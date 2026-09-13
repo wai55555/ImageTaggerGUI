@@ -75,8 +75,18 @@ a = Analysis(
 # opt-in: the app downloads that DLL plus the NVIDIA runtime DLLs at runtime into
 # gpu_runtime/ (docs/260910_gpu_acceleration_impl_plan.md). Strip it here so the
 # distributed zip stays small; onnxruntime_providers_shared.dll (tiny) is kept.
+_stripped_cuda_provider = any(
+    os.path.basename(b[0]).lower() == 'onnxruntime_providers_cuda.dll' for b in a.binaries)
 a.binaries = [b for b in a.binaries
               if os.path.basename(b[0]).lower() != 'onnxruntime_providers_cuda.dll']
+if _stripped_cuda_provider and not _gpu_datas:
+    # The strip above and bundling gpu_components.json are two independent steps;
+    # forgetting `tools/gen_gpu_components.py` before this build silently ships a
+    # release where GPU acceleration can never be enabled (cubic review, PR #21).
+    print('WARNING: onnxruntime_providers_cuda.dll was stripped from this build but '
+          'gpu_components.json is missing - GPU acceleration will be permanently '
+          'unavailable in this build. Run tools/gen_gpu_components.py first if that '
+          'is not intended.')
 
 pyz = PYZ(a.pure)
 

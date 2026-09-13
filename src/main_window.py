@@ -319,6 +319,17 @@ class MainWindow(QMainWindow):
         elif clicked is never_btn:
             beh.gpu_setup_prompt = "dismissed"
             self.save_current_config()
+            if partial:
+                # This was the repair prompt (a broken gpu_runtime/ made `partial`
+                # true and bypassed the dismissed check above) - without clearing
+                # it, `partial` stays true forever and this same prompt would keep
+                # reappearing on every launch even though the user just said Never
+                # (CodeRabbit review, PR #21). `gpu_runtime` was already imported
+                # above (same function scope).
+                try:
+                    gpu_runtime.GpuRuntimeInstaller().uninstall()
+                except Exception as exc:  # noqa: BLE001
+                    write_debug_log(f"_maybe_prompt_gpu_setup: could not clear broken gpu_runtime/ ({exc!r})")
 
     def _start_gpu_runtime_download(self):
         if self._gpu_dl_thread and self._gpu_dl_thread.isRunning():
@@ -335,6 +346,14 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         progress.canceled.connect(self._cancel_gpu_runtime_download)
+        # WA_DeleteOnClose means the underlying C++ object can be destroyed by the
+        # user clicking the dialog's own close button (not just our Cancel/close()
+        # calls) at any time. `destroyed` fires synchronously right when that
+        # happens, so this is the one place that reliably keeps our reference in
+        # sync - without it, a later access (from the async finished handler) can
+        # hit an already-deleted PySide6 wrapper and raise RuntimeError
+        # (cubic review, PR #21).
+        progress.destroyed.connect(self._on_gpu_dl_progress_destroyed)
         self._gpu_dl_progress = progress
 
         self._gpu_dl_thread = QThread()
@@ -352,6 +371,9 @@ class MainWindow(QMainWindow):
             self.update_log(self.locale_manager.get_string("Gpu", "Download_Cancelling"), "orange")
             self._gpu_dl_worker.stop()
 
+    def _on_gpu_dl_progress_destroyed(self):
+        self._gpu_dl_progress = None
+
     def _on_gpu_runtime_progress(self, percent: int, done_mb: float, total_mb: float):
         if not self._gpu_dl_progress:
             return
@@ -367,14 +389,22 @@ class MainWindow(QMainWindow):
     def _on_gpu_runtime_finished(self, ok: bool):
         if self._is_shutting_down:
             return  # closeEvent stops/joins the thread itself
+        # Capture before the worker is torn down below: install() returns False for
+        # both cancellation and genuine failure, collapsing them into one bool.
+        # Without this, cancelling a download pops the scary "Download failed"
+        # dialog even though the user asked for exactly this (CodeRabbit, PR #21).
+        cancelled = bool(self._gpu_dl_worker and self._gpu_dl_worker.is_stopped())
         if self._gpu_dl_progress:
             # close() counts as a cancel for QProgressDialog and would re-fire
             # canceled -> _cancel_gpu_runtime_download; drop the connection first.
+            # Both calls are guarded: _on_gpu_dl_progress_destroyed (connected to
+            # `destroyed`) is the normal way this reference gets cleared, but a
+            # user-initiated close (WA_DeleteOnClose) can race ahead of us.
             try:
                 self._gpu_dl_progress.canceled.disconnect(self._cancel_gpu_runtime_download)
+                self._gpu_dl_progress.close()  # WA_DeleteOnClose frees it
             except (RuntimeError, TypeError):
-                pass
-            self._gpu_dl_progress.close()  # WA_DeleteOnClose frees it
+                pass  # already destroyed (e.g. user closed the dialog directly)
             self._gpu_dl_progress = None
         if self._gpu_dl_thread:
             self._gpu_dl_thread.quit()
@@ -383,6 +413,8 @@ class MainWindow(QMainWindow):
                 self._gpu_dl_worker.deleteLater()
             self._gpu_dl_thread.deleteLater()
             self._gpu_dl_thread = self._gpu_dl_worker = None
+        if cancelled:
+            return  # already logged via Download_Cancelling / Worker_Stopped
         title = self.locale_manager.get_string("Gpu", "Prompt_Title")
         if ok:
             QMessageBox.information(self, title,

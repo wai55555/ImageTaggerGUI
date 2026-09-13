@@ -163,6 +163,21 @@ def test_spec_total_bytes_tolerates_garbage():
     assert GR.spec_total_bytes(spec) == 15
 
 
+def test_spec_missing_ort_version_rejected(tmp_path):
+    """Without ort_version, onnx_providers' version-lock check can't run at all
+    and silently never rejects a mismatched gpu_runtime/ (CodeRabbit/cubic review,
+    PR #21) - so the spec itself must require it."""
+    bad = _spec()
+    del bad["ort_version"]
+    (tmp_path / GR.COMPONENT_SPEC_NAME).write_text(json.dumps(bad), encoding="utf-8")
+    assert GR.load_component_spec(tmp_path) is None
+
+    blank = _spec()
+    blank["ort_version"] = "   "
+    (tmp_path / GR.COMPONENT_SPEC_NAME).write_text(json.dumps(blank), encoding="utf-8")
+    assert GR.load_component_spec(tmp_path) is None
+
+
 # --- install happy path ------------------------------------------------
 
 def test_install_places_files_and_marks_ready(tmp_path):
@@ -330,6 +345,28 @@ def test_uninstall_removes_everything(tmp_path):
     inst.uninstall()
     assert not (tmp_path / OP.GPU_RUNTIME_DIRNAME).exists()
     assert not capi_file.exists()
+
+
+def test_uninstall_rejects_path_traversal_in_manifest(tmp_path):
+    """A tampered/corrupted manifest naming a capi entry like "../../evil.dll"
+    must not let unlink() escape onnxruntime's capi/ directory (cubic review,
+    PR #21, confidence 10)."""
+    ort = _fake_ort(tmp_path)
+    capi_dir = tmp_path / "onnxruntime" / "capi"
+    victim = tmp_path / "victim.txt"  # sits *outside* capi/, one level up
+    victim.write_text("do not delete me")
+
+    root = tmp_path / OP.GPU_RUNTIME_DIRNAME
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text(json.dumps({
+        "schema": 1, "ort_version": "1.23.1",
+        "files": [{"name": "../victim.txt", "location": "capi"}],
+    }), encoding="utf-8")
+
+    GR.GpuRuntimeInstaller(base_dir=tmp_path, ort_module=ort).uninstall()
+
+    assert victim.is_file(), "path traversal must not delete files outside capi/"
+    assert not root.exists()  # the rest of the (legitimate) cleanup still happens
 
 
 # --- gpu_runtime_ready "files" form ---------------------------------

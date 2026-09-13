@@ -95,20 +95,34 @@ def _pick_wheel(files: list[dict], *, must_contain: tuple[str, ...] = ()) -> dic
     raise SystemExit(f"no matching win_amd64 wheel among {[f.get('filename') for f in files]}")
 
 
-def _download_and_hash(url: str, cache_dir: Path | None) -> tuple[bytes, str, int]:
-    """Return (wheel_bytes, sha256_hex, size). Caches by basename when cache_dir set."""
+def _download_and_hash(url: str, cache_dir: Path | None, *,
+                       expected_sha256: str | None = None) -> tuple[bytes, str, int]:
+    """Return (wheel_bytes, sha256_hex, size). Caches by basename when cache_dir set.
+
+    A cache hit is only trusted when its hash matches PyPI's published
+    `expected_sha256` (cubic review, PR #21) - otherwise a stale/corrupted cached
+    wheel would get re-recorded as "verified" in the generated manifest. On a
+    mismatch the cache entry is refreshed from the network.
+    """
     base = url.split("?", 1)[0].rsplit("/", 1)[-1]
-    if cache_dir is not None:
-        cached = cache_dir / base
-        if cached.is_file():
-            data = cached.read_bytes()
-            return data, hashlib.sha256(data).hexdigest(), len(data)
+    cached_path = cache_dir / base if cache_dir is not None else None
+    if cached_path is not None and cached_path.is_file():
+        data = cached_path.read_bytes()
+        sha = hashlib.sha256(data).hexdigest()
+        if expected_sha256 is None or sha.lower() == expected_sha256.lower():
+            return data, sha, len(data)
+        print(f"  (cache mismatch for {base}, re-downloading)")
+
     with urllib.request.urlopen(url, timeout=180) as resp:  # noqa: S310
         data = resp.read()
-    if cache_dir is not None:
+    sha = hashlib.sha256(data).hexdigest()
+    if expected_sha256 is not None and sha.lower() != expected_sha256.lower():
+        raise SystemExit(f"SHA-256 mismatch downloading {url}: "
+                         f"got {sha}, PyPI says {expected_sha256}")
+    if cached_path is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        (cache_dir / base).write_bytes(data)
-    return data, hashlib.sha256(data).hexdigest(), len(data)
+        cached_path.write_bytes(data)
+    return data, sha, len(data)
 
 
 def _bin_dll_members(whl_bytes: bytes) -> list[dict[str, str]]:
@@ -143,7 +157,8 @@ def main() -> None:
     meta = _pypi_json(f"https://pypi.org/pypi/onnxruntime-gpu/{args.ort_version}/json")
     f = _pick_wheel(meta["urls"], must_contain=(f"-{args.python}-{args.python}-",))
     print(f"  onnxruntime-gpu {args.ort_version}: {f['filename']}")
-    data, sha, size = _download_and_hash(f["url"], cache)
+    data, sha, size = _download_and_hash(f["url"], cache,
+                                         expected_sha256=f.get("digests", {}).get("sha256"))
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         if _PROVIDER_ARCNAME not in zf.namelist():
             raise SystemExit(f"{f['filename']} has no {_PROVIDER_ARCNAME}")
@@ -159,7 +174,8 @@ def main() -> None:
         version = meta["info"]["version"]
         f = _pick_wheel(meta.get("urls", []))
         print(f"  {pkg} {version}: {f['filename']}")
-        data, sha, size = _download_and_hash(f["url"], cache)
+        data, sha, size = _download_and_hash(f["url"], cache,
+                                             expected_sha256=f.get("digests", {}).get("sha256"))
         members = _bin_dll_members(data)
         if not members:
             raise SystemExit(f"{pkg}: no */bin/*.dll members in wheel")

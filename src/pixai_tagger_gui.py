@@ -91,8 +91,18 @@ def main():
         from onnx_providers import preload_gpu_dlls
 
         preload_gpu_dlls()
-    except Exception:
-        pass
+    except Exception as exc:
+        # preload_gpu_dlls() itself already catches and logs its own failures; an
+        # exception here means the import failed (e.g. onnx_providers missing from
+        # a broken build), which is worth a log line instead of dying silently -
+        # the same import fails again, loudly, at tagging_core.py's module level
+        # right after (cubic review, PR #21).
+        try:
+            from utils import write_debug_log
+
+            write_debug_log(f"main: preload_gpu_dlls unavailable ({exc!r})")
+        except Exception:
+            print(f"preload_gpu_dlls unavailable: {exc!r}", file=sys.stderr)
 
     app = QApplication(sys.argv)
 

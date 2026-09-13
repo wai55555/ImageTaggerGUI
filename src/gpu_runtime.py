@@ -97,6 +97,11 @@ def load_component_spec(resource_dir: Path | None = None) -> dict | None:
                and isinstance(e.get("members"), list) and e["members"]
                for e in wheels):
         return None
+    # onnx_providers._read_ready_files() version-locks gpu_runtime/ against the
+    # running onnxruntime via this field; a spec that omits it would silently skip
+    # that check (CodeRabbit review, PR #21) and let a mismatched provider DLL load.
+    if not isinstance(data.get("ort_version"), str) or not data["ort_version"].strip():
+        return None
     return data
 
 
@@ -199,6 +204,14 @@ class GpuRuntimeInstaller:
             capi_names = ["onnxruntime_providers_cuda.dll"]
         if self._capi is not None:
             for name in capi_names:
+                # CodeRabbit/cubic review (PR #21): a tampered or corrupted manifest
+                # could otherwise carry a "../../..." name and unlink() outside capi/.
+                # install() already rejects unsafe names before they ever reach a
+                # manifest we wrote ourselves, but uninstall() must not trust an
+                # on-disk manifest it didn't just validate.
+                if not _is_safe_filename(name):
+                    log_dbg(f"gpu_runtime: uninstall skipping unsafe capi entry {name!r}")
+                    continue
                 try:
                     (self._capi / name).unlink(missing_ok=True)
                 except OSError:
@@ -220,7 +233,7 @@ class GpuRuntimeInstaller:
         url = item.get("url")
         if not name or not url:
             raise GpuRuntimeError("'direct' entry needs name and url")
-        if "/" in name or "\\" in name or name in ("", ".", ".."):
+        if not _is_safe_filename(name):
             raise GpuRuntimeError(f"unsafe direct name {name!r}")
         location = item.get("location", "gpu_runtime")
         if location not in ("gpu_runtime", "capi"):
@@ -256,7 +269,7 @@ class GpuRuntimeInstaller:
                 out_name = member.get("name") or (_basename(arcname) if arcname else None)
                 if not arcname or not out_name:
                     raise GpuRuntimeError("wheel member needs arcname")
-                if "/" in out_name or "\\" in out_name or out_name in ("", ".", ".."):
+                if not _is_safe_filename(out_name):
                     raise GpuRuntimeError(f"unsafe member name {out_name!r}")
                 location = member.get("location", "gpu_runtime")
                 if location not in ("gpu_runtime", "capi"):
@@ -326,6 +339,14 @@ class GpuRuntimeInstaller:
         tmp = self._root / (_MANIFEST_NAME + ".part")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         os.replace(tmp, self._root / _MANIFEST_NAME)
+
+
+def _is_safe_filename(name: Any) -> bool:
+    """A single path component, no separators, no `.`/`..`/empty. Used for every
+    filename that comes from a manifest/spec before it's joined onto a real path
+    (download destination, capi/ placement, uninstall cleanup)."""
+    return (isinstance(name, str) and name not in ("", ".", "..")
+            and "/" not in name and "\\" not in name)
 
 
 def _basename(url: str | None) -> str:

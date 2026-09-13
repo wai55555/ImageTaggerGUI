@@ -1,22 +1,31 @@
 {
   "//": "SCHEMA REFERENCE - not read by the app. A real gpu_components.json is",
-  "//1": "generated at release time by tools/gen_gpu_components.py on the Windows",
-  "//2": "build machine and placed at the repo root; pixai_tagger_gui.spec bundles",
-  "//3": "it into _internal/. Do NOT commit the generated file (keep it release-local).",
-  "//4": "onnx_providers.gpu_runtime_ready stays False until it is installed.",
+  "//1": "generated at release time by `python tools/gen_gpu_components.py` (run it",
+  "//2": "from anywhere - it pulls the Windows wheels straight from PyPI, no build",
+  "//3": "venv needed) and placed at the repo root; pixai_tagger_gui.spec bundles it",
+  "//4": "into _internal/. Do NOT commit the generated file (keep it release-local).",
+  "//5": "Nothing is self-hosted: the CUDA provider DLL comes from the onnxruntime-gpu",
+  "//6": "wheel itself (as a member, location=capi), matching the generator's actual",
+  "//7": "output - `direct` is always empty in a real generated manifest.",
+  "//8": "onnx_providers.gpu_runtime_ready stays False until it is installed, and",
+  "//9": "ort_version must match the running onnxruntime exactly or it is also False.",
 
   "schema": 1,
-  "ort_version": "1.23.1",
-  "direct": [
-    {
-      "name": "onnxruntime_providers_cuda.dll",
-      "url": "https://github.com/OWNER/REPO/releases/download/gpu-runtime-1.23.1/onnxruntime_providers_cuda.dll",
-      "sha256": "<sha256 of the DLL from the onnxruntime-gpu build venv>",
-      "bytes": 0,
-      "location": "capi"
-    }
-  ],
+  "ort_version": "1.23.2",
+  "direct": [],
   "wheels": [
+    {
+      "url": "https://files.pythonhosted.org/packages/.../onnxruntime_gpu-1.23.2-cp310-cp310-win_amd64.whl",
+      "sha256": "<sha256 of the .whl, from PyPI's own published digest>",
+      "bytes": 0,
+      "members": [
+        {
+          "arcname": "onnxruntime/capi/onnxruntime_providers_cuda.dll",
+          "name": "onnxruntime_providers_cuda.dll",
+          "location": "capi"
+        }
+      ]
+    },
     {
       "url": "https://files.pythonhosted.org/packages/.../nvidia_cudnn_cu12-9.X.Y.Z-py3-none-win_amd64.whl",
       "sha256": "<sha256 of the .whl>",
