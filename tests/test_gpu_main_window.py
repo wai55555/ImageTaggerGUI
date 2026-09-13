@@ -118,6 +118,8 @@ def test_never_on_repair_prompt_clears_broken_gpu_runtime(monkeypatch, tmp_path)
 
     monkeypatch.setattr(onnxruntime, "get_available_providers",
                         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    # this test doesn't care whether the test box actually has an NVIDIA GPU
+    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: True)
     # a broken gpu_runtime/: present, but not gpu_runtime_ready() (no manifest)
     broken = tmp_path / OP.GPU_RUNTIME_DIRNAME
     broken.mkdir(parents=True)

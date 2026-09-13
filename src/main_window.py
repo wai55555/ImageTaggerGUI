@@ -274,6 +274,12 @@ class MainWindow(QMainWindow):
         「使わない」を選んだ後に気が変わった人は config.ini [Behavior] gpu_setup_prompt = ask
         で復活できる。ただし gpu_runtime/ が中途半端に壊れている場合は、dismissed でも
         修復のために 1 度だけ尋ねる。
+
+        `CUDAExecutionProvider` は onnxruntime-gpu にコンパイルされているという静的な
+        事実でしかなく、実機に NVIDIA GPU があるかは見ていない。なので
+        `onnx_providers.has_nvidia_gpu()`（nvidia-smi の有無）で実機確認を挟み、
+        AMD/Intel/GPU 無し環境に無意味な約1.8GBの提案をしないようにする
+        （cubic review, PR #21）。
         """
         beh = self.settings.behavior
         if beh.onnx_device == "cpu":
@@ -288,6 +294,8 @@ class MainWindow(QMainWindow):
                 return  # this build has no CUDA support -> nothing to offer
             if onnx_providers.gpu_runtime_ready():
                 return  # components already installed
+            if not onnx_providers.has_nvidia_gpu():
+                return  # no NVIDIA GPU detected on this machine -> nothing to offer
             # dismissed suppresses the prompt, except when a partly-installed gpu_runtime/
             # is sitting there broken (crashed download etc.) - offer to repair it once.
             partial = onnx_providers.gpu_runtime_dir().exists()

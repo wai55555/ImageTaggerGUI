@@ -390,3 +390,37 @@ def _pip_nvidia_bin_dirs() -> list[str]:
             except OSError:
                 continue
     return out
+
+
+def has_nvidia_gpu(*, run: Any = None) -> bool:
+    """Best-effort check for an NVIDIA GPU via `nvidia-smi -L`.
+
+    `nvidia-smi` ships with the NVIDIA driver on both Windows and Linux/WSL (not
+    Windows-only). An `onnxruntime-gpu` build always reports
+    `CUDAExecutionProvider` as *compiled in*, regardless of whether this machine
+    actually has NVIDIA hardware - without this check, AMD/Intel/no-dGPU users
+    would be offered a useless ~1.8GB download (cubic review, PR #21).
+
+    Any failure - not installed, no driver, PATH doesn't have it, spawn error,
+    times out - means "no NVIDIA GPU found": the safe default, since it just
+    means the setup prompt doesn't show (the app keeps working on CPU either way).
+    macOS has no NVIDIA GPU support to check for (and onnxruntime-gpu doesn't
+    ship there either), so this is only ever meaningfully exercised on Windows/Linux.
+    """
+    import subprocess
+
+    runner = run or subprocess.run
+    try:
+        kwargs: dict[str, Any] = {}
+        if sys.platform.startswith("win"):
+            # avoid a console window flashing in front of this windowed app
+            # getattr, not a bare attribute access: the constant only exists on
+            # the Windows build of the subprocess module, so even a test that
+            # monkeypatches sys.platform to simulate Windows must not crash here
+            # when actually running on a non-Windows interpreter.
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        result = runner(["nvidia-smi", "-L"], capture_output=True, text=True,
+                        timeout=3, **kwargs)
+    except Exception:
+        return False
+    return result.returncode == 0 and "GPU" in (result.stdout or "")

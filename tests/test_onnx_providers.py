@@ -341,5 +341,67 @@ def test_settings_round_trip(monkeypatch):
     assert s2.behavior.gpu_setup_prompt == "dismissed"
 
 
+# --- has_nvidia_gpu ---------------------------------------------------------
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+
+
+def test_has_nvidia_gpu_true_on_success():
+    run = lambda *a, **k: _FakeCompleted(0, "GPU 0: NVIDIA GeForce RTX 4070 (UUID: GPU-xxx)\n")
+    assert OP.has_nvidia_gpu(run=run) is True
+
+
+def test_has_nvidia_gpu_false_on_nonzero_exit():
+    # e.g. driver present but no GPU enumerated, or a permissions error
+    run = lambda *a, **k: _FakeCompleted(1, "")
+    assert OP.has_nvidia_gpu(run=run) is False
+
+
+def test_has_nvidia_gpu_false_on_empty_or_unexpected_stdout():
+    run = lambda *a, **k: _FakeCompleted(0, "")
+    assert OP.has_nvidia_gpu(run=run) is False
+
+
+def test_has_nvidia_gpu_false_when_not_installed():
+    def run(*a, **k):
+        raise FileNotFoundError("nvidia-smi not found")
+    assert OP.has_nvidia_gpu(run=run) is False
+
+
+def test_has_nvidia_gpu_false_on_timeout():
+    import subprocess as _sp
+
+    def run(*a, **k):
+        raise _sp.TimeoutExpired(cmd="nvidia-smi", timeout=3)
+    assert OP.has_nvidia_gpu(run=run) is False
+
+
+def test_has_nvidia_gpu_passes_windows_creationflags(monkeypatch):
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen.update(kwargs)
+        return _FakeCompleted(0, "GPU 0: ...")
+
+    monkeypatch.setattr(OP.sys, "platform", "win32")
+    assert OP.has_nvidia_gpu(run=run) is True
+    assert "creationflags" in seen  # avoids a console window flash on Windows
+
+
+def test_has_nvidia_gpu_no_creationflags_off_windows(monkeypatch):
+    seen = {}
+
+    def run(cmd, **kwargs):
+        seen.update(kwargs)
+        return _FakeCompleted(0, "GPU 0: ...")
+
+    monkeypatch.setattr(OP.sys, "platform", "linux")
+    assert OP.has_nvidia_gpu(run=run) is True
+    assert "creationflags" not in seen
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
