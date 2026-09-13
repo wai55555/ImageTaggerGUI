@@ -435,7 +435,7 @@ class OnnxTagger:
         get_string: GetString | None = None,
         inference_config: InferenceConfig | None = None,
         intra_op_num_threads: int = 0,
-        onnx_device: str = "auto",
+        onnx_device: str = "cpu",
     ):
         self.get_string = get_string if get_string else _get_string
         self.inference_config = inference_config if inference_config is not None else InferenceConfig()

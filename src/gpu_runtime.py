@@ -344,9 +344,17 @@ class GpuRuntimeInstaller:
 def _is_safe_filename(name: Any) -> bool:
     """A single path component, no separators, no `.`/`..`/empty. Used for every
     filename that comes from a manifest/spec before it's joined onto a real path
-    (download destination, capi/ placement, uninstall cleanup)."""
+    (download destination, capi/ placement, uninstall cleanup).
+
+    `:` is rejected too (cubic review, PR #21, P1): on Windows, `pathlib`'s `/`
+    treats a drive-qualified name like "C:evil.dll" as anchored, so
+    `Path(root) / "C:evil.dll"` silently discards `root` entirely and resolves to
+    `C:evil.dll` relative to the current directory on C: - completely escaping
+    staging/capi/gpu_runtime. NTFS Alternate Data Stream names ("legit.dll:hide")
+    also contain `:` and are blocked the same way.
+    """
     return (isinstance(name, str) and name not in ("", ".", "..")
-            and "/" not in name and "\\" not in name)
+            and "/" not in name and "\\" not in name and ":" not in name)
 
 
 def _basename(url: str | None) -> str:

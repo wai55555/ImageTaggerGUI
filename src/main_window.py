@@ -338,6 +338,15 @@ class MainWindow(QMainWindow):
                     gpu_runtime.GpuRuntimeInstaller().uninstall()
                 except Exception as exc:  # noqa: BLE001
                     write_debug_log(f"_maybe_prompt_gpu_setup: could not clear broken gpu_runtime/ ({exc!r})")
+                if onnx_providers.gpu_runtime_dir().exists():
+                    # uninstall() swallows per-file OSError (locked/permission-denied
+                    # files) so gpu_runtime/ can survive it; the repair prompt will
+                    # then keep reappearing despite Never (cubic review, PR #21).
+                    # There's no unconditional way to force-remove a locked file, so
+                    # this is diagnostic only - the existing `onnx_device = cpu`
+                    # config escape hatch still stops the prompt outright.
+                    write_debug_log("_maybe_prompt_gpu_setup: gpu_runtime/ still present after "
+                                    "uninstall() - the repair prompt may reappear next launch")
 
     def _start_gpu_runtime_download(self):
         if self._gpu_dl_thread and self._gpu_dl_thread.isRunning():
@@ -401,7 +410,11 @@ class MainWindow(QMainWindow):
         # both cancellation and genuine failure, collapsing them into one bool.
         # Without this, cancelling a download pops the scary "Download failed"
         # dialog even though the user asked for exactly this (CodeRabbit, PR #21).
-        cancelled = bool(self._gpu_dl_worker and self._gpu_dl_worker.is_stopped())
+        # `not ok` guards a narrow race (cubic review, PR #21): install() can
+        # finish successfully right as the user clicks Cancel, so is_stopped() may
+        # be true even though ok is also true - that must still show the success
+        # dialog, not be silently swallowed as "cancelled".
+        cancelled = bool(not ok and self._gpu_dl_worker and self._gpu_dl_worker.is_stopped())
         if self._gpu_dl_progress:
             # close() counts as a cancel for QProgressDialog and would re-fire
             # canceled -> _cancel_gpu_runtime_download; drop the connection first.

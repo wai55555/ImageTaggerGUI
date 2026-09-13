@@ -19,10 +19,6 @@ import app_settings as _A
 _A.CONFIG_PATH = Path(tempfile.mkdtemp()) / "config.ini"
 import constants as _C
 _C.CONFIG_PATH = _A.CONFIG_PATH
-import vlm_config as _VC
-_vcdir = Path(tempfile.mkdtemp())
-_VC.VLM_CONNECTIONS_PATH = _vcdir / "vlm_connections.json"
-_VC.VLM_PROFILES_PATH = _vcdir / "vlm_profiles.json"
 
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
@@ -48,9 +44,15 @@ def _fake_progress_dialog(mw):
     return progress
 
 
-def test_progress_dialog_destroyed_clears_reference():
+def test_progress_dialog_destroyed_clears_reference(monkeypatch):
     """WA_DeleteOnClose can free the dialog from a user close; the destroyed
     signal must be what keeps mw._gpu_dl_progress in sync (cubic review, PR #21)."""
+    import onnx_providers as OP
+    # On a machine that actually has an NVIDIA GPU + CUDA-enabled onnxruntime,
+    # _mw_ready()'s initial_load() would otherwise pop a *real*, unpatched
+    # QMessageBox from _maybe_prompt_gpu_setup() and hang forever offscreen -
+    # this test doesn't care about that prompt, so force it off.
+    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)
     w = _mw_ready()
     progress = _fake_progress_dialog(w)
     assert w._gpu_dl_progress is progress
@@ -67,6 +69,8 @@ def test_progress_dialog_destroyed_clears_reference():
 def test_finished_handler_survives_dialog_already_destroyed(monkeypatch):
     """_on_gpu_runtime_finished must not raise when the dialog died earlier
     (e.g. the user closed it) and _gpu_dl_progress is already None."""
+    import onnx_providers as OP
+    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)  # see test above
     w = _mw_ready()
     w._gpu_dl_progress = None
     w._gpu_dl_thread = QThread()
@@ -85,6 +89,8 @@ def test_finished_handler_suppresses_popup_on_cancellation(monkeypatch):
     """cancelling a download must not show the generic 'download failed' dialog
     (CodeRabbit review, PR #21): install() collapses cancel and failure into the
     same `False`, so the handler must check the worker's own stop flag."""
+    import onnx_providers as OP
+    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)  # see test above
     w = _mw_ready()
     w._gpu_dl_progress = None
     w._gpu_dl_thread = QThread()

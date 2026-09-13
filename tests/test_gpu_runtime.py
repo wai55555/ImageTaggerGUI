@@ -350,17 +350,23 @@ def test_uninstall_removes_everything(tmp_path):
 def test_uninstall_rejects_path_traversal_in_manifest(tmp_path):
     """A tampered/corrupted manifest naming a capi entry like "../../evil.dll"
     must not let unlink() escape onnxruntime's capi/ directory (cubic review,
-    PR #21, confidence 10)."""
+    PR #21, confidence 10).
+
+    Geometry: _fake_ort(tmp_path) makes capi/ resolve to
+    tmp_path/onnxruntime/capi/, so it takes TWO ".." to reach tmp_path/ itself
+    (one ".." only reaches tmp_path/onnxruntime/) - a previous version of this
+    test used one ".." and so victim.txt was never actually at the resolved
+    path, meaning it would have passed even with the traversal guard removed
+    (cubic review, PR #21, confidence 9)."""
     ort = _fake_ort(tmp_path)
-    capi_dir = tmp_path / "onnxruntime" / "capi"
-    victim = tmp_path / "victim.txt"  # sits *outside* capi/, one level up
+    victim = tmp_path / "victim.txt"  # sits *outside* capi/, two levels up
     victim.write_text("do not delete me")
 
     root = tmp_path / OP.GPU_RUNTIME_DIRNAME
     root.mkdir(parents=True)
     (root / "manifest.json").write_text(json.dumps({
         "schema": 1, "ort_version": "1.23.1",
-        "files": [{"name": "../victim.txt", "location": "capi"}],
+        "files": [{"name": "../../victim.txt", "location": "capi"}],
     }), encoding="utf-8")
 
     GR.GpuRuntimeInstaller(base_dir=tmp_path, ort_module=ort).uninstall()

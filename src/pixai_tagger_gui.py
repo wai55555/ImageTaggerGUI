@@ -92,11 +92,14 @@ def main():
 
         preload_gpu_dlls()
     except Exception as exc:
-        # preload_gpu_dlls() itself already catches and logs its own failures; an
-        # exception here means the import failed (e.g. onnx_providers missing from
-        # a broken build), which is worth a log line instead of dying silently -
-        # the same import fails again, loudly, at tagging_core.py's module level
-        # right after (cubic review, PR #21).
+        # preload_gpu_dlls() itself already catches and logs its own failures, so
+        # reaching here means something outside that (e.g. the `from onnx_providers
+        # import` line itself, if the module is missing from a broken build) went
+        # wrong. In practice a missing onnx_providers would already have crashed the
+        # process at import time via main_window's own top-level import chain, well
+        # before main() runs - this handler is really just a last-resort diagnostic
+        # for anything unexpected here, not the primary place that failure surfaces
+        # (cubic review, PR #21).
         try:
             from utils import write_debug_log
 
