@@ -363,6 +363,11 @@ def test_has_nvidia_gpu_false_on_nonzero_exit():
 def test_has_nvidia_gpu_false_on_empty_or_unexpected_stdout():
     run = lambda *a, **k: _FakeCompleted(0, "")
     assert OP.has_nvidia_gpu(run=run) is False
+    # non-empty stdout without a "GPU" line is also treated as "no NVIDIA GPU"
+    # (cubic review, PR #21: the test name promised this but only the empty-
+    # string case was actually exercised)
+    run = lambda *a, **k: _FakeCompleted(0, "driver version: 555.42\n")
+    assert OP.has_nvidia_gpu(run=run) is False
 
 
 def test_has_nvidia_gpu_false_when_not_installed():
@@ -380,6 +385,15 @@ def test_has_nvidia_gpu_false_on_timeout():
 
 
 def test_has_nvidia_gpu_passes_windows_creationflags(monkeypatch):
+    # cubic review, PR #21: asserting mere presence of "creationflags" passed
+    # even with the key mapped to 0 (the getattr(..., 0) fallback used on
+    # non-Windows CI hosts, where subprocess.CREATE_NO_WINDOW doesn't exist) -
+    # a regression that dropped the real flag on an actual Windows run would
+    # have slipped through. Pin subprocess.CREATE_NO_WINDOW to a sentinel and
+    # assert the exact value passed through.
+    import subprocess
+    sentinel = 0x08000000  # real value of CREATE_NO_WINDOW, used as a sentinel
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", sentinel, raising=False)
     seen = {}
 
     def run(cmd, **kwargs):
@@ -388,7 +402,7 @@ def test_has_nvidia_gpu_passes_windows_creationflags(monkeypatch):
 
     monkeypatch.setattr(OP.sys, "platform", "win32")
     assert OP.has_nvidia_gpu(run=run) is True
-    assert "creationflags" in seen  # avoids a console window flash on Windows
+    assert seen.get("creationflags") == sentinel  # avoids a console window flash
 
 
 def test_has_nvidia_gpu_no_creationflags_off_windows(monkeypatch):

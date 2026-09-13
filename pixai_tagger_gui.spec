@@ -81,12 +81,17 @@ a.binaries = [b for b in a.binaries
               if os.path.basename(b[0]).lower() != 'onnxruntime_providers_cuda.dll']
 if _stripped_cuda_provider and not _gpu_datas:
     # The strip above and bundling gpu_components.json are two independent steps;
-    # forgetting `tools/gen_gpu_components.py` before this build silently ships a
-    # release where GPU acceleration can never be enabled (cubic review, PR #21).
-    print('WARNING: onnxruntime_providers_cuda.dll was stripped from this build but '
-          'gpu_components.json is missing - GPU acceleration will be permanently '
-          'unavailable in this build. Run tools/gen_gpu_components.py first if that '
-          'is not intended.')
+    # forgetting `tools/gen_gpu_components.py` before this build would otherwise
+    # silently ship a release where GPU acceleration can never be enabled - a
+    # print()-only warning is easy to miss in build output, and a completed build
+    # with exit code 0 reads as success (CodeRabbit review, PR #21). Fail the
+    # build instead, so a mis-rolled release is caught here, not by a user.
+    raise SystemExit(
+        'pixai_tagger_gui.spec: onnxruntime_providers_cuda.dll was stripped from '
+        'this build but gpu_components.json is missing, which would permanently '
+        'disable GPU acceleration in this build. Run tools/gen_gpu_components.py '
+        'first, or delete onnxruntime-gpu from this environment if a CPU-only '
+        'build is actually what you want.')
 
 pyz = PYZ(a.pure)
 

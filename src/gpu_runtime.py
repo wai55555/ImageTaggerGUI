@@ -201,7 +201,17 @@ class GpuRuntimeInstaller:
             capi_names = [e["name"] for e in data.get("files", [])
                           if isinstance(e, dict) and e.get("location") == "capi" and e.get("name")]
         except (OSError, ValueError, KeyError, TypeError):
-            capi_names = ["onnxruntime_providers_cuda.dll"]
+            # Deliberately empty, NOT ["onnxruntime_providers_cuda.dll"] (cubic +
+            # CodeRabbit review, PR #21, confidence 8-9): in a packaged build that
+            # file only exists in capi/ because we mirrored it there, so guessing
+            # its name would be safe - but in a *source* run, pip's onnxruntime-gpu
+            # wheel ships its own onnxruntime_providers_cuda.dll in capi/ already
+            # (confirmed: it's what makes CUDAExecutionProvider available before we
+            # ever download anything). With no readable manifest we can't tell "ours"
+            # from "the package's own", so when in doubt we touch nothing in capi/
+            # and only clean up gpu_runtime/ - deleting the pip package's own file
+            # would break CUDA until a `pip install --force-reinstall`.
+            capi_names = []
         if self._capi is not None:
             for name in capi_names:
                 # CodeRabbit/cubic review (PR #21): a tampered or corrupted manifest

@@ -8,23 +8,45 @@ Run:  rtk pytest tests/test_gpu_main_window.py -q
 """
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-# isolate config.ini so MainWindow.closeEvent's save doesn't pollute the real one
-import app_settings as _A
-_A.CONFIG_PATH = Path(tempfile.mkdtemp()) / "config.ini"
-import constants as _C
-_C.CONFIG_PATH = _A.CONFIG_PATH
-
+import pytest
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from PySide6.QtCore import Qt
 
 _APP = QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _isolated_config(monkeypatch, tmp_path):
+    """Isolate config.ini so MainWindow.closeEvent's save doesn't pollute the
+    real one. Scoped via monkeypatch (per test, auto-undone) rather than the
+    former module-level `_A.CONFIG_PATH = ...` at import time, which permanently
+    repointed the shared app_settings/constants modules for the whole pytest
+    session regardless of collection order (cubic + CodeRabbit review, PR #21).
+    """
+    import app_settings as _A
+    import constants as _C
+    config_path = tmp_path / "config.ini"
+    monkeypatch.setattr(_A, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(_C, "CONFIG_PATH", config_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_prompt(monkeypatch):
+    """On a machine that actually has an NVIDIA GPU + CUDA-enabled onnxruntime,
+    MainWindow()'s initial_load() would otherwise reach _maybe_prompt_gpu_setup()
+    and pop a real, unpatched QMessageBox that hangs forever under the offscreen
+    platform. Most tests here don't care about that prompt, so force it off by
+    default; test_never_on_repair_prompt_clears_broken_gpu_runtime overrides this
+    back to True for the one test that specifically exercises the prompt flow
+    (cubic review, PR #21: was duplicated ad hoc in three tests before)."""
+    import onnx_providers as OP
+    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)
 
 
 def _mw_ready():
@@ -44,15 +66,9 @@ def _fake_progress_dialog(mw):
     return progress
 
 
-def test_progress_dialog_destroyed_clears_reference(monkeypatch):
+def test_progress_dialog_destroyed_clears_reference():
     """WA_DeleteOnClose can free the dialog from a user close; the destroyed
     signal must be what keeps mw._gpu_dl_progress in sync (cubic review, PR #21)."""
-    import onnx_providers as OP
-    # On a machine that actually has an NVIDIA GPU + CUDA-enabled onnxruntime,
-    # _mw_ready()'s initial_load() would otherwise pop a *real*, unpatched
-    # QMessageBox from _maybe_prompt_gpu_setup() and hang forever offscreen -
-    # this test doesn't care about that prompt, so force it off.
-    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)
     w = _mw_ready()
     progress = _fake_progress_dialog(w)
     assert w._gpu_dl_progress is progress
@@ -69,8 +85,6 @@ def test_progress_dialog_destroyed_clears_reference(monkeypatch):
 def test_finished_handler_survives_dialog_already_destroyed(monkeypatch):
     """_on_gpu_runtime_finished must not raise when the dialog died earlier
     (e.g. the user closed it) and _gpu_dl_progress is already None."""
-    import onnx_providers as OP
-    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)  # see test above
     w = _mw_ready()
     w._gpu_dl_progress = None
     w._gpu_dl_thread = QThread()
@@ -89,8 +103,6 @@ def test_finished_handler_suppresses_popup_on_cancellation(monkeypatch):
     """cancelling a download must not show the generic 'download failed' dialog
     (CodeRabbit review, PR #21): install() collapses cancel and failure into the
     same `False`, so the handler must check the worker's own stop flag."""
-    import onnx_providers as OP
-    monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: False)  # see test above
     w = _mw_ready()
     w._gpu_dl_progress = None
     w._gpu_dl_thread = QThread()
@@ -124,7 +136,8 @@ def test_never_on_repair_prompt_clears_broken_gpu_runtime(monkeypatch, tmp_path)
 
     monkeypatch.setattr(onnxruntime, "get_available_providers",
                         lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
-    # this test doesn't care whether the test box actually has an NVIDIA GPU
+    # this test needs the prompt path to actually run, unlike the _no_gpu_prompt
+    # fixture's default (see that fixture's docstring)
     monkeypatch.setattr(OP, "has_nvidia_gpu", lambda *a, **k: True)
     # a broken gpu_runtime/: present, but not gpu_runtime_ready() (no manifest)
     broken = tmp_path / OP.GPU_RUNTIME_DIRNAME

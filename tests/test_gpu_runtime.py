@@ -375,6 +375,31 @@ def test_uninstall_rejects_path_traversal_in_manifest(tmp_path):
     assert not root.exists()  # the rest of the (legitimate) cleanup still happens
 
 
+def test_uninstall_leaves_capi_alone_when_manifest_unreadable(tmp_path):
+    """No readable gpu_runtime/manifest.json must NOT fall back to guessing
+    "onnxruntime_providers_cuda.dll" and deleting it from capi/ (cubic +
+    CodeRabbit review, PR #21, confidence 8-9): in a source run, pip's
+    onnxruntime-gpu wheel ships that exact file in capi/ on its own (confirmed
+    against a real install - it's what makes CUDAExecutionProvider available
+    before this app ever downloads anything), so a corrupted/missing local
+    manifest must not be able to delete the package's own file. Only
+    gpu_runtime/ itself - which this app owns outright - gets cleaned up."""
+    ort = _fake_ort(tmp_path)
+    capi_file = tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll"
+    capi_file.parent.mkdir(parents=True)
+    capi_file.write_bytes(PROV_BYTES)  # stands in for the pip package's own file
+
+    root = tmp_path / OP.GPU_RUNTIME_DIRNAME
+    root.mkdir(parents=True)
+    (root / "manifest.json").write_text("not valid json", encoding="utf-8")
+
+    GR.GpuRuntimeInstaller(base_dir=tmp_path, ort_module=ort).uninstall()
+
+    assert capi_file.is_file(), "must not guess-delete a file it doesn't own"
+    assert capi_file.read_bytes() == PROV_BYTES
+    assert not root.exists()  # gpu_runtime/ itself is still cleaned up
+
+
 # --- gpu_runtime_ready "files" form ---------------------------------
 
 def test_ready_files_form_missing_from_gpu_runtime_root(tmp_path):
