@@ -9,8 +9,9 @@ It writes a `wheels`-only manifest:
 
   * onnxruntime-gpu  <pinned>  win_amd64 cp310 wheel
        -> extracts onnxruntime/capi/onnxruntime_providers_cuda.dll  (location: capi)
-  * nvidia-*-cu12 latest win_amd64 wheels
-       -> extracts every */bin/*.dll  (location: gpu_runtime)
+  * nvidia-*-cu12 latest win_amd64 wheels (see NVIDIA_PACKAGES below for which,
+    and why - it's evidence-based, not "grab everything")
+       -> extracts every */bin/*.dll except _EXCLUDED_DLL_NAMES  (location: gpu_runtime)
 
 Every wheel's SHA-256 + size is pinned. The app downloads these same wheels at
 runtime, re-verifies, and extracts the same members. Nothing is self-hosted;
@@ -39,8 +40,22 @@ from pathlib import Path
 SCHEMA = 1
 _ROOT = Path(__file__).resolve().parents[1]
 
-# cu12 runtime packages the ONNX Runtime CUDA EP loads (CUDA-ExecutionProvider
-# docs / onnxruntime.preload_dlls). Adjust if a future ORT drops/adds one.
+# cu12 runtime packages the ONNX Runtime CUDA EP actually needs. Evidence, not
+# guesswork (2026-09-13):
+#   - onnxruntime's own official extras_require for onnxruntime-gpu[cuda,cudnn]
+#     (https://github.com/microsoft/onnxruntime/pull/23659) lists exactly:
+#     cuda={nvrtc, cuda-runtime, cufft, curand}, cudnn={cudnn}. No cublas, no
+#     cusparse there - cublas/nvjitlink come in transitively as nvidia-cudnn-cu12's
+#     own dependencies (confirmed: a real `pip install` of the extras above pulled
+#     in nvidia-nvjitlink-cu12 without it being requested).
+#   - PyInstaller's dependency scan of the actual provider DLLs
+#     (onnxruntime_providers_cuda.dll / onnxruntime_providers_tensorrt.dll) named
+#     cudart64_12, cublasLt64_12, cublas64_12, cufft64_11, cudnn64_9 - never
+#     cusparse.
+#   - A real `pip install` of this exact set never pulled in nvidia-cusparse-cu12.
+# So nvidia-cublas-cu12 stays here explicitly (this tool downloads each wheel
+# independently rather than relying on pip's resolver to add it), and
+# nvidia-cusparse-cu12 is dropped. Adjust if a future ORT/cuDNN release changes this.
 NVIDIA_PACKAGES = [
     "nvidia-cudnn-cu12",
     "nvidia-cublas-cu12",
@@ -48,10 +63,13 @@ NVIDIA_PACKAGES = [
     "nvidia-cuda-nvrtc-cu12",
     "nvidia-cufft-cu12",
     "nvidia-curand-cu12",
-    "nvidia-cusparse-cu12",
     "nvidia-nvjitlink-cu12",
 ]
 _PROVIDER_ARCNAME = "onnxruntime/capi/onnxruntime_providers_cuda.dll"
+# nvblas64_12.dll: NVBLAS is a standalone BLAS drop-in shim, not something
+# onnxruntime/cuDNN load internally (absent from the PyInstaller dependency scan
+# above). Excluded so it isn't downloaded/shipped for nothing.
+_EXCLUDED_DLL_NAMES = {"nvblas64_12.dll"}
 
 
 def _ort_version_from_requirements() -> str | None:
@@ -98,7 +116,8 @@ def _bin_dll_members(whl_bytes: bytes) -> list[dict[str, str]]:
     with zipfile.ZipFile(io.BytesIO(whl_bytes)) as zf:
         for arc in zf.namelist():
             parts = arc.split("/")
-            if len(parts) >= 2 and parts[-2] == "bin" and arc.lower().endswith(".dll"):
+            if (len(parts) >= 2 and parts[-2] == "bin" and arc.lower().endswith(".dll")
+                    and parts[-1] not in _EXCLUDED_DLL_NAMES):
                 out.append({"arcname": arc, "name": parts[-1]})
     return out
 
