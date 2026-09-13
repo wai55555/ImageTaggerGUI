@@ -10,6 +10,11 @@ docs/260910_gpu_acceleration_impl_plan.md を参照。
 - 上記のどれか一つでも欠ければ CPUExecutionProvider へ静かに落ちる（起動は止めない）。
 - onnx_device="cpu"（既定の実効値）のときのセッション生成は、この機能が入る前の
   ``providers=["CPUExecutionProvider"]`` とバイト等価。
+- gpu_runtime/ が唯一の持ち出し可能な source of truth。provider DLL は ONNX
+  Runtime の制約で onnxruntime の capi/ にも要るが、それは `preload_gpu_dlls()` が
+  毎起動 gpu_runtime/ から自動で複製する（`_mirror_capi_files`）ので、gpu_runtime/
+  フォルダをコピーするだけで別ビルド/別マシンでも動く（バージョン不一致は
+  `_read_ready_files` が検出して「未整備」扱いにする）。
 
 このモジュールはプラットフォーム非依存のロジックのみ（実際のダウンロードは
 gpu_runtime.GpuRuntimeInstaller、起動時の preload 呼び出しは pixai_tagger_gui.main）。
@@ -20,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -85,18 +91,25 @@ def gpu_runtime_dir(base_dir: Path | None = None) -> Path:
     return _base_dir(base_dir) / GPU_RUNTIME_DIRNAME
 
 
-def gpu_runtime_ready(base_dir: Path | None = None, *, ort_module: Any = _ORT_DEFAULT) -> bool:
-    """gpu_runtime/ が「使える状態」か検証する。
+def _read_ready_files(base_dir: Path | None = None, *, ort_module: Any = _ORT_DEFAULT) -> list[dict] | None:
+    """gpu_runtime/ が「使える状態」か検証し、揃っているなら files のリストを返す。
 
-    gpu_runtime/manifest.json を読み、記載された各ファイルが実在すれば True。
-    JSON パース失敗・キー欠け・型違い・ファイル欠けはすべて False
+    gpu_runtime/manifest.json を読み、記載された各ファイルが **gpu_runtime/ 直下に**
+    実在すれば OK（`location` は「起動時に capi/ へも複製が要るか」のメタ情報でしか
+    なく、実在チェック自体は gpu_runtime/ 単体で完結する — model.onnx の DL 判定と
+    同じ「ファイルがあるか」チェック。Phase 4 で判明した「capi/ にしか無いファイルの
+    存在まで要求すると、gpu_runtime/ を丸ごとコピーしただけでは『未整備』判定になる」
+    問題への対応。capi/ への複製は preload_gpu_dlls() が毎起動時に自動でやる）。
+    JSON パース失敗・キー欠け・型違い・ファイル欠けはすべて None
     （CLAUDE.md #2: is_file() だけで判断しない）。
 
     対応する形式:
-      - {"files": [{"name": ..., "location": "gpu_runtime"|"capi", "sha256": ...}, ...]}
-        gpu_runtime.GpuRuntimeInstaller が書き出す正式形式。location="capi" は
-        onnxruntime の capi/ ディレクトリ（provider DLL の設置先）を基準に解決する。
-      - {"required": ["a.dll", "b.dll", ...]}（旧形式・すべて gpu_runtime/ 直下）
+      - {"files": [{"name": ..., "location": "gpu_runtime"|"capi"}, ...], "ort_version": ...}
+        gpu_runtime.GpuRuntimeInstaller が書き出す正式形式。`ort_version` が実行中の
+        onnxruntime と食い違う場合は None（provider DLL はビルド単位でバージョンロック
+        されており、別バージョン向けの gpu_runtime/ を別マシン/別ビルドへコピーした
+        ケースを安全に「未整備」扱いにする）。
+      - {"required": ["a.dll", "b.dll", ...]}（旧形式・すべて gpu_runtime/ 直下、バージョン情報なし）
     起動ごとに走るので SHA-256 は取り直さない（存在確認のみ。ハッシュは
     インストール時に検証済み）。
     """
@@ -104,48 +117,53 @@ def gpu_runtime_ready(base_dir: Path | None = None, *, ort_module: Any = _ORT_DE
     manifest = root / _MANIFEST_NAME
     try:
         if not manifest.is_file():
-            return False
+            return None
         data = json.loads(manifest.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return None
     if not isinstance(data, dict):
-        return False
+        return None
 
     files = data.get("files")
     if isinstance(files, list) and files:
-        capi = capi_dir(ort_module)
+        manifest_version = data.get("ort_version")
+        if isinstance(manifest_version, str) and manifest_version:
+            ort_mod = _resolve_ort(ort_module)
+            running_version = getattr(ort_mod, "__version__", None) if ort_mod is not None else None
+            if running_version and running_version != manifest_version:
+                return None  # built for a different onnxruntime-gpu version
+        normalized: list[dict] = []
         for entry in files:
             if not isinstance(entry, dict):
-                return False
+                return None
             name = entry.get("name")
             if not isinstance(name, str) or not name:
-                return False
-            location = entry.get("location", "gpu_runtime")
-            if location == "capi":
-                if capi is None:
-                    return False
-                target = capi / name
-            else:
-                target = root / name
+                return None
             try:
-                if not target.is_file():
-                    return False
+                if not (root / name).is_file():
+                    return None
             except OSError:
-                return False
-        return True
+                return None
+            normalized.append({"name": name, "location": entry.get("location", "gpu_runtime")})
+        return normalized
 
     required = data.get("required")
     if not isinstance(required, list) or not required:
-        return False
+        return None
     for rel in required:
         if not isinstance(rel, str) or not rel:
-            return False
+            return None
         try:
             if not (root / rel).is_file():
-                return False
+                return None
         except OSError:
-            return False
-    return True
+            return None
+    return [{"name": rel, "location": "gpu_runtime"} for rel in required]
+
+
+def gpu_runtime_ready(base_dir: Path | None = None, *, ort_module: Any = _ORT_DEFAULT) -> bool:
+    """gpu_runtime/ が「使える状態」か（`_read_ready_files` の真偽版）。"""
+    return _read_ready_files(base_dir, ort_module=ort_module) is not None
 
 
 def _normalize_device(prefer: Any) -> str:
@@ -245,7 +263,13 @@ def preload_gpu_dlls(base_dir: Path | None = None, ort_module: Any = _ORT_DEFAUL
     最初の InferenceSession 生成より前に一度だけ呼ぶこと（順序を誤るとシステム
     PATH 上の別バージョン cuDNN を掴む）。`main()` の冒頭で呼ぶ。
 
-    - `gpu_runtime/` が揃っていれば（＝凍結 exe が自前 DL 済み）そこからロード。
+    - `gpu_runtime/` が揃っていれば（＝自前 DL 済み、または他所からコピーされたもの）
+      そこからロード。provider DLL（location="capi"）は onnxruntime の capi/ に
+      複製されていないと ORT 自体が見つけられないので、ここで毎回ミラーする
+      （`_mirror_capi_files`）。これにより gpu_runtime/ フォルダを別ビルド/別マシンの
+      exe 隣にコピーするだけで動く（capi/ は `_internal/` 側にあり、アプリの
+      再インストールで消えるので、gpu_runtime/ を単一の持ち出し可能な source of
+      truth にしている）。
     - 揃っていなければ、pip で入れた `nvidia-*` wheel（ソース実行の開発者向け）を
       `ort.preload_dlls()` 既定探索で拾う。凍結 exe で未 DL の場合はどちらも
       no-op（`resolve_providers("auto")` が CPU を返すので実害なし）。
@@ -256,8 +280,11 @@ def preload_gpu_dlls(base_dir: Path | None = None, ort_module: Any = _ORT_DEFAUL
     if not callable(preload):
         return False
 
-    if gpu_runtime_ready(base_dir, ort_module=ort_mod):
-        directory = str(gpu_runtime_dir(base_dir))
+    files = _read_ready_files(base_dir, ort_module=ort_mod)
+    if files is not None:
+        directory_path = gpu_runtime_dir(base_dir)
+        directory = str(directory_path)
+        _mirror_capi_files(files, directory_path, ort_mod)
         _prepend_dll_search([directory])
         try:
             preload(cuda=True, cudnn=True, directory=directory)
@@ -309,6 +336,39 @@ def _prepend_dll_search(dirs: list[str]) -> None:
         new = [d for d in dirs if d not in have]
         if new:
             os.environ["PATH"] = os.pathsep.join(new + ([current] if current else []))
+
+
+def _mirror_capi_files(files: list[dict], root: Path, ort_module: Any) -> None:
+    """gpu_runtime/ 内の location="capi" ファイルを、実行中の onnxruntime の capi/ に
+    複製する。ONNX Runtime は provider DLL を自分（onnxruntime.dll / *.pyd）と同じ
+    ディレクトリからしか探さないため、gpu_runtime/ に置くだけでは足りない。
+
+    毎起動呼ぶことで、`_internal/` がアプリ更新で再生成されても、あるいは
+    gpu_runtime/ フォルダを別ビルドの exe 隣にコピーしただけでも、自動で復元される。
+    サイズ一致なら複製済みとみなしてスキップ（200MB 級を毎起動ハッシュ化しない）。
+    capi/ の場所が特定できない・書き込めない環境では黙って諦める
+    （CPU フォールバックで動くだけ）。
+    """
+    capi = capi_dir(ort_module)
+    if capi is None:
+        return
+    for entry in files:
+        if entry.get("location") != "capi":
+            continue
+        name = entry.get("name")
+        if not name:
+            continue
+        src = root / name
+        dst = capi / name
+        try:
+            if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+                continue
+            capi.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".part")
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+        except OSError as exc:
+            log_dbg(f"preload_gpu_dlls: could not mirror {name} into capi/ ({exc!r})")
 
 
 def _pip_nvidia_bin_dirs() -> list[str]:

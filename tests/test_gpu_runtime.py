@@ -7,6 +7,7 @@ Run:  rtk pytest tests/test_gpu_runtime.py -q
 import hashlib
 import io
 import json
+import shutil
 import sys
 import types
 import zipfile
@@ -65,11 +66,16 @@ def _sha(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def _fake_ort(tmp_path: Path):
+def _fake_ort(tmp_path: Path, *, with_preload: bool = False, version: str | None = None):
     """capi_dir() が <tmp>/onnxruntime/capi を返すようにする onnxruntime 代役。"""
     capi_parent = tmp_path / "onnxruntime"
     capi_parent.mkdir(parents=True, exist_ok=True)
-    return types.SimpleNamespace(__file__=str(capi_parent / "__init__.py"))
+    ns = types.SimpleNamespace(__file__=str(capi_parent / "__init__.py"))
+    if version is not None:
+        ns.__version__ = version
+    if with_preload:
+        ns.preload_dlls = lambda cuda=False, cudnn=False, directory=None: None
+    return ns
 
 
 def _spec(prov_sha=None, whl_sha=None):
@@ -163,10 +169,14 @@ def test_install_places_files_and_marks_ready(tmp_path):
     ok = _installer(tmp_path).install(_spec())
     assert ok is True
 
-    capi = tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll"
+    # Everything lands in gpu_runtime/ - including the capi-tagged provider DLL.
+    # It is NOT copied into onnxruntime/capi/ at install time (that only happens at
+    # startup, via preload_gpu_dlls -> _mirror_capi_files; see below).
+    prov = tmp_path / OP.GPU_RUNTIME_DIRNAME / "onnxruntime_providers_cuda.dll"
     cudnn = tmp_path / OP.GPU_RUNTIME_DIRNAME / "cudnn64_9.dll"
-    assert capi.read_bytes() == PROV_BYTES
+    assert prov.read_bytes() == PROV_BYTES
     assert cudnn.read_bytes() == CUDNN_BYTES
+    assert not (tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").exists()
 
     manifest = json.loads((tmp_path / OP.GPU_RUNTIME_DIRNAME / "manifest.json").read_text())
     names = {f["name"]: f["location"] for f in manifest["files"]}
@@ -178,10 +188,43 @@ def test_install_places_files_and_marks_ready(tmp_path):
     assert not (tmp_path / OP.GPU_RUNTIME_DIRNAME / ".staging").exists()
 
 
+def test_preload_mirrors_capi_file_from_gpu_runtime(tmp_path):
+    """The capi-tagged file gets copied into onnxruntime/capi/ at startup
+    (preload_gpu_dlls), not at install time - this is what lets gpu_runtime/ be
+    copied wholesale to a different build's exe directory and still work."""
+    assert _installer(tmp_path).install(_spec()) is True
+    capi_file = tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll"
+    assert not capi_file.exists()
+
+    ort = _fake_ort(tmp_path, with_preload=True, version="1.23.1")
+    assert OP.preload_gpu_dlls(base_dir=tmp_path, ort_module=ort) is True
+    assert capi_file.read_bytes() == PROV_BYTES
+
+
+def test_gpu_runtime_dir_is_portable_across_builds(tmp_path):
+    """Copying only gpu_runtime/ (no capi file) to a fresh 'build' still works: the
+    manifest + files under gpu_runtime/ are enough for gpu_runtime_ready(), and
+    preload_gpu_dlls() restores the capi mirror for whatever onnxruntime is running
+    there. This is the exact scenario a user hit copying gpu_runtime/ between a
+    source run and a built exe."""
+    src = tmp_path / "src_build"
+    assert _installer(src).install(_spec()) is True
+
+    dst = tmp_path / "other_build"
+    dst.mkdir()
+    shutil.copytree(src / OP.GPU_RUNTIME_DIRNAME, dst / OP.GPU_RUNTIME_DIRNAME)
+    # deliberately do NOT copy anything under src/onnxruntime/capi/
+
+    other_ort = _fake_ort(dst, with_preload=True, version="1.23.1")
+    assert OP.gpu_runtime_ready(dst, ort_module=other_ort) is True
+    assert OP.preload_gpu_dlls(base_dir=dst, ort_module=other_ort) is True
+    assert (dst / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").read_bytes() == PROV_BYTES
+
+
 def test_install_skips_placeholder_sha(tmp_path):
     ok = _installer(tmp_path).install(_spec(prov_sha="TODO_FILL_ON_WINDOWS", whl_sha="TODO"))
     assert ok is True
-    assert (tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").is_file()
+    assert (tmp_path / OP.GPU_RUNTIME_DIRNAME / "onnxruntime_providers_cuda.dll").is_file()
 
 
 # --- install failure modes -------------------------------------------
@@ -249,12 +292,22 @@ def test_install_missing_wheel_member_aborts(tmp_path):
     _assert_not_ready(tmp_path)
 
 
-def test_install_capi_location_without_capi_dir_aborts(tmp_path):
+def test_install_succeeds_even_when_capi_dir_unresolvable(tmp_path):
+    """Placement no longer needs onnxruntime's capi/ dir - only the startup mirror
+    step (preload_gpu_dlls) does, and it degrades gracefully (see next test)."""
     inst = GR.GpuRuntimeInstaller(base_dir=tmp_path, ort_module=types.SimpleNamespace(),
                                   http_get=_http_get(_URLS))
     ok = inst.install(_spec())
-    assert ok is False
-    _assert_not_ready(tmp_path)
+    assert ok is True
+    assert OP.gpu_runtime_ready(tmp_path, ort_module=types.SimpleNamespace()) is True
+
+
+def test_preload_mirror_noop_when_capi_dir_unresolvable(tmp_path, monkeypatch):
+    assert _installer(tmp_path).install(_spec()) is True
+    unresolvable = types.SimpleNamespace(preload_dlls=lambda **kw: None)  # no __file__
+    monkeypatch.setattr(OP, "log_dbg", lambda *a, **k: None)
+    # preload_gpu_dlls still proceeds (PATH/preload_dlls), just can't mirror into capi.
+    assert OP.preload_gpu_dlls(base_dir=tmp_path, ort_module=unresolvable) is True
 
 
 def test_install_download_404_aborts(tmp_path):
@@ -268,35 +321,60 @@ def test_install_download_404_aborts(tmp_path):
 def test_uninstall_removes_everything(tmp_path):
     inst = _installer(tmp_path)
     assert inst.install(_spec()) is True
+    # mirror the capi file first, so uninstall has something real to clean up there
+    ort = _fake_ort(tmp_path, with_preload=True, version="1.23.1")
+    assert OP.preload_gpu_dlls(base_dir=tmp_path, ort_module=ort) is True
+    capi_file = tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll"
+    assert capi_file.is_file()
+
     inst.uninstall()
     assert not (tmp_path / OP.GPU_RUNTIME_DIRNAME).exists()
-    assert not (tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").exists()
+    assert not capi_file.exists()
 
 
 # --- gpu_runtime_ready "files" form ---------------------------------
 
-def test_ready_files_form_missing_capi_file(tmp_path):
+def test_ready_files_form_missing_from_gpu_runtime_root(tmp_path):
+    """Readiness only looks at gpu_runtime/ root, regardless of a file's `location`
+    tag - a capi-tagged file absent from onnxruntime/capi/ does NOT matter; absent
+    from gpu_runtime/ itself does."""
     root = tmp_path / OP.GPU_RUNTIME_DIRNAME
     root.mkdir(parents=True)
     (root / "cudnn64_9.dll").write_bytes(b"x")
+    # deliberately don't create onnxruntime_providers_cuda.dll anywhere
     (root / "manifest.json").write_text(json.dumps({
         "schema": 1, "ort_version": "1.23.1",
         "files": [{"name": "cudnn64_9.dll", "location": "gpu_runtime"},
                   {"name": "onnxruntime_providers_cuda.dll", "location": "capi"}],
     }), encoding="utf-8")
-    # capi file not created -> not ready
     assert OP.gpu_runtime_ready(tmp_path, ort_module=_fake_ort(tmp_path)) is False
 
 
+def test_ready_files_ort_version_mismatch_is_not_ready(tmp_path):
+    root = tmp_path / OP.GPU_RUNTIME_DIRNAME
+    root.mkdir(parents=True)
+    (root / "cudnn64_9.dll").write_bytes(b"x")
+    (root / "manifest.json").write_text(json.dumps({
+        "schema": 1, "ort_version": "1.23.1",
+        "files": [{"name": "cudnn64_9.dll", "location": "gpu_runtime"}],
+    }), encoding="utf-8")
+    same = _fake_ort(tmp_path, version="1.23.1")
+    other = _fake_ort(tmp_path, version="1.24.0")
+    assert OP.gpu_runtime_ready(tmp_path, ort_module=same) is True
+    assert OP.gpu_runtime_ready(tmp_path, ort_module=other) is False
+
+
 def test_wheel_member_capi_location(tmp_path):
-    """A wheels entry may route a member to capi/ (used for onnxruntime_providers_cuda.dll)."""
+    """A wheels entry may route a member to capi/ (used for onnxruntime_providers_cuda.dll):
+    it still lands in gpu_runtime/ at install time, tagged for a later capi mirror."""
     spec = _spec()
     spec["direct"] = []
     spec["wheels"][0]["members"] = [
         {"arcname": "nvidia/cudnn/bin/cudnn64_9.dll", "name": "onnxruntime_providers_cuda.dll",
          "location": "capi"}]
     assert _installer(tmp_path).install(spec) is True
-    assert (tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").is_file()
+    assert (tmp_path / OP.GPU_RUNTIME_DIRNAME / "onnxruntime_providers_cuda.dll").is_file()
+    assert not (tmp_path / "onnxruntime" / "capi" / "onnxruntime_providers_cuda.dll").exists()
     m = json.loads((tmp_path / OP.GPU_RUNTIME_DIRNAME / "manifest.json").read_text())
     assert m["files"][0]["location"] == "capi"
     assert OP.gpu_runtime_ready(tmp_path, ort_module=_fake_ort(tmp_path)) is True
@@ -310,12 +388,12 @@ def test_wheel_member_bad_location_aborts(tmp_path):
 
 
 def test_ready_files_form_all_present(tmp_path):
+    """Both files only need to exist under gpu_runtime/ - the capi-tagged one does
+    NOT need a copy under onnxruntime/capi/ for readiness (that's preload's job)."""
     root = tmp_path / OP.GPU_RUNTIME_DIRNAME
     root.mkdir(parents=True)
     (root / "cudnn64_9.dll").write_bytes(b"x")
-    capi = tmp_path / "onnxruntime" / "capi"
-    capi.mkdir(parents=True)
-    (capi / "onnxruntime_providers_cuda.dll").write_bytes(b"x")
+    (root / "onnxruntime_providers_cuda.dll").write_bytes(b"x")
     (root / "manifest.json").write_text(json.dumps({
         "schema": 1, "files": [
             {"name": "cudnn64_9.dll", "location": "gpu_runtime"},

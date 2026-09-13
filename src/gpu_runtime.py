@@ -7,7 +7,9 @@ workers.GpuRuntimeDownloadWorker が薄く包んで呼ぶ。
   アプリのバージョンとコンポーネントは 1:1 で紐付く（version-lock）。
 - `direct`  … 単体ファイル（`onnxruntime_providers_cuda.dll` を GitHub Release から等）。
 - `wheels`  … NVIDIA 公式 PyPI wheel（再ホストしない）。zip から必要な DLL だけ取り出す。
-- すべて staging に落として SHA-256 検証してから所定位置へ `os.replace`。最後に
+- すべて staging に落として SHA-256 検証してから **すべて gpu_runtime/ へ** `os.replace`
+  （`location="capi"` のものも含む — gpu_runtime/ が唯一の持ち出し可能な source of
+  truth。capi/ への複製は onnx_providers.preload_gpu_dlls() が毎起動やる）。最後に
   `gpu_runtime/manifest.json` を書く。途中で失敗/中断したら manifest を書かないので
   onnx_providers.gpu_runtime_ready() は False のまま（再試行で上書きされる）。
 """
@@ -299,18 +301,19 @@ class GpuRuntimeInstaller:
         return actual
 
     def _place(self, planned: list[_Planned], log: LogCb) -> None:
+        # 全ファイルを常に gpu_runtime/ へ置く（location="capi" のものも含む）。
+        # gpu_runtime/ が唯一の持ち出し可能な source of truth になり、コピーするだけで
+        # 別ビルド/別マシンでも動くようにするため（Phase 4 で判明した「capi/ にしか
+        # 無いファイルの存在まで求めると、コピーしただけでは『未整備』判定になる」
+        # 問題への対応）。capi/ への複製は onnx_providers.preload_gpu_dlls() が
+        # 毎起動 gpu_runtime/ を見て自動でやる（ONNX Runtime は provider DLL を自分と
+        # 同じディレクトリからしか探さないため、capi/ への複製自体は避けられない）。
         for p in planned:
-            if p.location == "capi":
-                if self._capi is None:
-                    raise GpuRuntimeError("cannot locate onnxruntime capi/ directory")
-                target_dir = self._capi
-            else:
-                target_dir = self._root
             try:
-                target_dir.mkdir(parents=True, exist_ok=True)
-                os.replace(p.staged, target_dir / p.name)
+                self._root.mkdir(parents=True, exist_ok=True)
+                os.replace(p.staged, self._root / p.name)
             except OSError as exc:
-                raise GpuRuntimeError(f"cannot write {target_dir / p.name}: {exc}") from exc
+                raise GpuRuntimeError(f"cannot write {self._root / p.name}: {exc}") from exc
         log(f"placed {len(planned)} file(s)")
 
     def _write_manifest(self, spec: dict, planned: list[_Planned]) -> None:
