@@ -122,7 +122,9 @@ class Ui_MainWindow(object):
         main_window.right_vertical_splitter.addWidget(bulk_actions_group)
         main_window.right_vertical_splitter.addWidget(log_group)
         
-        main_window.right_vertical_splitter.setSizes([400, 200, 100])
+        # 初期は tagger レイアウト。captioner / VLM 切替時は
+        # MainWindow._rebalance_right_splitter が constants の値へ組み替える。
+        main_window.right_vertical_splitter.setSizes(constants.RIGHT_SPLIT_TAGGER)
         main_window.right_vertical_splitter.setStretchFactor(0, 4)
         main_window.right_vertical_splitter.setStretchFactor(1, 2)
         main_window.right_vertical_splitter.setStretchFactor(2, 1)
@@ -257,12 +259,20 @@ class Ui_MainWindow(object):
         main_window.caption_text_edit = QTextEdit()
         main_window.caption_text_edit.setPlaceholderText(main_window.locale_manager.get_string("MainWindow", "Caption_Placeholder"))
         main_window.caption_text_edit.setVisible(False)
-        tag_panel.addWidget(main_window.caption_text_edit)
+        # captioner / VLM モードではタグボタン群が消えるので、この編集欄が余った縦領域を
+        # すべて埋めるようにする（stretch=1）。tag_panel 末尾のばね（addStretch）は
+        # ModelModeController が text_ui のとき stretch=0 に殺すので、編集欄の下に空きが
+        # 出ず、長文でも不要なスクロールが発生しない。
+        main_window.caption_text_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        main_window.caption_text_edit.setMinimumHeight(120)
+        tag_panel.addWidget(main_window.caption_text_edit, 1)
 
         # 生成キャプションを既存 .txt にどう入れるか（前に追加 / 後に追加 / 上書き）。
         # 排他のトグルボタンで、押した1つだけが押しっぱなしになる。danbooru タグと
         # 自然言語を1ファイルに同居させるモデル向け（2026-08-31 ユーザー要望）。
-        main_window.caption_placement_widget = QWidget()
+        # 親を main_window にしておく（この後 shared_run_block へ addWidget で移すまでの間、
+        # 親なしトップレベルにならないように）。
+        main_window.caption_placement_widget = QWidget(main_window)
         placement_row = QHBoxLayout(main_window.caption_placement_widget)
         placement_row.setContentsMargins(0, 0, 0, 0)
         main_window.caption_placement_group = QButtonGroup(main_window)
@@ -284,7 +294,9 @@ class Ui_MainWindow(object):
             current_placement, main_window.caption_placement_buttons["OVERWRITE"]).setChecked(True)
         main_window.caption_placement_group.buttonClicked.connect(main_window._on_caption_placement_changed)  # type: ignore
         main_window.caption_placement_widget.setVisible(False)
-        tag_panel.addWidget(main_window.caption_placement_widget)
+        # NOTE: caption_placement_widget は viewer ではなく section[1] の shared_run_block へ
+        # 載せる（_create_bulk_actions_group）。Run ボタン直上に「出力の入れ方」系をまとめ、
+        # tagger/captioner/VLM のどのモードでも同じ位置に出すため。ここでは生成だけ。
 
         main_window.task_combo = QComboBox()
         main_window.task_combo.setToolTip(main_window.locale_manager.get_string("MainWindow", "Task_Combo_Tooltip"))
@@ -319,30 +331,55 @@ class Ui_MainWindow(object):
         add_tag_layout.addWidget(main_window.add_single_tag_line)
         add_tag_layout.addWidget(main_window.add_single_tag_button)
         tag_panel.addLayout(add_tag_layout)
-        
+
+        # tagger モードでは caption_text_edit が隠れて stretch が効かないので、この末尾の
+        # ばねで下端の余白を保持し、タグ関連ウィジェットを上詰めにする。caption / VLM
+        # モードでは ModelModeController がこのばねを stretch=0 にして殺し、
+        # caption_text_edit(stretch=1) が編集欄を縦いっぱいへ伸ばす。
         tag_panel.addStretch(1)
+        main_window._tag_panel_layout = tag_panel
+        main_window._tag_panel_bottom_spacer_index = tag_panel.count() - 1
         return tag_panel_widget
 
     def _create_bulk_actions_group(self, main_window: 'MainWindow') -> QWidget:
-        """Creates the widget containing all bulk action and settings controls."""
+        """右スプリッター section[1]。
+
+        - ``tagger_config_block``: 一括削除／一括追加＋しきい値・最大タグ数スライダー。
+          ONNX タガー専用なので captioner / VLM 接続時は丸ごと非表示（ModelModeController）。
+        - ``shared_run_block``: 生成キャプションの挿入位置・既存ファイルモード・対象モード・
+          Run ボタン。どのモードでも表示し、Run 直上へ集約する。
+        """
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        
+
+        # --- tagger 専用ブロック（captioner / VLM では非表示） ---
+        main_window.tagger_config_block = QWidget()
+        tcb_layout = QVBoxLayout(main_window.tagger_config_block)
+        tcb_layout.setContentsMargins(0, 0, 0, 0)
+
         bulk_edit_layout = QHBoxLayout()
         main_window.bulk_delete_group = self._create_bulk_delete_group(main_window)
         main_window.bulk_add_group = self._create_bulk_add_group(main_window)
         bulk_edit_layout.addWidget(main_window.bulk_delete_group, 3)
         bulk_edit_layout.addWidget(main_window.bulk_add_group, 1)
-        layout.addLayout(bulk_edit_layout)
+        tcb_layout.addLayout(bulk_edit_layout)
+        tcb_layout.addWidget(self._create_tagger_sliders(main_window))
 
-        settings_group = self._create_settings_group(main_window)
-        layout.addWidget(settings_group)
-        
+        layout.addWidget(main_window.tagger_config_block)
+
+        # --- 共通ブロック（常時表示） ---
+        main_window.shared_run_block = QWidget()
+        srb_layout = QVBoxLayout(main_window.shared_run_block)
+        srb_layout.setContentsMargins(0, 0, 0, 0)
+        srb_layout.addWidget(main_window.caption_placement_widget)
+        srb_layout.addLayout(self._create_mode_row(main_window))
+
         main_window.run_button = QPushButton(main_window.locale_manager.get_string("Constants", "Tag_Button_Text"))
         main_window.run_button.setStyleSheet(constants.STYLE_BTN_GREEN)
-        layout.addWidget(main_window.run_button)
-        
+        srb_layout.addWidget(main_window.run_button)
+
+        layout.addWidget(main_window.shared_run_block)
         return widget
 
     def _create_bulk_delete_group(self, main_window: 'MainWindow') -> QGroupBox:
@@ -418,8 +455,8 @@ class Ui_MainWindow(object):
         layout.addStretch(1)
         return group
 
-    def _create_settings_group(self, main_window: 'MainWindow') -> QWidget:
-        """Creates the widget for threshold and limit sliders."""
+    def _create_tagger_sliders(self, main_window: 'MainWindow') -> QWidget:
+        """しきい値・最大タグ数スライダーとカテゴリ設定ボタンの行（ONNX タガー専用）。"""
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -451,13 +488,13 @@ class Ui_MainWindow(object):
         layout.addWidget(thresh_group, 1)
         layout.addWidget(limit_group, 1)
         layout.addWidget(main_window.category_settings_button, 0)
+        return widget
 
-        # 既存 .txt の扱い（ASK / OVERWRITE / SKIP / APPEND）。スライダー行は既に
-        # 混み合っているので、独立した行に置く（spec.md 6.1節）。
-        outer = QVBoxLayout()
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(widget)
-
+    def _create_mode_row(self, main_window: 'MainWindow') -> QHBoxLayout:
+        """既存ファイルの扱い（ASK / OVERWRITE / SKIP / APPEND）と一括処理の対象選択
+        （すべて / 未生成のみ / 失敗のみ / 選択画像のみ）を Run ボタン直上へ並べる行。
+        tagger / captioner / VLM のどのモードでも意味があるので常時表示（spec.md 6.1節・
+        260903_vlm-gap-fix.md todo 5）。"""
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel(main_window.locale_manager.get_string("MainWindow", "Existing_Mode_Label")))
         main_window.existing_mode_combo = QComboBox()
@@ -471,8 +508,6 @@ class Ui_MainWindow(object):
         main_window.existing_mode_combo.currentIndexChanged.connect(main_window._on_existing_mode_changed)  # type: ignore
         mode_row.addWidget(main_window.existing_mode_combo)
 
-        # 一括処理の対象選択（すべて / 未生成のみ / 失敗のみ / 選択画像のみ）。
-        # 実行ボタンのすぐ上、既存ファイル設定と同じ行に置く（260903_vlm-gap-fix.md todo 5）。
         mode_row.addSpacing(12)
         mode_row.addWidget(QLabel(main_window.locale_manager.get_string("MainWindow", "Target_Mode_Label")))
         main_window.target_mode_combo = QComboBox()
@@ -487,11 +522,7 @@ class Ui_MainWindow(object):
         mode_row.addWidget(main_window.target_mode_combo)
 
         mode_row.addStretch(1)
-        outer.addLayout(mode_row)
-
-        container = QWidget()
-        container.setLayout(outer)
-        return container
+        return mode_row
 
     def _create_log_group(self, main_window: 'MainWindow') -> QGroupBox:
         """Creates the group for the execution log."""

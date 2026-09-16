@@ -139,6 +139,13 @@ MAX_LOG_LINES = 1000
 # （issue #10: 全ファイルの旧内容＋新内容を1つの CompositeUndoAction に抱えるとメモリを圧迫する）。
 UNDO_BATCH_SNAPSHOT_LIMIT = 500
 
+# 右パネルの縦スプリッター [viewer, bulk_actions(section[1]), log] の初期サイズ。
+# tagger は現行どおり。captioner / VLM では section[1] を shared_run_block の高さへ畳み、
+# 余りを viewer（キャプション編集欄）へ回す（ModelModeController._apply_model_type_ui ->
+# MainWindow._rebalance_right_splitter）。
+RIGHT_SPLIT_TAGGER = [400, 200, 100]
+RIGHT_SPLIT_TEXT = [560, 120, 100]
+
 # --- UI TEXT ---
 MSG_WINDOW_TITLE = "PixAI Tagger 0.9 onnx GUI (Viewer/Bulk Edit)"
 

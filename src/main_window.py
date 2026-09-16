@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget,
     QGridLayout, QLabel, QLineEdit, QPushButton,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QDialog,
-    QStackedWidget, QApplication, QSplitter, QListWidgetItem, QComboBox, QButtonGroup
+    QStackedWidget, QApplication, QSplitter, QListWidgetItem, QComboBox, QButtonGroup,
+    QProgressDialog
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QKeyEvent, QResizeEvent, QDragEnterEvent,
@@ -31,7 +32,7 @@ from tag_utils import load_tag_translation_map
 from tagging_core import ExistingFileMode, OverwriteDecision
 from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSettingsDialog
 from grid_view_widget import GridViewWidget
-from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker
+from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker
 from vlm_worker import VlmCaptionWorker
 from locale_manager import LocaleManager
 from ui_main_window import Ui_MainWindow
@@ -121,6 +122,9 @@ class MainWindow(QMainWindow):
     redo_button: QPushButton
     bulk_delete_group: QWidget
     bulk_add_group: QWidget
+    tagger_config_block: QWidget
+    shared_run_block: QWidget
+    category_settings_button: QPushButton
 
     # --- Signals ---
     request_overwrite_check = Signal(str, str)
@@ -172,6 +176,9 @@ class MainWindow(QMainWindow):
         self._vlm_settings_dialog = None
         self._download_thread: QThread | None = None
         self._downloader_worker: DownloaderWorker | None = None
+        self._gpu_dl_thread: QThread | None = None
+        self._gpu_dl_worker: GpuRuntimeDownloadWorker | None = None
+        self._gpu_dl_progress: QProgressDialog | None = None
         self._bulk_tag_thread: QThread | None = None
         self._bulk_tag_worker: BulkTagWorker | None = None
         self.tag_thread: QThread | None = None
@@ -218,6 +225,9 @@ class MainWindow(QMainWindow):
         # False while a download/tagging run holds the UI lock; consulted by
         # _update_undo_redo_buttons so a mid-run action push cannot re-enable Undo.
         self._controls_enabled: bool = True
+        # 直近に適用した text_ui（captioner / VLM）状態。None は未適用。
+        # _rebalance_right_splitter がモード切替時だけ縦割当を組み替えるための差分基準。
+        self._last_text_ui: bool | None = None
         self._category_settings_dialog: QDialog | None = None
         self._image_viewer_dialog: ImageViewerDialog | None = None
         
@@ -255,6 +265,184 @@ class MainWindow(QMainWindow):
         # UI (no caption box / task selector), and the threshold sliders keep whatever
         # global value was last saved instead of the selected model's own defaults.
         self._model_mode.on_model_changed(self._current_model_entry())
+        self._maybe_prompt_gpu_setup()
+
+    def _maybe_prompt_gpu_setup(self):
+        """NVIDIA GPU が使えるビルドで GPU コンポーネント未整備なら、ダウンロードを尋ねる。
+
+        3 択: ダウンロードする / 今はしない（次回また尋ねる）/ 使わない（次回から聞かない）。
+        「使わない」を選んだ後に気が変わった人は config.ini [Behavior] gpu_setup_prompt = ask
+        で復活できる。ただし gpu_runtime/ が中途半端に壊れている場合は、dismissed でも
+        修復のために 1 度だけ尋ねる。
+
+        `CUDAExecutionProvider` は onnxruntime-gpu にコンパイルされているという静的な
+        事実でしかなく、実機に NVIDIA GPU があるかは見ていない。なので
+        `onnx_providers.has_nvidia_gpu()`（nvidia-smi の有無）で実機確認を挟み、
+        AMD/Intel/GPU 無し環境に無意味な約1.8GBの提案をしないようにする
+        （cubic review, PR #21）。
+        """
+        beh = self.settings.behavior
+        if beh.onnx_device == "cpu":
+            return
+        if self._gpu_dl_thread and self._gpu_dl_thread.isRunning():
+            return
+        try:
+            import onnxruntime
+            import onnx_providers
+            import gpu_runtime
+            if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+                return  # this build has no CUDA support -> nothing to offer
+            if onnx_providers.gpu_runtime_ready():
+                return  # components already installed
+            if not onnx_providers.has_nvidia_gpu():
+                return  # no NVIDIA GPU detected on this machine -> nothing to offer
+            # dismissed suppresses the prompt, except when a partly-installed gpu_runtime/
+            # is sitting there broken (crashed download etc.) - offer to repair it once.
+            partial = onnx_providers.gpu_runtime_dir().exists()
+            if beh.gpu_setup_prompt != "ask" and not partial:
+                return
+            spec = gpu_runtime.load_component_spec()
+        except Exception:
+            return
+        if spec is None:
+            return  # no (valid) gpu_components.json bundled -> dev build or unpinned
+
+        gb = gpu_runtime.spec_total_bytes(spec) / (1024 ** 3)
+        size_txt = (f"{gb:.1f} GB" if gb >= 0.05
+                    else self.locale_manager.get_string("Gpu", "Prompt_Size_Unknown"))
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(self.locale_manager.get_string("Gpu", "Prompt_Title"))
+        box.setText(self.locale_manager.get_string("Gpu", "Prompt_Body", size=size_txt))
+        dl_btn = box.addButton(self.locale_manager.get_string("Gpu", "Prompt_Download"),
+                               QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(self.locale_manager.get_string("Gpu", "Prompt_Later"),
+                      QMessageBox.ButtonRole.RejectRole)
+        never_btn = box.addButton(self.locale_manager.get_string("Gpu", "Prompt_Never"),
+                                  QMessageBox.ButtonRole.DestructiveRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is dl_btn:
+            self._start_gpu_runtime_download()
+        elif clicked is never_btn:
+            beh.gpu_setup_prompt = "dismissed"
+            self.save_current_config()
+            if partial:
+                # This was the repair prompt (a broken gpu_runtime/ made `partial`
+                # true and bypassed the dismissed check above) - without clearing
+                # it, `partial` stays true forever and this same prompt would keep
+                # reappearing on every launch even though the user just said Never
+                # (CodeRabbit review, PR #21). `gpu_runtime` was already imported
+                # above (same function scope).
+                try:
+                    gpu_runtime.GpuRuntimeInstaller().uninstall()
+                except Exception as exc:  # noqa: BLE001
+                    write_debug_log(f"_maybe_prompt_gpu_setup: could not clear broken gpu_runtime/ ({exc!r})")
+                if onnx_providers.gpu_runtime_dir().exists():
+                    # uninstall() swallows per-file OSError (locked/permission-denied
+                    # files) so gpu_runtime/ can survive it; the repair prompt will
+                    # then keep reappearing despite Never (cubic review, PR #21).
+                    # There's no unconditional way to force-remove a locked file, so
+                    # this is diagnostic only - the existing `onnx_device = cpu`
+                    # config escape hatch still stops the prompt outright.
+                    write_debug_log("_maybe_prompt_gpu_setup: gpu_runtime/ still present after "
+                                    "uninstall() - the repair prompt may reappear next launch")
+
+    def _start_gpu_runtime_download(self):
+        if self._gpu_dl_thread and self._gpu_dl_thread.isRunning():
+            return
+        self.update_log(self.locale_manager.get_string("Gpu", "Download_Start"), "black")
+
+        progress = QProgressDialog(
+            self.locale_manager.get_string("Gpu", "Download_Progress_Label"),
+            self.locale_manager.get_string("Gpu", "Download_Cancel"), 0, 100, self)
+        progress.setWindowTitle(self.locale_manager.get_string("Gpu", "Prompt_Title"))
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        progress.canceled.connect(self._cancel_gpu_runtime_download)
+        # WA_DeleteOnClose means the underlying C++ object can be destroyed by the
+        # user clicking the dialog's own close button (not just our Cancel/close()
+        # calls) at any time. `destroyed` fires synchronously right when that
+        # happens, so this is the one place that reliably keeps our reference in
+        # sync - without it, a later access (from the async finished handler) can
+        # hit an already-deleted PySide6 wrapper and raise RuntimeError
+        # (cubic review, PR #21).
+        progress.destroyed.connect(self._on_gpu_dl_progress_destroyed)
+        self._gpu_dl_progress = progress
+
+        self._gpu_dl_thread = QThread()
+        self._gpu_dl_worker = GpuRuntimeDownloadWorker(self.locale_manager.get_string)
+        self._gpu_dl_worker.moveToThread(self._gpu_dl_thread)
+        self._gpu_dl_worker.log_message.connect(self.update_log)
+        self._gpu_dl_worker.progress_update.connect(self._on_gpu_runtime_progress)
+        self._gpu_dl_worker.download_finished.connect(self._on_gpu_runtime_finished)
+        self._gpu_dl_thread.started.connect(self._gpu_dl_worker.run_download)
+        self._gpu_dl_thread.start()
+        progress.show()
+
+    def _cancel_gpu_runtime_download(self):
+        if self._gpu_dl_worker:
+            self.update_log(self.locale_manager.get_string("Gpu", "Download_Cancelling"), "orange")
+            self._gpu_dl_worker.stop()
+
+    def _on_gpu_dl_progress_destroyed(self):
+        self._gpu_dl_progress = None
+
+    def _on_gpu_runtime_progress(self, percent: int, done_mb: float, total_mb: float):
+        if not self._gpu_dl_progress:
+            return
+        if total_mb > 0:
+            self._gpu_dl_progress.setRange(0, 100)
+            self._gpu_dl_progress.setValue(percent)
+            self._gpu_dl_progress.setLabelText(
+                self.locale_manager.get_string("Gpu", "Download_Progress_Detail",
+                                               done=f"{done_mb:.0f}", total=f"{total_mb:.0f}"))
+        else:
+            self._gpu_dl_progress.setRange(0, 0)  # indeterminate
+
+    def _on_gpu_runtime_finished(self, ok: bool):
+        if self._is_shutting_down:
+            return  # closeEvent stops/joins the thread itself
+        # Capture before the worker is torn down below: install() returns False for
+        # both cancellation and genuine failure, collapsing them into one bool.
+        # Without this, cancelling a download pops the scary "Download failed"
+        # dialog even though the user asked for exactly this (CodeRabbit, PR #21).
+        # `not ok` guards a narrow race (cubic review, PR #21): install() can
+        # finish successfully right as the user clicks Cancel, so is_stopped() may
+        # be true even though ok is also true - that must still show the success
+        # dialog, not be silently swallowed as "cancelled".
+        cancelled = bool(not ok and self._gpu_dl_worker and self._gpu_dl_worker.is_stopped())
+        if self._gpu_dl_progress:
+            # close() counts as a cancel for QProgressDialog and would re-fire
+            # canceled -> _cancel_gpu_runtime_download; drop the connection first.
+            # Both calls are guarded: _on_gpu_dl_progress_destroyed (connected to
+            # `destroyed`) is the normal way this reference gets cleared, but a
+            # user-initiated close (WA_DeleteOnClose) can race ahead of us.
+            try:
+                self._gpu_dl_progress.canceled.disconnect(self._cancel_gpu_runtime_download)
+                self._gpu_dl_progress.close()  # WA_DeleteOnClose frees it
+            except (RuntimeError, TypeError):
+                pass  # already destroyed (e.g. user closed the dialog directly)
+            self._gpu_dl_progress = None
+        if self._gpu_dl_thread:
+            self._gpu_dl_thread.quit()
+            self._gpu_dl_thread.wait()
+            if self._gpu_dl_worker:
+                self._gpu_dl_worker.deleteLater()
+            self._gpu_dl_thread.deleteLater()
+            self._gpu_dl_thread = self._gpu_dl_worker = None
+        if cancelled:
+            return  # already logged via Download_Cancelling / Worker_Stopped
+        title = self.locale_manager.get_string("Gpu", "Prompt_Title")
+        if ok:
+            QMessageBox.information(self, title,
+                                   self.locale_manager.get_string("Gpu", "Download_Done_Restart"))
+        else:
+            QMessageBox.warning(self, title,
+                                self.locale_manager.get_string("Gpu", "Download_Failed"))
 
     def _apply_image_list_selection_style(self):
         """ダークモード時にファイルリストの選択色を見やすい色に上書きする。"""
@@ -878,6 +1066,25 @@ class MainWindow(QMainWindow):
         self.add_tag_line.setEnabled(enabled)
         self.add_tag_line_append.setEnabled(enabled)
 
+    def _rebalance_right_splitter(self, text_ui: bool) -> None:
+        """モデル種別／VLM トグルで text_ui（captioner / VLM）が変わったときだけ、右パネルの
+        縦スプリッターの割当を組み替える。毎回呼んでも実際に切り替わったときしか動かないので、
+        利用者が手でドラッグしたサイズを踏み潰さない。サイズ定数は constants に集約
+        （ui_main_window の初期 setSizes と同じ出所）。"""
+        if text_ui == self._last_text_ui:
+            return
+        self._last_text_ui = text_ui
+        sp = getattr(self, "right_vertical_splitter", None)
+        if sp is None:
+            return
+        if text_ui:
+            # section[1] は shared_run_block の高さに固定し、伸縮は viewer(0) と log(2) が受ける。
+            sp.setStretchFactor(1, 0)
+            sp.setSizes(constants.RIGHT_SPLIT_TEXT)
+        else:
+            sp.setStretchFactor(1, 2)
+            sp.setSizes(constants.RIGHT_SPLIT_TAGGER)
+
     def closeEvent(self, event: QCloseEvent):
         """Handles the window closing event to save settings and stop threads gracefully."""
         self._is_shutting_down = True
@@ -886,6 +1093,7 @@ class MainWindow(QMainWindow):
 
         threads_to_stop: list[tuple[QThread | None, StoppableWorker | None]] = [ # type: ignore
             (self._download_thread, self._downloader_worker),
+            (self._gpu_dl_thread, self._gpu_dl_worker),
             (self._tagger_thread, self._tagger_worker),
             (self._bulk_tag_thread, self._bulk_tag_worker),
             (self.tag_thread, self.tag_worker)

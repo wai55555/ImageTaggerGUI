@@ -132,12 +132,13 @@ class ModelModeController:
         mw.add_single_tag_label.setVisible(not text_ui)
         mw.add_single_tag_line.setVisible(not text_ui)
         mw.add_single_tag_button.setVisible(not text_ui)
-        mw.bulk_delete_group.setVisible(not text_ui)
-        mw.bulk_add_group.setVisible(not text_ui)
+        # 一括削除／一括追加＋しきい値・最大タグ数スライダーは ONNX タガー専用。
+        # 個別 hide ではなくブロックごと隠すことで、消えた跡の空白と片欠けを防ぎ、
+        # 縦スプリッターの再配分（_rebalance_right_splitter）が効くようにする。
+        if hasattr(mw, "tagger_config_block"):
+            mw.tagger_config_block.setVisible(not text_ui)
         # Undo/Redo stays visible in text mode - text edits are undoable too
         # (2026-08-31 user decision).
-        if hasattr(mw, "category_settings_button"):
-            mw.category_settings_button.setVisible(not text_ui)
         if hasattr(mw, "grid_view_widget"):
             mw.grid_view_widget.set_caption_mode(text_ui)
         # Grid-view (3x3 edit) tag search filter is a separate widget tree
@@ -157,6 +158,17 @@ class ModelModeController:
             mw.use_vlm_check.blockSignals(True)
             mw.use_vlm_check.setChecked(use_vlm)
             mw.use_vlm_check.blockSignals(False)
+
+        # tagger_config_block が消えた縦領域をキャプション編集欄へ回す。モードが実際に
+        # 切り替わったときだけ実行し、利用者が手でドラッグしたサイズを毎回踏み潰さない。
+        if hasattr(mw, "_rebalance_right_splitter"):
+            mw._rebalance_right_splitter(text_ui)
+
+        # tag_panel 末尾のばねを、text_ui のときは殺す（caption_text_edit を縦いっぱいへ）、
+        # tagger のときは効かせる（タグ関連ウィジェットを上詰めにし下端に余白を残す）。
+        if hasattr(mw, "_tag_panel_layout"):
+            mw._tag_panel_layout.setStretch(mw._tag_panel_bottom_spacer_index, 0 if text_ui else 1)
+            mw._tag_panel_layout.activate()
 
         # 既存ファイルの扱いは captioner でも4モードすべて選べる（existing_mode_combo の
         # APPEND 項目は ui_main_window.py で作成時から常に有効で、無効化している箇所は

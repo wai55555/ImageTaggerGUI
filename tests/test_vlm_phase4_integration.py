@@ -23,9 +23,24 @@ _vcdir = Path(tempfile.mkdtemp())
 _VC.VLM_CONNECTIONS_PATH = _vcdir / "vlm_connections.json"
 _VC.VLM_PROFILES_PATH = _vcdir / "vlm_profiles.json"
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 _APP = QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_prompt(monkeypatch):
+    """This file never exercises the GPU-setup prompt. On a dev box that actually
+    has an NVIDIA GPU + a CUDA-enabled onnxruntime, MainWindow()'s initial_load()
+    would otherwise reach _maybe_prompt_gpu_setup() and pop a real, unpatched
+    QMessageBox that hangs forever under the offscreen platform. Scoped via the
+    monkeypatch fixture (auto-undone per test) rather than a permanent module
+    mutation, since onnx_providers is a single shared module object across the
+    whole pytest session/process - a bare assignment here would leak into other
+    test files' own assertions about has_nvidia_gpu()."""
+    import onnx_providers as _OP
+    monkeypatch.setattr(_OP, "has_nvidia_gpu", lambda *a, **k: False)
 
 
 def _mw_ready(vlm_enabled: bool = False):
@@ -54,11 +69,23 @@ def test_use_vlm_toggle_surfaces_ui_and_hides_tag_grid():
     assert w.tag_grid_container.isHidden()
     assert w.task_combo.isHidden(), "Florence-2 task combo is irrelevant for VLM"
     assert not w.caption_placement_widget.isHidden()
+    # tagger-only bulk edit + threshold sliders collapse as one block; the shared
+    # run block (placement / modes / Run) stays.
+    assert w.tagger_config_block.isHidden()
+    assert not w.shared_run_block.isHidden()
+    assert not w.run_button.isHidden()
+    assert w._last_text_ui is True  # _rebalance_right_splitter ran for the switch
+    # the tag-panel bottom spacer is killed so caption_text_edit fills the panel
+    assert w._tag_panel_layout.stretch(w._tag_panel_bottom_spacer_index) == 0
 
     w.use_vlm_check.setChecked(False)
     _APP.processEvents()
     assert w.settings.vlm.enabled is False
     assert not w.tag_grid_container.isHidden()
+    assert not w.tagger_config_block.isHidden()
+    assert w._last_text_ui is False
+    # spacer active again -> tagger widgets top-packed
+    assert w._tag_panel_layout.stretch(w._tag_panel_bottom_spacer_index) == 1
     w.close()
     print("  Use-VLM toggle surfaces VLM UI, hides tag grid, restores on off: OK")
 

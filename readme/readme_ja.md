@@ -46,6 +46,7 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 ### 2. パワフルな自動タグ付け
 - **高速なONNX Runtime**: CPUでも軽快に動作するONNXモデルを採用。大量の画像もストレスなく処理します。
 - **モデル自動ダウンロード**: 選択したモデルと必要なメタデータを、設定された配布元からボタン一つでダウンロードできます。面倒な手作業は不要です。
+- **GPU対応（NVIDIA・任意）**: NVIDIA GPUがあると、起動時の確認ダイアログからGPUコンポーネント（2GB前後）を一度ダウンロードし、アプリを再起動すればtaggerをCUDAで実行できます（実測RTX 4070で約28倍高速）。ダウンロードしなくても、また非NVIDIA環境でも、従来どおりCPUで動作します。キャプション（Florence-2）は量子化モデルの都合でCPUのままです。切り替えは`config.ini`の`[Behavior] onnx_device`（`auto`／`cpu`／`cuda`）。
 
 ### 3. 柔軟で高度なタグ編集
 - **個別編集**:
@@ -72,11 +73,10 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 
 
 ## ~~実装予定 (To Be Released)~~
-- GPU利用、onnxruntime-directml
-- ~~GPU利用を `config.ini` で切り替えられるようにして高速化~~
-onnxruntime-gpuにCUDA tool kit、NVIDIA Developer Programへのユーザー登録必須なcuDNNが必要と判明。venv環境構築までやれば自動DLに導入も実用的だが...　考慮中
+- ~~GPU利用（onnxruntime-directml、AMD/Intel等の汎用GPU向け）~~
+  → NVIDIA向け`onnxruntime-gpu`（CUDA）で実装（上記「GPU対応」参照）。directmlとCUDAは排他関係のため、両対応には別ビルドが必要になり見送り。
 - ~~バッチ処理対応による高速化~~
-ONNX Runtimeではオーバーヘッドが発生してバッチ処理による高速化はできなかった
+  → ONNX Runtimeではオーバーヘッドが発生し、バッチ処理による高速化効果は得られなかった。
 
 ## ライセンス (License)
 
@@ -86,4 +86,4 @@ ONNX Runtimeではオーバーヘッドが発生してバッチ処理による�
 
 - このツールは [PixAI](https://pixai.art/) 様によってトレーニングされた素晴らしいタグ付けモデルを利用しています。Pixai Taggerが公開されていなければ、このアプリケーションは生まれませんでした。心から感謝申し上げます。
 - ONNXモデルは [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)様 によってHugging Faceで公開されているものを利用しています。ありがとうございます。
-- 追加対応しているモデルとその ONNX を公開してくださっている作者の皆さまにも感謝します。 [SmilingWolf](https://huggingface.co/SmilingWolf)（WD タガー系）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle）、および Florence-2（Microsoft）の ONNX 一式を公開する [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) の各氏。各モデルのライセンスは配布元に従います。
+- 追加対応しているモデルとその ONNX を公開してくださっている作者の皆さまにも感謝します。 [SmilingWolf](https://huggingface.co/SmilingWolf)（WD tagger系）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle）、および Florence-2（Microsoft）の ONNX 一式を公開する [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) の各氏。各モデルのライセンスは配布元に従います。

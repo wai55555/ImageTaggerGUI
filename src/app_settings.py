@@ -86,6 +86,14 @@ class Behavior:
     # 一括処理の対象選択。既定 ALL によりこのキーを持たない旧 config.ini でも
     # 従来どおり全画像を処理する（260903_vlm-gap-fix.md todo 5）。
     target_mode: str = "ALL"
+    # ローカル ONNX 推論のデバイス希望。auto / cpu / cuda。
+    # 既定 auto は「GPU コンポーネント（gpu_runtime/）が揃っていれば CUDA、無ければ CPU」で、
+    # 未整備の環境では従来どおり CPU 動作になる（docs/260910_gpu_acceleration_impl_plan.md）。
+    onnx_device: str = "auto"
+    # 初回に NVIDIA GPU を検出したときの「GPU コンポーネントをダウンロードしますか」
+    # ダイアログを出すか。ask / dismissed。dismissed は「使わない・次回から聞かない」。
+    # 設定画面のボタンからはいつでもダウンロードできる。
+    gpu_setup_prompt: str = "ask"
 
 @dataclass
 class Window:
@@ -121,6 +129,23 @@ def parse_target_mode_setting(raw: str) -> str:
     持たない旧 config.ini と同じ挙動）へフォールバックする。"""
     value = str(raw).strip().upper()
     return value if value in TARGET_MODES else "ALL"
+
+
+ONNX_DEVICES: tuple[str, ...] = ("auto", "cpu", "cuda")
+GPU_SETUP_PROMPT_STATES: tuple[str, ...] = ("ask", "dismissed")
+
+
+def parse_onnx_device(raw: str) -> str:
+    """[Behavior] onnx_device を検証する。空文字・不正値は auto（＝GPU コンポーネントが
+    無ければ CPU、というこのキーを持たない旧 config.ini と同じ実効挙動）へ。"""
+    value = str(raw).strip().lower()
+    return value if value in ONNX_DEVICES else "auto"
+
+
+def parse_gpu_setup_prompt(raw: str) -> str:
+    """[Behavior] gpu_setup_prompt を検証する。空文字・不正値は ask へ。"""
+    value = str(raw).strip().lower()
+    return value if value in GPU_SETUP_PROMPT_STATES else "ask"
 
 
 def _parse_onnx_threads(raw: str) -> int:
@@ -232,7 +257,7 @@ def get_default_config() -> configparser.ConfigParser:
         'Paths': {'input_dir': str(BASE_DIR / "inputs"), 'model_dir': MODEL_DIR_NAME, 'model_filename': 'model.onnx'},
         'Thresholds': {'general': '0.40', 'character': '0.65', 'rating': '0.50', 'copyright': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
         'Limits': {'general': '55', 'character': '1', 'rating': '0', 'copyright': '0', 'artist': '0', 'meta': '0', 'model': '0', 'quality': '0', 'year': '0', 'touched': ''},
-        'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL'},
+        'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL', 'onnx_device': 'auto', 'gpu_setup_prompt': 'ask'},
         'Window': {'geometry': '986x976+50+50', 'tag_display_rows': '6', 'tag_display_cols': '5'},
         'Model': {'model_id': 'pixai-tagger-v0.9', 'verified_models': ''},
         'Caption': {'task': 'MORE_DETAILED_CAPTION', 'placement': 'OVERWRITE'},
@@ -340,7 +365,9 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
             convert_underscore_to_space=config.getboolean('Behavior', 'convert_underscore_to_space', fallback=True),
             existing_file_mode=config.get('Behavior', 'existing_file_mode', fallback='ASK'),
             onnx_threads=_parse_onnx_threads(config.get('Behavior', 'onnx_threads', fallback='0')),
-            target_mode=parse_target_mode_setting(config.get('Behavior', 'target_mode', fallback='ALL'))
+            target_mode=parse_target_mode_setting(config.get('Behavior', 'target_mode', fallback='ALL')),
+            onnx_device=parse_onnx_device(config.get('Behavior', 'onnx_device', fallback='auto')),
+            gpu_setup_prompt=parse_gpu_setup_prompt(config.get('Behavior', 'gpu_setup_prompt', fallback='ask'))
         ),
         window=Window(
             geometry=config.get('Window', 'geometry', fallback='986x976+50+50'),
