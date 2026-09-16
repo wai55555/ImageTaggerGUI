@@ -1,4 +1,4 @@
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 import sys
 from PySide6.QtCore import Qt
@@ -84,6 +84,29 @@ def apply_dark_palette(app: QApplication) -> None:
 
 def main():
     """main entry point."""
+    # GPU コンポーネント（gpu_runtime/）が入っていれば、最初の InferenceSession より
+    # 前に CUDA/cuDNN DLL を明示ロードしておく（順序を誤るとシステム PATH 上の別
+    # バージョン cuDNN を掴む）。未整備なら無害な no-op。例外は内部で握られる。
+    try:
+        from onnx_providers import preload_gpu_dlls
+
+        preload_gpu_dlls()
+    except Exception as exc:
+        # preload_gpu_dlls() itself already catches and logs its own failures, so
+        # reaching here means something outside that (e.g. the `from onnx_providers
+        # import` line itself, if the module is missing from a broken build) went
+        # wrong. In practice a missing onnx_providers would already have crashed the
+        # process at import time via main_window's own top-level import chain, well
+        # before main() runs - this handler is really just a last-resort diagnostic
+        # for anything unexpected here, not the primary place that failure surfaces
+        # (cubic review, PR #21).
+        try:
+            from utils import write_debug_log
+
+            write_debug_log(f"main: preload_gpu_dlls unavailable ({exc!r})")
+        except Exception:
+            print(f"preload_gpu_dlls unavailable: {exc!r}", file=sys.stderr)
+
     app = QApplication(sys.argv)
 
     # colorScheme() が使えない環境向けのフォールバック判定は Fusion 適用前のプラット

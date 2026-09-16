@@ -389,6 +389,84 @@ class DownloaderWorker(QObject):
         self.download_finished.emit(all_success)
         write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Thread_Exit")), self.get_string)
 
+class GpuRuntimeDownloadWorker(QObject):
+    """任意ダウンロードの GPU コンポーネント（CUDA provider DLL ＋ NVIDIA ランタイム）を
+    取得する薄いワーカー。実処理は gpu_runtime.GpuRuntimeInstaller。"""
+
+    log_message = Signal(str, str)                 # message, color
+    progress_update = Signal(int, float, float)    # percent, done_mb, total_mb
+    download_finished = Signal(bool)               # success
+
+    _LEVEL_COLOR = {"info": "blue", "warn": "orange", "error": "red"}
+
+    def __init__(self, get_string: GetString | None = None):
+        super().__init__()
+        self.get_string: GetString = get_string if get_string else default_get_string_fallback
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        write_debug_log(f"DEBUG: {type(self).__name__}.stop() called.")
+        self._stop_event.set()
+
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            pct = max(0, min(100, int(done * 100 / total)))
+            self.progress_update.emit(pct, done / 1024 / 1024, total / 1024 / 1024)
+        else:
+            self.progress_update.emit(0, done / 1024 / 1024, 0.0)
+
+    def _on_log(self, message: str, level: str = "info") -> None:
+        write_debug_log(f"GpuRuntimeDownloadWorker: {message}")
+        self.log_message.emit(message, self._LEVEL_COLOR.get(level, "black"))
+
+    @Slot()
+    def run_download(self):
+        # download_finished は必ず 1 回発火させる（_run 内で何が起きても）。でないと
+        # MainWindow 側の進捗ダイアログとスレッドが後始末されずに残る。
+        ok = False
+        try:
+            ok = self._run()
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            write_debug_log(f"GpuRuntimeDownloadWorker: fatal {exc!r}")
+        self.download_finished.emit(ok)
+
+    def _run(self) -> bool:
+        import gpu_runtime
+        import onnx_providers
+
+        spec = gpu_runtime.load_component_spec()
+        if spec is None:
+            self._on_log(self.get_string("Gpu", "Worker_NoSpec"), "error")
+            return False
+        installer = gpu_runtime.GpuRuntimeInstaller()
+        # This worker only runs when gpu_runtime_ready() is False (the prompt gates on
+        # that). If a stale/partial gpu_runtime/ is sitting there - a cancelled run, or a
+        # previous release whose manifest listed differently named DLLs - clear it first
+        # so install() starts clean (install() overwrites by name but won't delete
+        # files only the old manifest knew about).
+        try:
+            if onnx_providers.gpu_runtime_dir().exists():
+                installer.uninstall()
+        except Exception as exc:  # noqa: BLE001
+            write_debug_log(f"GpuRuntimeDownloadWorker: uninstall-before-reinstall skipped ({exc!r})")
+        try:
+            ok = installer.install(spec, progress_cb=self._on_progress,
+                                   log_cb=self._on_log, stop_cb=self.is_stopped)
+        except Exception as exc:  # noqa: BLE001 - defensive; installer already guards
+            write_debug_log(f"GpuRuntimeDownloadWorker: unexpected {exc!r}")
+            ok = False
+        if ok:
+            self._on_log(self.get_string("Gpu", "Worker_Done"), "info")
+        elif self.is_stopped():
+            self._on_log(self.get_string("Gpu", "Worker_Stopped"), "warn")
+        else:
+            self._on_log(self.get_string("Gpu", "Worker_Failed"), "error")
+        return ok
+
+
 class TaggerThreadWorker(QObject):
     """Tagging Worker"""
     log_message = Signal(str, str)
@@ -450,6 +528,18 @@ class TaggerThreadWorker(QObject):
                 return
 
             self.log_message.emit(self.get_string("Workers", "TaggerThreadWorker_Loading_Model"), "black")
+
+            # Surface which execution provider the tagger session actually got, so the
+            # user can see GPU acceleration is (or isn't) active without opening the log
+            # file. onnx_providers already handled any fallback; this is just a report.
+            try:
+                on_gpu = tagger.session.get_providers()[0] == "CUDAExecutionProvider"
+            except Exception:
+                on_gpu = False
+            self.log_message.emit(
+                self.get_string("Workers", "TaggerThreadWorker_Provider_Gpu" if on_gpu
+                                else "TaggerThreadWorker_Provider_Cpu"),
+                "green" if on_gpu else "black")
 
             # Whichever model is tagging, tag translations are looked up against PixAI's
             # selected_tags.csv - grab it here if a previous run never pulled it in.

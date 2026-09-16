@@ -23,9 +23,24 @@ _vcdir = Path(tempfile.mkdtemp())
 _VC.VLM_CONNECTIONS_PATH = _vcdir / "vlm_connections.json"
 _VC.VLM_PROFILES_PATH = _vcdir / "vlm_profiles.json"
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 _APP = QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def _no_gpu_prompt(monkeypatch):
+    """This file never exercises the GPU-setup prompt. On a dev box that actually
+    has an NVIDIA GPU + a CUDA-enabled onnxruntime, MainWindow()'s initial_load()
+    would otherwise reach _maybe_prompt_gpu_setup() and pop a real, unpatched
+    QMessageBox that hangs forever under the offscreen platform. Scoped via the
+    monkeypatch fixture (auto-undone per test) rather than a permanent module
+    mutation, since onnx_providers is a single shared module object across the
+    whole pytest session/process - a bare assignment here would leak into other
+    test files' own assertions about has_nvidia_gpu()."""
+    import onnx_providers as _OP
+    monkeypatch.setattr(_OP, "has_nvidia_gpu", lambda *a, **k: False)
 
 
 def _mw_ready(vlm_enabled: bool = False):

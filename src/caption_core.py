@@ -101,7 +101,7 @@ class Florence2Captioner:
     """
 
     def __init__(self, config: CaptionerConfig, get_string: GetString | None = None,
-                 intra_op_num_threads: int = 0):
+                 intra_op_num_threads: int = 0, onnx_device: str = "auto"):
         self.get_string = get_string if get_string else _get_string
         self.config = config
 
@@ -109,19 +109,35 @@ class Florence2Captioner:
             raise ImportError(self.get_string("CaptionCore", "Required_Libraries_NotFound"))
 
         onnx_dir = config.model_dir / "onnx"
-        providers = ["CPUExecutionProvider"]
         # config.ini [Behavior] onnx_threads。0 なら None（ORT 既定 = 全コア）。
         so = make_cpu_session_options(intra_op_num_threads)
         if so is not None:
             log_dbg(f"Florence2Captioner: intra_op_num_threads capped at {so.intra_op_num_threads} ([Behavior] onnx_threads)")
         log_dbg(self.get_string("CaptionCore", "Info_Loading_Sessions", model_dir=str(config.model_dir)))
-        self.vision_encoder = ort.InferenceSession(str(onnx_dir / "vision_encoder_quantized.onnx"), sess_options=so, providers=providers)
-        self.embed_tokens = ort.InferenceSession(str(onnx_dir / "embed_tokens_quantized.onnx"), sess_options=so, providers=providers)
-        self.encoder_model = ort.InferenceSession(str(onnx_dir / "encoder_model_quantized.onnx"), sess_options=so, providers=providers)
-        self.decoder_model_merged = ort.InferenceSession(str(onnx_dir / "decoder_model_merged_quantized.onnx"), sess_options=so, providers=providers)
+
+        model_files = ("vision_encoder_quantized.onnx", "embed_tokens_quantized.onnx",
+                       "encoder_model_quantized.onnx", "decoder_model_merged_quantized.onnx")
+        (self.vision_encoder, self.embed_tokens,
+         self.encoder_model, self.decoder_model_merged) = self._load_sessions(
+            [onnx_dir / name for name in model_files], so, onnx_device)
         self._decoder_output_names = [o.name for o in self.decoder_model_merged.get_outputs()]
         self.tokenizer = Tokenizer.from_file(str(config.model_dir / "tokenizer.json"))
         log_dbg(self.get_string("CaptionCore", "Info_Sessions_Loaded"))
+
+    def _load_sessions(self, paths: list[Path], sess_options, onnx_device: str) -> list:
+        """Florence-2 の 4 セッションは CPU 固定（onnx_device は現状無視）。
+
+        Phase 4 実測（RTX 4070 / onnxruntime-gpu 1.23.2 / 2026-09-10）で、量子化(int8)の
+        Florence-2 を CUDA EP に載せると **CPU より約4倍遅い**（CPU 1.7s / CUDA 6.9s、
+        1キャプション）。原因は (1) int8 グラフに CUDA が対応できず大量の Memcpy ノードが
+        挿入される（ORT 警告 "455 Memcpy nodes are added ..."）、(2) greedy 自己回帰
+        デコードは 1 トークンごとの小さなカーネル起動で、GPU の起動オーバーヘッドが支配的。
+        タガー（単発の重い畳み込み）は逆に CUDA で ~28倍速いので、そちらだけ GPU にする。
+        非量子化(fp16)の Florence エクスポートを採用したら onnx_device を効かせる余地あり。
+        """
+        del onnx_device  # 明示的に未使用（fp16 エクスポート採用時に復活させる）
+        return [ort.InferenceSession(str(p), sess_options=sess_options,
+                                     providers=["CPUExecutionProvider"]) for p in paths]
 
     def _preprocess_image(self, image: "Image.Image") -> "NDArray[np.float32]":
         size = self.config.image_size
@@ -250,7 +266,8 @@ def setup_captioner_from_settings(app_settings: AppSettings, get_string: GetStri
             "CAPTION_PLACEMENT": app_settings.caption.placement,
         }
         captioner = Florence2Captioner(captioner_config, get_string=_get_string_internal,
-                                       intra_op_num_threads=app_settings.behavior.onnx_threads)
+                                       intra_op_num_threads=app_settings.behavior.onnx_threads,
+                                       onnx_device=app_settings.behavior.onnx_device)
         return captioner, settings_dict
     except Exception as e:
         log_dbg(f"Error during Captioner initialization: {type(e).__name__}: {e}")

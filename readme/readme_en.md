@@ -44,6 +44,7 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 ### 2. Powerful Automatic Tagging
 -   **High-speed ONNX Runtime**: Employs an ONNX model that operates smoothly even on CPUs. Processes large volumes of images without stress.
 -   **Automatic Model Download**: Download the selected model and its required metadata from the configured source with one click. No tedious manual setup is required.
+-   **GPU Acceleration (NVIDIA, optional)**: With an NVIDIA GPU, a one-time download of the GPU components (~2GB) from the startup prompt lets the tagger run on CUDA from then on (~28x faster, measured on an RTX 4070). Skip the download - or run on a non-NVIDIA machine - and it keeps working on the CPU exactly as before. Captioning (Florence-2) always runs on the CPU due to its quantized model. Toggle with `[Behavior] onnx_device` in `config.ini` (`auto` / `cpu` / `cuda`).
 
 ### 3. Flexible and Advanced Tag Editing
 -   **Individual Editing**:
@@ -67,6 +68,12 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 -   **Custom connections**: Add any OpenAI-compatible endpoint, including local servers such as Ollama, LM Studio, llama.cpp or vLLM.
 -   **Keys stay out of `config.ini`**: Register an API key from the VLM settings dialog; it is checked with one real request and stored in the OS keyring (or read from a `.env` file / environment variable).
 -   **Routes follow your selection**: Only enabled, authenticated routes you ordered are tried; provider billing and metered usage follow each service's terms. No route is treated as free. Detail level, sentence count, character-name policy and Markdown are adjustable, and captions combine with an existing `.txt` (prepend / append / overwrite) just like tagging output.
+
+## ~~Planned~~
+-   ~~GPU support (onnxruntime-directml, for AMD/Intel and other general-purpose GPUs)~~
+    → Implemented for NVIDIA instead, via `onnxruntime-gpu` (CUDA) - see "GPU Acceleration" above. DirectML and CUDA are mutually exclusive, so supporting both would need a separate build; shelved.
+-   ~~Batch processing for extra speed~~
+    → ONNX Runtime's per-call overhead outweighed the gains, so this was dropped.
 
 ## License
 
