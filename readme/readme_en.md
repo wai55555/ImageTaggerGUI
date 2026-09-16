@@ -44,7 +44,7 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 ### 2. Powerful Automatic Tagging
 -   **High-speed ONNX Runtime**: Employs an ONNX model that operates smoothly even on CPUs. Processes large volumes of images without stress.
 -   **Automatic Model Download**: Download the selected model and its required metadata from the configured source with one click. No tedious manual setup is required.
--   **GPU Acceleration (NVIDIA, optional)**: With an NVIDIA GPU, a one-time download of the GPU components (~2GB) from the startup prompt lets the tagger run on CUDA from then on (~28x faster, measured on an RTX 4070). Skip the download - or run on a non-NVIDIA machine - and it keeps working on the CPU exactly as before. Captioning (Florence-2) always runs on the CPU due to its quantized model. Toggle with `[Behavior] onnx_device` in `config.ini` (`auto` / `cpu` / `cuda`).
+-   **GPU Acceleration (NVIDIA, optional)**: With an NVIDIA GPU, a one-time download of the GPU components (~2GB) from the startup prompt, followed by a restart, lets the tagger run on CUDA from then on (~28x faster, measured on an RTX 4070). Skip the download - or run on a non-NVIDIA machine - and it keeps working on the CPU exactly as before. Captioning (Florence-2) always runs on the CPU due to its quantized model. Toggle with `[Behavior] onnx_device` in `config.ini` (`auto` / `cpu` / `cuda`).
 
 ### 3. Flexible and Advanced Tag Editing
 -   **Individual Editing**:
@@ -59,7 +59,7 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 
 ### 4. Detailed Customization
 -   **Tag Generation Adjustment**: Intuitively adjust model-specific **thresholds** and **maximum tag counts** for supported categories.
--   **Automatic Settings Save**: Window size and all settings are automatically saved to `config.ini` upon app exit. Resume work in the same environment next time.
+-   **Automatic Settings Save**: Window size and other non-secret settings are automatically saved to `config.ini` upon app exit (API keys are never written there - see VLM Captioning below). Resume work in the same environment next time.
 -   **Multi-language Support**: Supports English, Japanese, French, German, Spanish, Russian, Simplified Chinese, Traditional Chinese, and Korean. The UI automatically switches according to the OS language settings.
 
 ### 5. VLM Captioning (Optional)

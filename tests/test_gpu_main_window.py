@@ -28,12 +28,24 @@ def _isolated_config(monkeypatch, tmp_path):
     former module-level `_A.CONFIG_PATH = ...` at import time, which permanently
     repointed the shared app_settings/constants modules for the whole pytest
     session regardless of collection order (cubic + CodeRabbit review, PR #21).
+
+    `utils.py` and `tagging_core.py` each compute their own `CONFIG_PATH =
+    BASE_DIR / "config.ini"` independently rather than importing it from
+    `constants` (confirmed in source) - patching only `app_settings`/`constants`
+    leaves both of those still pointed at the real config.ini, so
+    `write_debug_log`/`DebugSettings` and any tagging_core config access during
+    MainWindow init/closeEvent would silently touch the real file (cubic review,
+    PR #22). Patch all four.
     """
     import app_settings as _A
     import constants as _C
+    import utils as _U
+    import tagging_core as _TC
     config_path = tmp_path / "config.ini"
     monkeypatch.setattr(_A, "CONFIG_PATH", config_path)
     monkeypatch.setattr(_C, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(_U, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(_TC, "CONFIG_PATH", config_path)
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +78,25 @@ def _fake_progress_dialog(mw):
     return progress
 
 
+class _DeadProgressStub:
+    """Simulates a QProgressDialog whose C++ object is already deleted but whose
+    Python wrapper is still referenced: any attribute access raises RuntimeError,
+    matching PySide6's real behavior for a destroyed QObject ("wrapped C++ object
+    ... has been deleted"). Used to actually exercise the
+    `except (RuntimeError, TypeError)` guard in `_on_gpu_runtime_finished` (cubic
+    review, PR #22) - a plain `_gpu_dl_progress = None` never reaches that branch
+    at all, since `if self._gpu_dl_progress:` is already False in that case."""
+
+    class _DeadSignal:
+        def disconnect(self, *a, **k):
+            raise RuntimeError("wrapped C++ object of type QProgressDialog has been deleted")
+
+    canceled = _DeadSignal()
+
+    def close(self):
+        raise RuntimeError("wrapped C++ object of type QProgressDialog has been deleted")
+
+
 def test_progress_dialog_destroyed_clears_reference():
     """WA_DeleteOnClose can free the dialog from a user close; the destroyed
     signal must be what keeps mw._gpu_dl_progress in sync (cubic review, PR #21)."""
@@ -96,6 +127,27 @@ def test_finished_handler_survives_dialog_already_destroyed(monkeypatch):
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
     w._on_gpu_runtime_finished(False)  # must not raise
     assert warned, "a genuine failure (not cancelled) should still warn"
+    w.close()
+
+
+def test_finished_handler_survives_dead_dialog_wrapper(monkeypatch):
+    """_on_gpu_runtime_finished must not raise when `_gpu_dl_progress` still holds
+    a reference but the underlying C++ object is already gone - unlike the
+    `_gpu_dl_progress = None` case above, this actually drives `disconnect()`/
+    `close()` into raising RuntimeError, exercising the `except (RuntimeError,
+    TypeError)` guard the None-case test doesn't reach (cubic review, PR #22)."""
+    w = _mw_ready()
+    w._gpu_dl_progress = _DeadProgressStub()
+    w._gpu_dl_thread = QThread()
+    from workers import GpuRuntimeDownloadWorker
+    worker = GpuRuntimeDownloadWorker(w.locale_manager.get_string)
+    w._gpu_dl_worker = worker
+
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: warned.append(a))
+    w._on_gpu_runtime_finished(False)  # must not raise despite the dead wrapper
+    assert warned, "a genuine failure should still warn even if progress cleanup raised"
+    assert w._gpu_dl_progress is None  # cleared regardless of the RuntimeError
     w.close()
 
 

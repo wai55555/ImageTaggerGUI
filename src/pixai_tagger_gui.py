@@ -105,7 +105,12 @@ def main():
 
             write_debug_log(f"main: preload_gpu_dlls unavailable ({exc!r})")
         except Exception:
-            print(f"preload_gpu_dlls unavailable: {exc!r}", file=sys.stderr)
+            # sys.stderr (and sys.stdout) is None in a windowed PyInstaller build
+            # (console=False in the spec) - print(..., file=None) falls back to
+            # sys.stdout internally, which is also None there, so an unguarded
+            # print() would itself raise and crash startup (cubic review, PR #22).
+            if sys.stderr is not None:
+                print(f"preload_gpu_dlls unavailable: {exc!r}", file=sys.stderr)
 
     app = QApplication(sys.argv)
 
