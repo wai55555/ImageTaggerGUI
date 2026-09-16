@@ -253,7 +253,101 @@ def test_install_sha_mismatch_aborts(tmp_path):
     ok = _installer(tmp_path).install(_spec(prov_sha="deadbeef" * 8))
     assert ok is False
     _assert_not_ready(tmp_path)
-    assert not (tmp_path / OP.GPU_RUNTIME_DIRNAME / ".staging").exists()
+    # Resume support (see test_install_retry_after_failure_resumes_download below)
+    # means staging itself is no longer wiped on failure, but a file that failed
+    # SHA-256 verification must still be gone - otherwise a retry would see it as
+    # "already downloaded" and never re-fetch the corrupted bytes.
+    assert not (tmp_path / OP.GPU_RUNTIME_DIRNAME / ".staging" / "onnxruntime_providers_cuda.dll").exists()
+
+
+class _BreakingResp:
+    """Yields `partial` then raises, simulating a connection drop mid-transfer."""
+    def __init__(self, partial: bytes):
+        self._partial = partial
+        self.status_code = 200
+        self.headers = {"content-length": str(len(self._partial))}
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=65536):
+        yield self._partial
+        raise RuntimeError("simulated connection drop")
+
+    def close(self):
+        pass
+
+
+class _FlakyThenResumableResp:
+    """First call: breaks after `break_at` bytes (see _BreakingResp). Any later
+    call: honors a Range header like a real HTTP server, returning 206 with only
+    the remaining bytes - so `_download()`'s resume path gets tested honestly
+    rather than by a fake that always just hands back the full file."""
+    def __init__(self, data: bytes, break_at: int):
+        self._data = data
+        self._break_at = break_at
+        self._used = False
+
+    def __call__(self, url, *, headers=None, stream=True, timeout=30):
+        headers = headers or {}
+        if not self._used:
+            self._used = True
+            return _BreakingResp(self._data[:self._break_at])
+        rng = headers.get("Range")
+        assert rng, "resume attempt must send a Range header"
+        start = int(rng.split("=", 1)[1].split("-", 1)[0])
+        remainder = self._data[start:]
+        resp = _Resp(remainder)
+        resp.status_code = 206
+        resp.headers["content-range"] = f"bytes {start}-{len(self._data) - 1}/{len(self._data)}"
+        return resp
+
+
+def test_install_retry_after_failure_resumes_download(tmp_path):
+    """A connection drop mid-download must not force the whole ~2GB back to zero:
+    the second install() attempt should resume the `.part` file via a Range
+    request instead of re-fetching bytes already on disk (cubic/CodeRabbit never
+    flagged this - restores intent dropped from docs/260910_gpu_acceleration_options.md
+    during implementation, per user request)."""
+    prov_url = "http://host/prov.dll"
+    flaky = _FlakyThenResumableResp(PROV_BYTES, break_at=len(PROV_BYTES) // 2)
+
+    def http(url, **kw):
+        if url == prov_url:
+            return flaky(url, **kw)
+        return _http_get(_URLS)(url, **kw)
+
+    inst = _installer(tmp_path, http=http)
+
+    assert inst.install(_spec()) is False  # breaks mid-download of the direct item
+    part = tmp_path / OP.GPU_RUNTIME_DIRNAME / ".staging" / "onnxruntime_providers_cuda.dll.part"
+    assert part.is_file()
+    assert part.stat().st_size == len(PROV_BYTES) // 2
+
+    assert inst.install(_spec()) is True  # resumes, then finishes normally
+    assert OP.gpu_runtime_ready(tmp_path, ort_module=_fake_ort(tmp_path, version="1.23.1")) is True
+    placed = tmp_path / OP.GPU_RUNTIME_DIRNAME / "onnxruntime_providers_cuda.dll"
+    assert placed.read_bytes() == PROV_BYTES
+
+
+def test_fetch_wheel_skips_already_extracted_members(tmp_path):
+    """If every member a wheel would produce is already sitting in staging from an
+    earlier (partially failed) attempt, _fetch_wheel must not re-download the
+    wheel at all - staging survives across attempts now (see install()), so this
+    is the common case after e.g. a later item in the same spec fails."""
+    def boom(*a, **k):
+        raise AssertionError("must not re-download an already-extracted wheel")
+
+    inst = _installer(tmp_path, http=boom)
+    inst._staging.mkdir(parents=True, exist_ok=True)
+    (inst._staging / "cudnn64_9.dll").write_bytes(b"already-extracted-bytes")
+
+    item = _spec()["wheels"][0]
+    planned = inst._fetch_wheel(item, log=lambda *a, **k: None, stop=lambda: False, bump=lambda n: None)
+
+    assert len(planned) == 1
+    assert planned[0].name == "cudnn64_9.dll"
+    assert planned[0].staged.read_bytes() == b"already-extracted-bytes"
 
 
 def test_install_stop_aborts(tmp_path):
