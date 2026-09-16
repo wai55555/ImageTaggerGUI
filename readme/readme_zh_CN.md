@@ -44,7 +44,7 @@
 ### 2. 强大的自动标注
 -   **高速 ONNX Runtime**: 采用 ONNX 模型，即使在 CPU 上也能流畅运行。轻松处理大量图像。
 -   **自动模型下载**: 只需单击一个按钮，即可从配置的来源下载所选模型及其必要的元数据。无需繁琐的手动设置。
--   **GPU 加速（NVIDIA，可选）**: 如果检测到 NVIDIA GPU，只需在启动提示中一次性下载 GPU 组件（约 2GB），之后即可让标注器在 CUDA 上运行（RTX 4070 实测约快 28 倍）。不下载，或在非 NVIDIA 设备上，应用仍会像以前一样在 CPU 上正常运行。由于使用量化模型，图像描述（Florence-2）始终在 CPU 上运行。可通过 `config.ini` 中的 `[Behavior] onnx_device`（`auto` / `cpu` / `cuda`）切换。
+-   **GPU 加速（NVIDIA，可选）**: 如果检测到 NVIDIA GPU，只需在启动提示中一次性下载 GPU 组件（约 2GB），下载完成后重启应用程序，即可让标注器在 CUDA 上运行（RTX 4070 实测约快 28 倍）。不下载，或在非 NVIDIA 设备上，应用仍会像以前一样在 CPU 上正常运行。由于使用量化模型，图像描述（Florence-2）始终在 CPU 上运行。可通过 `config.ini` 中的 `[Behavior] onnx_device`（`auto` / `cpu` / `cuda`）切换。
 
 ### 3. 灵活高级的标签编辑
 -   **单独编辑**:

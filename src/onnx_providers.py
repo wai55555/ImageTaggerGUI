@@ -91,6 +91,24 @@ def gpu_runtime_dir(base_dir: Path | None = None) -> Path:
     return _base_dir(base_dir) / GPU_RUNTIME_DIRNAME
 
 
+def _is_safe_filename(name: Any) -> bool:
+    """A single path component, no separators, no `.`/`..`/empty/drive-qualified.
+
+    Duplicated from `gpu_runtime._is_safe_filename` rather than imported: this
+    module is the lower-level one (`gpu_runtime.py` imports `capi_dir`/
+    `gpu_runtime_dir` from here), so importing back would be circular.
+
+    Applied to every manifest-sourced filename here before it's joined onto
+    `gpu_runtime_dir()` (`_read_ready_files`) or `capi_dir()` (`_mirror_capi_files`)
+    (cubic review, PR #22, confidence 8): a tampered/corrupted `manifest.json` with
+    a `"../../..."` or `"C:evil.dll"` name could otherwise make `_mirror_capi_files`
+    read from and write to arbitrary paths outside `gpu_runtime/`/`capi/` - the same
+    class of bug `gpu_runtime.uninstall()` was already hardened against.
+    """
+    return (isinstance(name, str) and name not in ("", ".", "..")
+            and "/" not in name and "\\" not in name and ":" not in name)
+
+
 def _read_ready_files(base_dir: Path | None = None, *, ort_module: Any = _ORT_DEFAULT) -> list[dict] | None:
     """gpu_runtime/ が「使える状態」か検証し、揃っているなら files のリストを返す。
 
@@ -137,7 +155,7 @@ def _read_ready_files(base_dir: Path | None = None, *, ort_module: Any = _ORT_DE
             if not isinstance(entry, dict):
                 return None
             name = entry.get("name")
-            if not isinstance(name, str) or not name:
+            if not _is_safe_filename(name):
                 return None
             try:
                 if not (root / name).is_file():
@@ -151,7 +169,7 @@ def _read_ready_files(base_dir: Path | None = None, *, ort_module: Any = _ORT_DE
     if not isinstance(required, list) or not required:
         return None
     for rel in required:
-        if not isinstance(rel, str) or not rel:
+        if not _is_safe_filename(rel):
             return None
         try:
             if not (root / rel).is_file():
@@ -356,7 +374,11 @@ def _mirror_capi_files(files: list[dict], root: Path, ort_module: Any) -> None:
         if entry.get("location") != "capi":
             continue
         name = entry.get("name")
-        if not name:
+        if not _is_safe_filename(name):
+            # Defense in depth: `_read_ready_files` already rejects unsafe names
+            # before this is ever called with a live manifest, but this function
+            # takes a bare `files` list and shouldn't trust it on its own (cubic
+            # review, PR #22) - `capi / name` below is a write, not just a read.
             continue
         src = root / name
         dst = capi / name
