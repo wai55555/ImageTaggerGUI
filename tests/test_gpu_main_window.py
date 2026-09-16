@@ -237,6 +237,103 @@ def test_never_on_repair_prompt_clears_broken_gpu_runtime(monkeypatch, tmp_path)
     w.close()
 
 
+def _patch_gpu_usable(monkeypatch, *, usable: bool):
+    """Controls the "is GPU actually usable" check ui_main_window._create_input_group
+    runs once at construction time to decide use_gpu_check's visibility."""
+    import onnxruntime
+    import onnx_providers as OP
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if usable else ["CPUExecutionProvider"]
+    monkeypatch.setattr(onnxruntime, "get_available_providers", lambda: providers)
+    monkeypatch.setattr(OP, "gpu_runtime_ready", lambda *a, **k: usable)
+
+
+def test_gpu_checkbox_hidden_when_cuda_provider_unavailable(monkeypatch):
+    """No CUDAExecutionProvider (CPU-only onnxruntime build) -> the checkbox must
+    not be offered at all, matching _maybe_prompt_gpu_setup's own gating.
+
+    Uses isHidden() rather than isVisible(): the MainWindow in these tests is
+    never .show()n, so isVisible() (which also checks the whole ancestor chain)
+    would be False for every child widget regardless of setVisible(), making
+    that assertion pass even if the gating logic were deleted entirely.
+    isHidden() reflects only this widget's own explicit hidden/shown state."""
+    _patch_gpu_usable(monkeypatch, usable=False)
+    w = _mw_ready()
+    assert w.use_gpu_check.isHidden() is True
+    w.close()
+
+
+def test_gpu_checkbox_hidden_when_components_not_downloaded(monkeypatch):
+    """CUDAExecutionProvider is compiled in, but GPU components haven't been
+    downloaded yet -> still hidden (there is nothing to actually run on)."""
+    import onnxruntime
+    monkeypatch.setattr(onnxruntime, "get_available_providers",
+                        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"])
+    import onnx_providers as OP
+    monkeypatch.setattr(OP, "gpu_runtime_ready", lambda *a, **k: False)
+    w = _mw_ready()
+    assert w.use_gpu_check.isHidden() is True
+    w.close()
+
+
+def test_gpu_checkbox_visible_and_checked_reflects_onnx_device(monkeypatch, tmp_path):
+    """When GPU is actually usable, the checkbox is shown and its initial checked
+    state mirrors the *persisted* onnx_device at construction time (cuda ->
+    checked, cpu -> unchecked) - written to config.ini before the window is built,
+    not set on the widget after the fact, so this actually exercises
+    ui_main_window's `setChecked(... != "cpu")` line."""
+    _patch_gpu_usable(monkeypatch, usable=True)
+    # _isolated_config (autouse) already pointed CONFIG_PATH at tmp_path/config.ini;
+    # write real content there before MainWindow() reads it via load_config().
+    (tmp_path / "config.ini").write_text("[Behavior]\nonnx_device = cpu\n", encoding="utf-8")
+    w = _mw_ready()
+    assert w.settings.behavior.onnx_device == "cpu"
+    assert w.use_gpu_check.isHidden() is False
+    assert w.use_gpu_check.isChecked() is False
+    w.close()
+
+
+def test_gpu_checkbox_toggle_writes_onnx_device_and_saves(monkeypatch, tmp_path):
+    """Toggling the checkbox after construction must write cuda/cpu to
+    settings.behavior.onnx_device and persist it - this is what actually switches
+    the execution provider for the *next* tagging run (no app restart needed,
+    unlike the initial GPU-component download).
+
+    Starts from a config.ini with onnx_device=cpu (so the checkbox actually
+    constructs unchecked) rather than overwriting settings.behavior directly
+    after construction: setChecked(True) on an already-checked box is a no-op
+    that never fires `toggled` at all, which would make this test pass
+    regardless of whether the handler does anything."""
+    _patch_gpu_usable(monkeypatch, usable=True)
+    (tmp_path / "config.ini").write_text("[Behavior]\nonnx_device = cpu\n", encoding="utf-8")
+    w = _mw_ready()
+    assert w.use_gpu_check.isChecked() is False
+
+    saved = []
+    monkeypatch.setattr(w, "save_current_config", lambda: saved.append(True))
+
+    w.use_gpu_check.setChecked(True)
+    assert w.settings.behavior.onnx_device == "cuda"
+    assert saved == [True]
+
+    w.use_gpu_check.setChecked(False)
+    assert w.settings.behavior.onnx_device == "cpu"
+    assert saved == [True, True]
+    w.close()
+
+
+def test_gpu_checkbox_construction_does_not_overwrite_auto(monkeypatch):
+    """A user who has never touched the checkbox keeps onnx_device="auto" as-is:
+    setChecked() during widget construction must not itself fire the toggled
+    handler and collapse "auto" into "cuda"/"cpu" unasked (this is exactly why
+    ui_main_window calls setChecked() before connecting toggled - see that
+    comment)."""
+    _patch_gpu_usable(monkeypatch, usable=True)
+    w = _mw_ready()
+    assert w.settings.behavior.onnx_device == "auto"
+    assert w.use_gpu_check.isChecked() is True  # displayed as ON (auto uses GPU when available)
+    w.close()
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

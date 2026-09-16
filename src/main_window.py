@@ -765,6 +765,25 @@ class MainWindow(QMainWindow):
         # タグ欄 <-> テキスト欄など UI 表示を更新。
         self._model_mode.on_model_changed(self._current_model_entry())
 
+    def _on_use_gpu_toggled(self, checked: bool):
+        """タガーの実行プロバイダーをGPU(CUDA)/CPUで切り替える。「VLM接続を使う」行の
+        右端にあるチェックボックスで、GPUが実際に使える（ビルド対応＋コンポーネント
+        導入済み）場合のみ表示される（ui_main_window._create_input_group）。
+
+        ONで`cuda`、OFFで`cpu`を`config.ini [Behavior] onnx_device`に書く。GPU DLLは
+        起動時に既にプロセスへpreload済みなので、次回のタグ付け実行から即座に反映
+        される（アプリ再起動が要るのはGPUコンポーネントの初回導入直後だけ）。
+        `auto`のまま一度もこのチェックボックスに触れていないユーザーの設定は、
+        toggled シグナルが発火しない限り上書きしない（ui_main_window 側で
+        setChecked() を toggled.connect() より先に呼んでいるのはこのため）。"""
+        checked = bool(checked)
+        new_device = "cuda" if checked else "cpu"
+        if new_device == self.settings.behavior.onnx_device:
+            return
+        self.settings.behavior.onnx_device = new_device
+        self.save_current_config()
+        write_debug_log(f"use_gpu -> {checked} (onnx_device={new_device})")
+
     @Slot()
     def _open_vlm_settings(self):
         """VLM 設定ダイアログを開く（260901_VLM_design.md 6.3節）。"""
