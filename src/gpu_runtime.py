@@ -293,18 +293,23 @@ class GpuRuntimeInstaller:
             raise GpuRuntimeError("'wheels' entry needs url and members[]")
         parsed = self._parse_wheel_members(members)
 
-        # Resume: a prior attempt may have already downloaded, verified, and
-        # extracted every member this wheel produces, then unlinked the .whl itself
-        # (staging is no longer wiped between attempts - see install()). Skip
-        # re-fetching the whole wheel (often several hundred MB) if so; each output
-        # file's presence is trusted the same way _download()'s own "already fetched"
-        # skip trusts an existing dest, since the URL is pinned per gpu_components.json.
-        if all((self._staging / out_name).is_file() for _, out_name, _ in parsed):
-            log(f"{_basename(url)} already extracted from an earlier attempt; skipping")
-            return [_Planned(name=out_name, staged=self._staging / out_name, location=location,
-                             sha256=calculate_sha256(self._staging / out_name))
-                    for _, out_name, location in parsed]
-
+        # Resume: _download() below already skips the network entirely when the
+        # .whl was fully fetched in a prior attempt (its own "dest already exists"
+        # check). What it does NOT protect against is *extraction* itself being
+        # interrupted (process killed mid-copyfileobj) - a member file existing in
+        # staging does not mean its bytes are complete/correct (CodeRabbit review,
+        # PR #23, confirmed: an earlier version of this function skipped re-extraction
+        # whenever every member's output file merely existed, trusting bare
+        # `is_file()` with no integrity check - a truncated file from an interrupted
+        # extraction would then get placed and manifested as if verified).
+        #
+        # So: keep the .whl around (do NOT unlink it after extraction - only
+        # install()'s success path clears staging) and unconditionally re-extract
+        # every member on every call. This is cheap (local disk I/O once the wheel
+        # itself is already downloaded+hash-verified) and makes the result correct
+        # by construction every time: `open(staged, "wb")` always truncates and
+        # rewrites the full member from scratch, so a stale/truncated leftover from
+        # an interrupted earlier extraction is fully overwritten, never trusted.
         whl = self._staging / (_basename(url) or "component.whl")
         log(f"downloading {whl.name}")
         self._download(url, whl, stop, bump)
@@ -323,7 +328,6 @@ class GpuRuntimeInstaller:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
                 out.append(_Planned(name=out_name, staged=staged, location=location,
                                     sha256=calculate_sha256(staged)))
-        whl.unlink(missing_ok=True)
         return out
 
     def _download(self, url: str, dest: Path, stop: StopCb, bump: Callable[[int], None]) -> None:
@@ -345,6 +349,20 @@ class GpuRuntimeInstaller:
         headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
         resp = self.http_get(url, headers=headers, stream=True, timeout=30)
         try:
+            if downloaded > 0 and resp.status_code == 416:
+                # The .part file already holds every byte the server has: most
+                # likely, an earlier attempt finished writing it but was
+                # interrupted before the os.replace() below ran. Requesting
+                # bytes starting at that exact offset leaves nothing to send, so
+                # the server correctly answers 416 Range Not Satisfiable -
+                # raise_for_status() below would turn that into a hard failure
+                # forever (every retry re-sends the same Range, gets the same
+                # 416 back). Treat it as "already complete" instead and let
+                # _verify() (run by the caller right after this returns) be the
+                # actual correctness check (CodeRabbit review, PR #23).
+                bump(downloaded)
+                os.replace(part, dest)
+                return
             resp.raise_for_status()
             resumed = downloaded > 0 and resp.status_code == 206
             if downloaded > 0 and not resumed:

@@ -330,24 +330,90 @@ def test_install_retry_after_failure_resumes_download(tmp_path):
     assert placed.read_bytes() == PROV_BYTES
 
 
-def test_fetch_wheel_skips_already_extracted_members(tmp_path):
-    """If every member a wheel would produce is already sitting in staging from an
-    earlier (partially failed) attempt, _fetch_wheel must not re-download the
-    wheel at all - staging survives across attempts now (see install()), so this
-    is the common case after e.g. a later item in the same spec fails."""
+class _Resp416:
+    """A server's real reply when a Range request's offset is already at (or past)
+    the resource's full length: nothing left to send from there."""
+    def __init__(self):
+        self.status_code = 416
+        self.headers: dict = {}
+
+    def raise_for_status(self):
+        raise RuntimeError("raise_for_status() must not be reached for this 416")
+
+    def iter_content(self, chunk_size=65536):
+        return iter(())
+
+    def close(self):
+        pass
+
+
+def test_download_promotes_complete_part_on_416(tmp_path):
+    """A `.part` file that already holds every byte (the server has nothing left
+    to send from that offset, hence 416) must be promoted directly instead of
+    treated as a hard failure - otherwise every retry would hit the same 416
+    forever, since the Range request never changes (CodeRabbit review, PR #23,
+    confirmed valid: this can happen when a prior attempt finished writing the
+    file but was interrupted before the os.replace() that follows)."""
+    inst = _installer(tmp_path)
+    inst._staging.mkdir(parents=True, exist_ok=True)
+    dest = inst._staging / "onnxruntime_providers_cuda.dll"
+    part = dest.with_name(dest.name + ".part")
+    part.write_bytes(PROV_BYTES)  # fully downloaded already, just never promoted
+
+    def http_416(url, *, headers=None, stream=True, timeout=30):
+        assert headers and headers.get("Range") == f"bytes={len(PROV_BYTES)}-"
+        return _Resp416()
+
+    inst.http_get = http_416
+    bumped = []
+    inst._download("http://host/prov.dll", dest, stop=lambda: False, bump=bumped.append)
+
+    assert dest.read_bytes() == PROV_BYTES
+    assert not part.exists()
+    assert bumped == [len(PROV_BYTES)]  # progress still accounted for
+
+
+def test_fetch_wheel_skips_network_when_whl_already_downloaded(tmp_path):
+    """If the .whl itself is already sitting in staging (fully, matching bytes)
+    from an earlier attempt, _fetch_wheel must not hit the network again -
+    staging survives across attempts now (see install()), so this is the common
+    case after e.g. a later item in the same spec fails. Extraction itself still
+    runs fresh from the wheel (see the next test for why)."""
     def boom(*a, **k):
-        raise AssertionError("must not re-download an already-extracted wheel")
+        raise AssertionError("must not re-download an already-staged .whl")
 
     inst = _installer(tmp_path, http=boom)
     inst._staging.mkdir(parents=True, exist_ok=True)
-    (inst._staging / "cudnn64_9.dll").write_bytes(b"already-extracted-bytes")
+    whl_name = GR._basename("http://host/nvidia_cudnn_cu12-9.0.0-py3-none-win_amd64.whl")
+    (inst._staging / whl_name).write_bytes(WHEEL_BYTES)
 
     item = _spec()["wheels"][0]
     planned = inst._fetch_wheel(item, log=lambda *a, **k: None, stop=lambda: False, bump=lambda n: None)
 
     assert len(planned) == 1
     assert planned[0].name == "cudnn64_9.dll"
-    assert planned[0].staged.read_bytes() == b"already-extracted-bytes"
+    assert planned[0].staged.read_bytes() == CUDNN_BYTES
+
+
+def test_fetch_wheel_overwrites_truncated_member_from_interrupted_extraction(tmp_path):
+    """A member file already present in staging must NOT be trusted just because
+    it exists (CodeRabbit review, PR #23, confirmed valid): if the process was
+    killed mid-`shutil.copyfileobj` during an earlier attempt's extraction, the
+    staged member file can be truncated/wrong even though it "exists". Since the
+    .whl itself is re-verified (or, as here, already present and skip-downloaded)
+    on every attempt, extraction must always re-run and overwrite any such stale
+    bytes - never skip extraction based on the member file's mere presence."""
+    inst = _installer(tmp_path)  # normal http_get; the .whl download itself is exercised too
+    inst._staging.mkdir(parents=True, exist_ok=True)
+    # Simulate a member left truncated/wrong by an interrupted prior extraction.
+    (inst._staging / "cudnn64_9.dll").write_bytes(b"TRUNCATED-GARBAGE")
+
+    item = _spec()["wheels"][0]
+    planned = inst._fetch_wheel(item, log=lambda *a, **k: None, stop=lambda: False, bump=lambda n: None)
+
+    assert len(planned) == 1
+    assert planned[0].staged.read_bytes() == CUDNN_BYTES, \
+        "stale/truncated bytes from an earlier interrupted extraction must be overwritten"
 
 
 def test_install_stop_aborts(tmp_path):
