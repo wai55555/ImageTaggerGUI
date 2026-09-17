@@ -194,6 +194,31 @@ class Ui_MainWindow(object):
         vlm_row.addWidget(main_window.vlm_settings_button)
         vlm_row.addWidget(main_window.vlm_single_test_button)
         vlm_row.addStretch(1)
+
+        # GPU/CPU トグル（同じ行の右端）。NVIDIA GPUが実際に使える場合、つまり
+        # onnxruntime-gpuビルド（静的な対応可否）かつGPUコンポーネント導入済みの
+        # 場合だけ表示する — 使えない選択肢は見せない。判定は起動時1回のみ（GPU
+        # コンポーネントの導入自体がアプリ再起動を要求する既存仕様と揃える）。
+        main_window.use_gpu_check = QCheckBox(
+            main_window.locale_manager.get_string("Gpu", "Use_Gpu_Checkbox"))
+        main_window.use_gpu_check.setToolTip(
+            main_window.locale_manager.get_string("Gpu", "Use_Gpu_Tooltip"))
+        gpu_usable = False
+        try:
+            import onnxruntime
+            import onnx_providers
+            gpu_usable = bool("CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                              and onnx_providers.gpu_runtime_ready())
+        except Exception:
+            gpu_usable = False
+        main_window.use_gpu_check.setVisible(gpu_usable)
+        # setChecked() before connecting toggled: matches use_vlm_check above -
+        # otherwise this fires _on_use_gpu_toggled during construction and can
+        # collapse an "auto" onnx_device setting to "cuda"/"cpu" unasked.
+        main_window.use_gpu_check.setChecked(main_window.settings.behavior.onnx_device != "cpu")
+        main_window.use_gpu_check.toggled.connect(main_window._on_use_gpu_toggled)  # type: ignore
+        vlm_row.addWidget(main_window.use_gpu_check)
+
         layout.addLayout(vlm_row)
         return group
 

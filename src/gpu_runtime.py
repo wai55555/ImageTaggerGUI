@@ -160,7 +160,14 @@ class GpuRuntimeInstaller:
                 progress_cb(done, total)
 
         try:
-            self._reset_staging()
+            # Deliberately NOT wiping staging here (unlike earlier versions of this
+            # method): the original design (docs/260910_gpu_acceleration_options.md)
+            # intended downloads to be resumable like the model downloader, but that
+            # got dropped during implementation. Keeping whatever a prior failed/
+            # cancelled attempt already downloaded lets a retry resume instead of
+            # re-fetching the ~2GB total from zero - see _download()'s Range-header
+            # logic and _fetch_wheel()'s "already extracted" skip.
+            self._staging.mkdir(parents=True, exist_ok=True)
             planned: list[_Planned] = []
 
             for item in spec.get("direct", []):
@@ -178,10 +185,11 @@ class GpuRuntimeInstaller:
 
             self._place(planned, log)
             self._write_manifest(spec, planned)
+            self._reset_staging(remove_only=True)  # success: nothing left to resume
             log("GPU components installed; restart to enable GPU inference")
             return True
         except _Stopped:
-            log("download cancelled", "warn")
+            log("download cancelled; a retry will resume from where this left off", "warn")
             return False
         except GpuRuntimeError as exc:
             log(f"install aborted: {exc}", "error")
@@ -189,8 +197,6 @@ class GpuRuntimeInstaller:
         except Exception as exc:  # noqa: BLE001 - network / zip / io
             log(f"install failed: {exc!r}", "error")
             return False
-        finally:
-            self._reset_staging(remove_only=True)
 
     def uninstall(self) -> None:
         """gpu_runtime/ と capi に置いた provider DLL を消す（破損時の作り直し用）。"""
@@ -254,6 +260,29 @@ class GpuRuntimeInstaller:
         sha = self._verify(dest, item.get("sha256"), name)
         return _Planned(name=name, staged=dest, location=location, sha256=sha)
 
+    @staticmethod
+    def _parse_wheel_members(members: list) -> list[tuple[str, str, str]]:
+        """Validates a wheels[].members list, returns [(arcname, out_name, location), ...].
+
+        Split out of `_fetch_wheel` so the resume skip-check below and the actual
+        extraction loop share one validated parse instead of drifting apart.
+        """
+        parsed: list[tuple[str, str, str]] = []
+        for member in members:
+            if not isinstance(member, dict):
+                raise GpuRuntimeError("invalid wheel member")
+            arcname = member.get("arcname")
+            out_name = member.get("name") or (_basename(arcname) if arcname else None)
+            if not arcname or not out_name:
+                raise GpuRuntimeError("wheel member needs arcname")
+            if not _is_safe_filename(out_name):
+                raise GpuRuntimeError(f"unsafe member name {out_name!r}")
+            location = member.get("location", "gpu_runtime")
+            if location not in ("gpu_runtime", "capi"):
+                raise GpuRuntimeError(f"unknown member location {location!r}")
+            parsed.append((arcname, out_name, location))
+        return parsed
+
     def _fetch_wheel(self, item: Any, log: LogCb, stop: StopCb,
                      bump: Callable[[int], None]) -> list[_Planned]:
         if not isinstance(item, dict):
@@ -262,6 +291,25 @@ class GpuRuntimeInstaller:
         members = item.get("members")
         if not url or not isinstance(members, list) or not members:
             raise GpuRuntimeError("'wheels' entry needs url and members[]")
+        parsed = self._parse_wheel_members(members)
+
+        # Resume: _download() below already skips the network entirely when the
+        # .whl was fully fetched in a prior attempt (its own "dest already exists"
+        # check). What it does NOT protect against is *extraction* itself being
+        # interrupted (process killed mid-copyfileobj) - a member file existing in
+        # staging does not mean its bytes are complete/correct (CodeRabbit review,
+        # PR #23, confirmed: an earlier version of this function skipped re-extraction
+        # whenever every member's output file merely existed, trusting bare
+        # `is_file()` with no integrity check - a truncated file from an interrupted
+        # extraction would then get placed and manifested as if verified).
+        #
+        # So: keep the .whl around (do NOT unlink it after extraction - only
+        # install()'s success path clears staging) and unconditionally re-extract
+        # every member on every call. This is cheap (local disk I/O once the wheel
+        # itself is already downloaded+hash-verified) and makes the result correct
+        # by construction every time: `open(staged, "wb")` always truncates and
+        # rewrites the full member from scratch, so a stale/truncated leftover from
+        # an interrupted earlier extraction is fully overwritten, never trusted.
         whl = self._staging / (_basename(url) or "component.whl")
         log(f"downloading {whl.name}")
         self._download(url, whl, stop, bump)
@@ -270,20 +318,9 @@ class GpuRuntimeInstaller:
         out: list[_Planned] = []
         with zipfile.ZipFile(whl) as zf:
             names = set(zf.namelist())
-            for member in members:
+            for arcname, out_name, location in parsed:
                 if stop():
                     raise _Stopped("stopped")
-                if not isinstance(member, dict):
-                    raise GpuRuntimeError("invalid wheel member")
-                arcname = member.get("arcname")
-                out_name = member.get("name") or (_basename(arcname) if arcname else None)
-                if not arcname or not out_name:
-                    raise GpuRuntimeError("wheel member needs arcname")
-                if not _is_safe_filename(out_name):
-                    raise GpuRuntimeError(f"unsafe member name {out_name!r}")
-                location = member.get("location", "gpu_runtime")
-                if location not in ("gpu_runtime", "capi"):
-                    raise GpuRuntimeError(f"unknown member location {location!r}")
                 if arcname not in names:
                     raise GpuRuntimeError(f"{whl.name} has no member {arcname}")
                 staged = self._staging / out_name
@@ -291,16 +328,50 @@ class GpuRuntimeInstaller:
                     shutil.copyfileobj(src, dst, length=1024 * 1024)
                 out.append(_Planned(name=out_name, staged=staged, location=location,
                                     sha256=calculate_sha256(staged)))
-        whl.unlink(missing_ok=True)
         return out
 
     def _download(self, url: str, dest: Path, stop: StopCb, bump: Callable[[int], None]) -> None:
-        # staging は attempt ごとに作り直すので、常に頭から取得する（再開はしない）。
+        """Fetches `url` into `dest`, resuming a partial `.part` from an earlier
+        attempt when possible (matches the model downloader's Range-based resume;
+        see `install()`'s docstring comment - staging is no longer wiped between
+        attempts, so a `.part` file can genuinely survive to be resumed here).
+        """
         part = dest.with_name(dest.name + ".part")
-        resp = self.http_get(url, headers={}, stream=True, timeout=30)
+        if dest.is_file():
+            # Already fully downloaded (and past this exact point) in an earlier
+            # attempt. The URL is pinned per gpu_components.json, so identical bytes
+            # are expected - skip the network round trip entirely. _verify() (called
+            # right after this) still checks the hash and deletes+retries on mismatch,
+            # so this can't let a corrupted file silently pass.
+            bump(dest.stat().st_size)
+            return
+        downloaded = part.stat().st_size if part.is_file() else 0
+        headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
+        resp = self.http_get(url, headers=headers, stream=True, timeout=30)
         try:
+            if downloaded > 0 and resp.status_code == 416:
+                # The .part file already holds every byte the server has: most
+                # likely, an earlier attempt finished writing it but was
+                # interrupted before the os.replace() below ran. Requesting
+                # bytes starting at that exact offset leaves nothing to send, so
+                # the server correctly answers 416 Range Not Satisfiable -
+                # raise_for_status() below would turn that into a hard failure
+                # forever (every retry re-sends the same Range, gets the same
+                # 416 back). Treat it as "already complete" instead and let
+                # _verify() (run by the caller right after this returns) be the
+                # actual correctness check (CodeRabbit review, PR #23).
+                bump(downloaded)
+                os.replace(part, dest)
+                return
             resp.raise_for_status()
-            with open(part, "wb") as f:
+            resumed = downloaded > 0 and resp.status_code == 206
+            if downloaded > 0 and not resumed:
+                # Server returned 200 (ignored the Range request) instead of 206 -
+                # can't safely append onto the partial file, so restart it clean.
+                downloaded = 0
+            if resumed:
+                bump(downloaded)  # count what's already on disk toward progress
+            with open(part, "ab" if resumed else "wb") as f:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
                     if stop():
                         raise _Stopped("stopped")
@@ -318,6 +389,11 @@ class GpuRuntimeInstaller:
         actual = calculate_sha256(path)
         if isinstance(expected, str) and expected and not expected.upper().startswith(SHA_PLACEHOLDER_PREFIX):
             if actual.lower() != expected.lower():
+                # Delete rather than leave it in staging: _download() now treats an
+                # existing dest file as "already fetched, skip" for resume purposes
+                # (see below) - a corrupted file left in place would look permanently
+                # "done" and never get re-fetched on retry.
+                path.unlink(missing_ok=True)
                 raise GpuRuntimeError(f"SHA-256 mismatch for {label}")
         else:
             log_dbg(f"gpu_runtime: {label} has no pinned SHA-256; skipping integrity check")

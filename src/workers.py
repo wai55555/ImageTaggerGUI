@@ -442,13 +442,21 @@ class GpuRuntimeDownloadWorker(QObject):
             self._on_log(self.get_string("Gpu", "Worker_NoSpec"), "error")
             return False
         installer = gpu_runtime.GpuRuntimeInstaller()
-        # This worker only runs when gpu_runtime_ready() is False (the prompt gates on
-        # that). If a stale/partial gpu_runtime/ is sitting there - a cancelled run, or a
-        # previous release whose manifest listed differently named DLLs - clear it first
-        # so install() starts clean (install() overwrites by name but won't delete
-        # files only the old manifest knew about).
+        # Only clear out a previous *completed* install (manifest.json present means
+        # an older spec/ORT-version fully installed here before; its files may not
+        # overlap by name with the current spec's, so a plain install() wouldn't clean
+        # them up on its own - install() overwrites by name but won't delete files
+        # only the old manifest knew about).
+        #
+        # Do NOT uninstall() just because gpu_runtime/ exists at all: install() now
+        # resumes an interrupted download instead of restarting the ~2GB total from
+        # zero (see gpu_runtime.GpuRuntimeInstaller.install()/`_download`), and the
+        # state that makes that possible - gpu_runtime/ present with only a
+        # `.staging/` subdirectory and no manifest.json yet, left by a prior
+        # cancelled/failed attempt - is exactly what the old unconditional uninstall()
+        # here used to wipe on every single retry, silently defeating resume entirely.
         try:
-            if onnx_providers.gpu_runtime_dir().exists():
+            if (onnx_providers.gpu_runtime_dir() / gpu_runtime._MANIFEST_NAME).is_file():
                 installer.uninstall()
         except Exception as exc:  # noqa: BLE001
             write_debug_log(f"GpuRuntimeDownloadWorker: uninstall-before-reinstall skipped ({exc!r})")
