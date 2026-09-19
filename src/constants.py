@@ -4,6 +4,13 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
+# Single source of truth for the app version (was previously duplicated as
+# `__version__` at the top of pixai_tagger_gui.py). Lives here, not there,
+# because main_window.py needs to read it too (for the update-notification
+# check) and pixai_tagger_gui.py imports main_window at module level - the
+# reverse import would be circular.
+APP_VERSION = "1.7.0"
+
 
 def _project_root_for_source() -> Path:
     """Return the repository/application root when source files live under ``src``.

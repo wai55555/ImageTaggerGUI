@@ -62,6 +62,7 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 -   **Tag Generation Adjustment**: Intuitively adjust model-specific **thresholds** and **maximum tag counts** for supported categories.
 -   **Automatic Settings Save**: Window size and other non-secret settings are automatically saved to `config.ini` upon app exit (API keys are never written there - see VLM Captioning below). Resume work in the same environment next time.
 -   **Multi-language Support**: Supports English, Japanese, French, German, Spanish, Russian, Simplified Chinese, Traditional Chinese, and Korean. The UI automatically switches according to the OS language settings.
+-   **New Version Notification**: Checks for a new version on startup and, if one is out, shows a link to the download page (notification only - no automatic download or self-update). Can be disabled with `[Behavior] update_check = dismissed` in `config.ini`.
 
 ### 5. VLM Captioning (Optional)
 -   **Natural-language captions via a networked VLM**: Next to the model selector, a "Use VLM connection" checkbox switches generation from the local model to a Vision-Language Model that writes a detailed English caption for each image - handy as training-dataset descriptions. Off by default; local tagging is unchanged.

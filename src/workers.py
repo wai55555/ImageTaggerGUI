@@ -475,6 +475,47 @@ class GpuRuntimeDownloadWorker(QObject):
         return ok
 
 
+class UpdateCheckWorker(QObject):
+    """起動時の新バージョン確認（update_checker.check_for_update、HTTPS GET 1回）を
+    GUI スレッドから外すための薄いワーカー。
+
+    同期で呼ぶと、パケットを黙って落とすファイアウォールや遅い DNS の環境で
+    ウィンドウが表示直後に数秒固まる（requests の timeout は接続・読み取りそれぞれに
+    かかる）。このアプリの他のネットワーク処理（モデル DL・GPU DL・VLM）と同じく
+    QThread で回す。結果は `check_finished(UpdateInfo | None)` で 1 回だけ通知。
+    """
+
+    check_finished = Signal(object)   # update_checker.UpdateInfo | None
+
+    def __init__(self, current_version: str):
+        super().__init__()
+        self._current_version = current_version
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        # requests.get は途中で中断できないので、これは closeEvent のプロトコル
+        # （StoppableWorker）を満たすための印だけ。実際の打ち切りは closeEvent 側の
+        # wait(5000) → terminate() に委ねる（他ワーカーと同じ扱い）。
+        self._stop_event.set()
+
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
+    @Slot()
+    def run_check(self):
+        # check_finished は必ず 1 回発火させる（MainWindow 側のスレッド後始末が
+        # これを待つ）。check_for_update 自体は例外を外に出さない設計だが、念のため。
+        info = None
+        try:
+            import update_checker
+            info = update_checker.check_for_update(self._current_version)
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            write_debug_log(f"UpdateCheckWorker: unexpected {exc!r}")
+        if self.is_stopped():
+            info = None  # shutting down: never surface a dialog from here
+        self.check_finished.emit(info)
+
+
 class TaggerThreadWorker(QObject):
     """Tagging Worker"""
     log_message = Signal(str, str)
