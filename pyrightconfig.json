@@ -1,0 +1,11 @@
+{
+  "//": "AGENT.md の Static Check 参照。strict にはしない — PySide6 のスタブ精度と動的な",
+  "//1": "getattr 多用箇所（Qt シグナル/スロット等）で誤検知が出やすいため、basic のまま",
+  "//2": "『増分だけ見る』運用にする。CI に組み込む場合もこの設定を使う。",
+  "include": ["src"],
+  "exclude": ["src/resources_rc.py"],
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.12",
+  "reportMissingImports": true,
+  "reportMissingTypeStubs": false
+}
