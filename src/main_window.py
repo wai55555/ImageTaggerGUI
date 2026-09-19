@@ -1,9 +1,10 @@
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Protocol
 import functools
 import sys
 import time
+import webbrowser
 
 from PySide6.QtCore import (
     Qt, QThread, QObject, Signal, Slot, QTimer, QPoint, QEvent,
@@ -32,7 +33,7 @@ from tag_utils import load_tag_translation_map
 from tagging_core import ExistingFileMode, OverwriteDecision
 from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSettingsDialog
 from grid_view_widget import GridViewWidget
-from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker
+from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker, UpdateCheckWorker
 from vlm_worker import VlmCaptionWorker
 from locale_manager import LocaleManager
 from ui_main_window import Ui_MainWindow
@@ -179,6 +180,8 @@ class MainWindow(QMainWindow):
         self._gpu_dl_thread: QThread | None = None
         self._gpu_dl_worker: GpuRuntimeDownloadWorker | None = None
         self._gpu_dl_progress: QProgressDialog | None = None
+        self._update_check_thread: QThread | None = None
+        self._update_check_worker: UpdateCheckWorker | None = None
         self._bulk_tag_thread: QThread | None = None
         self._bulk_tag_worker: BulkTagWorker | None = None
         self.tag_thread: QThread | None = None
@@ -266,6 +269,12 @@ class MainWindow(QMainWindow):
         # global value was last saved instead of the selected model's own defaults.
         self._model_mode.on_model_changed(self._current_model_entry())
         self._maybe_prompt_gpu_setup()
+        # Called after the GPU prompt returns (its QMessageBox.exec() is synchronous),
+        # so the update check's worker thread isn't even started until the user has
+        # answered it. The update dialog itself is shown later from the worker's
+        # finished slot, which additionally waits out any modal still open (e.g. the
+        # GPU download progress) - see _show_update_prompt.
+        self._maybe_prompt_update_check()
 
     def _maybe_prompt_gpu_setup(self):
         """NVIDIA GPU が使えるビルドで GPU コンポーネント未整備なら、ダウンロードを尋ねる。
@@ -347,6 +356,120 @@ class MainWindow(QMainWindow):
                     # config escape hatch still stops the prompt outright.
                     write_debug_log("_maybe_prompt_gpu_setup: gpu_runtime/ still present after "
                                     "uninstall() - the repair prompt may reappear next launch")
+
+    def _maybe_prompt_update_check(self):
+        """起動時に新バージョンの有無を確認し、あれば通知する（通知型のみ。ダウンロード・
+        自己更新は一切しない - docs/260917_updater_av_safety_design.md）。
+
+        3択: ダウンロードページを開く / 今はしない（次回また訊く）/ このバージョンを
+        スキップ（次に新しい版が出るまで確認しない）。
+
+        起動のたびに通信しないよう、前回チェックから24時間経っていなければ何もしない。
+        **チェックを試みた時点で（結果の成否に関わらず）update_check_last を更新する**
+        ので、ネットワーク不通でも次の24時間は再試行しない（design doc 6章、失敗を
+        無限リトライしない）。
+
+        ここではガード（dismissed / 24h / 実行中）と update_check_last の保存だけを
+        して、通信は UpdateCheckWorker（QThread）に投げる。結果は
+        `_on_update_check_finished` → `_show_update_prompt` で GUI スレッドに戻って
+        表示する。`initial_load()` で `_maybe_prompt_gpu_setup()` の後に呼ばれる。
+        """
+        beh = self.settings.behavior
+        if beh.update_check == "dismissed":
+            return
+        if self._update_check_thread is not None:
+            # Still running, or finished but its check_finished slot hasn't run yet
+            # (which is what clears this) - either way a second thread must not be
+            # started on top of it.
+            return
+        if beh.update_check_last:
+            try:
+                last = datetime.fromisoformat(beh.update_check_last)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                # A timestamp in the future (clock set back, hand-edited value) would
+                # otherwise suppress the check until the clock catches up - treat it
+                # as "unknown" instead so it just gets overwritten below.
+                if last <= now and now - last < timedelta(hours=24):
+                    return
+            except ValueError:
+                pass  # 壊れた値は「未確認」扱いで続行（このまま下で上書きされる）
+
+        # 成否に関わらずここで更新する（design doc 6章の意図通り）。
+        beh.update_check_last = datetime.now(timezone.utc).isoformat()
+        self.save_current_config()
+
+        # The HTTPS GET runs off the GUI thread: done synchronously here it would
+        # freeze the just-shown window for up to the connect+read timeouts on a
+        # network that silently drops packets (every other network call in this
+        # app is on a QThread for the same reason). The dialog is shown from
+        # _on_update_check_finished, back on the GUI thread.
+        self._update_check_thread = QThread()
+        self._update_check_worker = UpdateCheckWorker(constants.APP_VERSION)
+        self._update_check_worker.moveToThread(self._update_check_thread)
+        self._update_check_worker.check_finished.connect(self._on_update_check_finished)
+        self._update_check_thread.started.connect(self._update_check_worker.run_check)
+        self._update_check_thread.start()
+
+    def _on_update_check_finished(self, info):
+        """UpdateCheckWorker の結果を受けて、必要ならダイアログを出す（GUI スレッド）。
+
+        `info` は update_checker.UpdateInfo か None（新版なし／取得失敗、区別しない）。
+        """
+        if self._update_check_thread:
+            self._update_check_thread.quit()
+            self._update_check_thread.wait()
+            if self._update_check_worker:
+                self._update_check_worker.deleteLater()
+            self._update_check_thread.deleteLater()
+            self._update_check_thread = self._update_check_worker = None
+        if self._is_shutting_down or info is None:
+            return
+        self._show_update_prompt(info)
+
+    def _show_update_prompt(self, info):
+        """新版 `info` を 3 択ダイアログで提示する。別のモーダル（GPU 導入プロンプトや
+        その進捗ダイアログ等）が開いている間は重ねずに待ち、閉じてから出す。"""
+        if self._is_shutting_down:
+            return
+        if QApplication.activeModalWidget() is not None:
+            # Never stack a second modal on top of one that's already open (the GPU
+            # prompt runs a nested exec() loop, and a slot firing inside it would
+            # otherwise open this dialog right on top of it). Poll until it's gone.
+            QTimer.singleShot(1000, lambda: self._show_update_prompt(info))
+            return
+        beh = self.settings.behavior
+        if beh.update_skip_version:
+            import update_checker
+            skip = update_checker.parse_version(beh.update_skip_version)
+            latest = update_checker.parse_version(info.version)
+            if skip is not None and latest is not None and latest <= skip:
+                return  # このバージョン（以下）はユーザーが既にスキップ済み
+
+        # Tags in this repo are "vX.Y.Z"; show the running version the same way so
+        # the two numbers in the dialog read consistently.
+        current_txt = constants.APP_VERSION
+        if info.version[:1] in ("v", "V") and current_txt[:1] not in ("v", "V"):
+            current_txt = "v" + current_txt
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(self.locale_manager.get_string("Updater", "Prompt_Title"))
+        box.setText(self.locale_manager.get_string("Updater", "Prompt_Body",
+                                                    version=info.version, current=current_txt))
+        open_btn = box.addButton(self.locale_manager.get_string("Updater", "Prompt_Open"),
+                                 QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(self.locale_manager.get_string("Updater", "Prompt_Later"),
+                      QMessageBox.ButtonRole.RejectRole)
+        skip_btn = box.addButton(self.locale_manager.get_string("Updater", "Prompt_Skip"),
+                                 QMessageBox.ButtonRole.DestructiveRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is open_btn:
+            webbrowser.open(info.html_url)
+        elif clicked is skip_btn:
+            beh.update_skip_version = info.version
+            self.save_current_config()
 
     def _start_gpu_runtime_download(self):
         if self._gpu_dl_thread and self._gpu_dl_thread.isRunning():
@@ -1113,6 +1236,7 @@ class MainWindow(QMainWindow):
         threads_to_stop: list[tuple[QThread | None, StoppableWorker | None]] = [ # type: ignore
             (self._download_thread, self._downloader_worker),
             (self._gpu_dl_thread, self._gpu_dl_worker),
+            (self._update_check_thread, self._update_check_worker),
             (self._tagger_thread, self._tagger_worker),
             (self._bulk_tag_thread, self._bulk_tag_worker),
             (self.tag_thread, self.tag_worker)

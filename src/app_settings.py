@@ -94,6 +94,16 @@ class Behavior:
     # ダイアログを出すか。ask / dismissed。dismissed は「使わない・次回から聞かない」。
     # 設定画面のボタンからはいつでもダウンロードできる。
     gpu_setup_prompt: str = "ask"
+    # 起動時の新バージョン確認（GitHub Releases）を行うか。ask / dismissed。
+    # dismissed は「二度と確認しない」。バージョン単位のスキップ（update_skip_version）とは別
+    # （docs/260917_updater_impl_plan.md）。
+    update_check: str = "ask"
+    # 直近の確認を試みた日時（ISO 8601, UTC）。空文字は「未確認」。
+    # 起動のたびに通信しないための24時間スロットルに使う。
+    update_check_last: str = ""
+    # ユーザーが「このバージョンはスキップ」を選んだ場合のタグ名（例 "v1.8.0"）。
+    # 次回以降、これ以下のバージョンでは再プロンプトしない。より新しい版が出れば再びプロンプトされる。
+    update_skip_version: str = ""
 
 @dataclass
 class Window:
@@ -146,6 +156,24 @@ def parse_gpu_setup_prompt(raw: str) -> str:
     """[Behavior] gpu_setup_prompt を検証する。空文字・不正値は ask へ。"""
     value = str(raw).strip().lower()
     return value if value in GPU_SETUP_PROMPT_STATES else "ask"
+
+
+UPDATE_CHECK_STATES: tuple[str, ...] = ("ask", "dismissed")
+
+
+# 手で config.ini を編集する人が「無効化」のつもりで書きがちな値。これらを ask に
+# 丸めると「オフにしたのに毎回訊かれる」になるので dismissed として受け付ける。
+_UPDATE_CHECK_OFF_ALIASES: frozenset[str] = frozenset(
+    {"false", "no", "off", "0", "never", "disabled", "disable", "none"})
+
+
+def parse_update_check(raw: str) -> str:
+    """[Behavior] update_check を検証する。空文字・不正値は ask へ。
+    false / no / off / 0 / never / disabled 等の「オフ」らしい値は dismissed 扱い。"""
+    value = str(raw).strip().lower()
+    if value in _UPDATE_CHECK_OFF_ALIASES:
+        return "dismissed"
+    return value if value in UPDATE_CHECK_STATES else "ask"
 
 
 def _parse_onnx_threads(raw: str) -> int:
@@ -257,7 +285,7 @@ def get_default_config() -> configparser.ConfigParser:
         'Paths': {'input_dir': str(BASE_DIR / "inputs"), 'model_dir': MODEL_DIR_NAME, 'model_filename': 'model.onnx'},
         'Thresholds': {'general': '0.40', 'character': '0.65', 'rating': '0.50', 'copyright': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
         'Limits': {'general': '55', 'character': '1', 'rating': '0', 'copyright': '0', 'artist': '0', 'meta': '0', 'model': '0', 'quality': '0', 'year': '0', 'touched': ''},
-        'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL', 'onnx_device': 'auto', 'gpu_setup_prompt': 'ask'},
+        'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL', 'onnx_device': 'auto', 'gpu_setup_prompt': 'ask', 'update_check': 'ask', 'update_check_last': '', 'update_skip_version': ''},
         'Window': {'geometry': '986x976+50+50', 'tag_display_rows': '6', 'tag_display_cols': '5'},
         'Model': {'model_id': 'pixai-tagger-v0.9', 'verified_models': ''},
         'Caption': {'task': 'MORE_DETAILED_CAPTION', 'placement': 'OVERWRITE'},
@@ -367,7 +395,10 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
             onnx_threads=_parse_onnx_threads(config.get('Behavior', 'onnx_threads', fallback='0')),
             target_mode=parse_target_mode_setting(config.get('Behavior', 'target_mode', fallback='ALL')),
             onnx_device=parse_onnx_device(config.get('Behavior', 'onnx_device', fallback='auto')),
-            gpu_setup_prompt=parse_gpu_setup_prompt(config.get('Behavior', 'gpu_setup_prompt', fallback='ask'))
+            gpu_setup_prompt=parse_gpu_setup_prompt(config.get('Behavior', 'gpu_setup_prompt', fallback='ask')),
+            update_check=parse_update_check(config.get('Behavior', 'update_check', fallback='ask')),
+            update_check_last=config.get('Behavior', 'update_check_last', fallback=''),
+            update_skip_version=config.get('Behavior', 'update_skip_version', fallback='')
         ),
         window=Window(
             geometry=config.get('Window', 'geometry', fallback='986x976+50+50'),
