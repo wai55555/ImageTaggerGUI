@@ -1,9 +1,8 @@
-__version__ = "1.7.0"
-
 import sys
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QProxyStyle, QStyle
+from constants import APP_VERSION as __version__
 from main_window import MainWindow
 
 
