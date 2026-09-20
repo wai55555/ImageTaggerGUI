@@ -1,14 +1,16 @@
-# PixAI Tagger ONNX GUI
+# ImageTaggerGUI (ранее PixAI Tagger ONNX GUI)
 Это приложение представляет собой графический инструмент для автоматического создания точных тегов и описаний для больших коллекций локальных изображений. Интуитивно понятное управление значительно упрощает организацию наборов данных. Помимо нескольких локальных моделей тегирования и создания описаний, поддерживаются Gemini, OpenAI, Claude, Groq, локальные VLM и другие совместимые сервисы.
 
-|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
 
 ## Обзор (Overview)
 
-**PixAI Tagger ONNX GUI** использует несколько локальных моделей, включая [версию ONNX](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) модели тегирования изображений от [PixAI](https://pixai.art/), а также дополнительные сетевые VLM для создания тегов и описаний изображений.
+**ImageTaggerGUI** использует несколько локальных моделей, включая [версию ONNX](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) модели тегирования изображений от [PixAI](https://pixai.art/), а также дополнительные сетевые VLM для создания тегов и описаний изображений.
+
+Этот проект начинался как GUI для PixAI Tagger (ранее PixAI Tagger ONNX GUI), а теперь поддерживает несколько локальных моделей и сетевые VLM.
 
 Оригинальный PixAI Tagger поддерживает более 13 000 богатых тегов, что дает преимущество по сравнению с обычными моделями тегирования (например, около 10 000 тегов у wd-tagger). Этот инструмент был разработан для максимального использования его производительности и поддержки управления вашими изображениями.
 
@@ -16,9 +18,10 @@
 
 ## Установка и использование (Installation & Usage)
 
-1.  Загрузите последнюю версию `PixaiTaggerOnnxGui-vX.X.X.zip` со страницы релизов.
+1.  Загрузите последнюю версию `ImageTaggerGUI-vX.X.X.zip` со страницы релизов.
 2.  Распакуйте zip-файл в выбранное вами место.
-3.  Запустите `pixai_tagger_gui.exe` внутри.
+3.  Запустите `ImageTaggerGUI.exe` внутри.
+4.  Если вы обновляетесь с v1.7.0 или более ранней версии: распакуйте архив в ту же папку — `config.ini`, модели, GPU-компоненты и сохранённые API-ключи сохранятся. Старый `pixai_tagger_gui.exe` можно удалить.
 
 ## Как использовать (How to Use)
 Дважды щелкните изображение и используйте колесико или перетаскивание, чтобы перемещать его. Возможно интуитивное управление.
@@ -82,6 +85,6 @@
 
 ## Благодарности (Acknowledgements)
 
-- Этот инструмент использует отличную модель тегирования, обученную [PixAI](https://pixai.art/). Без публичного выпуска Pixai Tagger это приложение не могло бы появиться. Искренне благодарю.
+- Этот инструмент использует отличную модель тегирования, обученную [PixAI](https://pixai.art/). Без публичного выпуска Pixai Tagger это приложение не могло бы появиться. Искренне благодарю. Этот проект начинался как GUI для PixAI Tagger (PixAI Tagger ONNX GUI). Он был переименован в ImageTaggerGUI по мере добавления новых моделей, но PixAI Tagger остаётся тем, с чего всё начиналось.
 - Используемая модель ONNX общедоступна на Hugging Face от [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx). Спасибо.
 - Также спасибо авторам, публикующим остальные поддерживаемые модели и их сборки ONNX — [SmilingWolf](https://huggingface.co/SmilingWolf) (семейство WD tagger), [Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2) (ONNX для wd-eva02 2026 Canary), [Camais03](https://huggingface.co/Camais03/camie-tagger-v2) (camie-tagger v2), [cella110n](https://huggingface.co/cella110n/cl_tagger) (cl_tagger), [Grio43](https://huggingface.co/Grio43/OppaiOracle) (OppaiOracle), а также [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) за сборку ONNX для Florence-2 (Microsoft). Каждая модель используется в соответствии с её исходной лицензией.

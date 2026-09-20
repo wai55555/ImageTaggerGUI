@@ -2,7 +2,7 @@
 #
 # onnxruntime-gpu (not the CPU 'onnxruntime') so the build's core matches the
 # CUDA provider. The large onnxruntime_providers_cuda.dll is stripped from the
-# distributed zip in pixai_tagger_gui.spec and downloaded at runtime into
+# distributed zip in ImageTaggerGUI.spec and downloaded at runtime into
 # gpu_runtime/ only when the user opts into GPU. NVIDIA runtime wheels
 # (nvidia-cudnn-cu12 etc.) are NOT installed here - they are fetched at runtime
 # too. Keep the version aligned with the CUDA/cuDNN baseline: 1.23.x == CUDA 12.x

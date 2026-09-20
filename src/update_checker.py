@@ -18,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-REPO = "wai55555/PixaiTaggerOnnxGui"
+# GitHub の repo slug。`constants.APP_NAME` とは独立（たまたま同じ綴り）。
+REPO = "wai55555/ImageTaggerGUI"
 API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 # `html_url` はこのプレフィックスで始まるものだけを受け付ける。API 応答は TLS で
 # 認証されているが、受け取った URL をそのまま `webbrowser.open()`（Windows では
