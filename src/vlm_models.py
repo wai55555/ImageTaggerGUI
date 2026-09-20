@@ -206,7 +206,11 @@ GEMMA_4_31B_IT = VlmModelProfile(
         "cloudflare": ModelBinding("cloudflare", "@cf/google/gemma-4-31b-it",
                                    ModelIdentityStatus.DECLARED),
         "nvidia": ModelBinding("nvidia", "google/gemma-4-31b-it", ModelIdentityStatus.DECLARED),
-        "groq": ModelBinding("groq", "gemma-4-31b-it", ModelIdentityStatus.DECLARED),
+        # Groq does not host any Gemma vision model (confirmed live: "model
+        # gemma-4-31b-it does not exist" from Groq's API, and it is absent
+        # from _KNOWN_VISION_MODEL_IDS["groq"] below, which only lists
+        # llama-4-scout and qwen3.x). GEMMA_4_26B_A4B_IT correctly has no groq
+        # binding either - this one was a stale/incorrect copy-paste.
         "huggingface": ModelBinding("huggingface", "google/gemma-4-31B-it",
                                      ModelIdentityStatus.DECLARED),
         "vercel": ModelBinding("vercel", "google/gemma-4-31b-it",

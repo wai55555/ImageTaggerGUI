@@ -801,13 +801,15 @@ def test_vlm_only_model_guard():
         M.default_registry().get("claude-opus-5"), "anthropic", "claude-sonnet-5")
     assert not M.is_vlm_model_id(gemma, "groq", "gpt-4o")
     assert not M.is_vlm_model_id(gemma, "anthropic", "gpt-4o")
-    # Provider-specific aliases must not cross a bound route, while the same
-    # literal ID can legitimately be used by two providers.
+    # Provider-specific aliases must not cross a bound route.
     gemma31 = M.default_registry().get("gemma-4-31b-it")
     assert gemma31 is not None
     assert M.is_vlm_model_id(gemma31, "gemini", "gemma-4-31b-it")
     assert not M.is_vlm_model_id(gemma31, "gemini", "google/gemma-4-31b-it:free")
-    assert M.is_vlm_model_id(gemma31, "groq", "gemma-4-31b-it")
+    # Groq has no Gemma vision model at all (confirmed live: "model gemma-4-31b-it
+    # does not exist"), so gemma-4-31b-it deliberately has no groq binding - this
+    # used to assert the opposite before that stale binding was removed.
+    assert not M.is_vlm_model_id(gemma31, "groq", "gemma-4-31b-it")
 
     bad_profile = M.VlmModelProfile(
         profile_id="user-bad", display_name="bad", canonical_model_id="groq/compound-mini",
