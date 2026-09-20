@@ -15,7 +15,7 @@ APP_NAME = "ImageTaggerGUI"
 # because main_window.py needs to read it too (for the update-notification
 # check) and image_tagger_gui.py imports main_window at module level - the
 # reverse import would be circular.
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 def _project_root_for_source() -> Path:
