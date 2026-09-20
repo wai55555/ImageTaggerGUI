@@ -4,10 +4,16 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
+# 表示名。ウィンドウタイトル・spec の exe 名・エラーダイアログ等の単一ソース。
+# リポジトリ slug（update_checker.REPO）や keyring のサービス名（vlm_secrets._SERVICE）は
+# 意図的にここから導出しない——表示名の変更に自動追従させてはいけない識別子
+# （変えるなら vlm_secrets の旧サービス名フォールバックのような互換処理が要る）。
+APP_NAME = "ImageTaggerGUI"
+
 # Single source of truth for the app version (was previously duplicated as
-# `__version__` at the top of pixai_tagger_gui.py). Lives here, not there,
+# `__version__` at the top of image_tagger_gui.py). Lives here, not there,
 # because main_window.py needs to read it too (for the update-notification
-# check) and pixai_tagger_gui.py imports main_window at module level - the
+# check) and image_tagger_gui.py imports main_window at module level - the
 # reverse import would be circular.
 APP_VERSION = "1.7.0"
 
@@ -154,7 +160,7 @@ RIGHT_SPLIT_TAGGER = [400, 200, 100]
 RIGHT_SPLIT_TEXT = [560, 120, 100]
 
 # --- UI TEXT ---
-MSG_WINDOW_TITLE = "PixAI Tagger 0.9 onnx GUI (Viewer/Bulk Edit)"
+MSG_WINDOW_TITLE = f"{APP_NAME} v{APP_VERSION}"
 
 # --- Style Sheet Colors ---
 STYLE_BTN_GREEN = "QPushButton { font-size: 16pt; padding: 10px; background-color: #4CAF50; color: white; }"

@@ -1,14 +1,16 @@
-# PixAI Tagger ONNX GUI
+# ImageTaggerGUI (formerly PixAI Tagger ONNX GUI)
 This application is a GUI tool for automatically generating fast and accurate tags and captions for large collections of local images. It streamlines dataset organization and management with intuitive controls. In addition to multiple local tagger and captioner models, it supports Gemini, OpenAI, Claude, Groq, local VLMs, and other compatible services.
 
-|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
 
 ## Overview
 
-**PixAI Tagger ONNX GUI** uses multiple local models—including the [ONNX version](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) of the image tagging model developed by [PixAI](https://pixai.art/)—and optional network VLMs to generate tags and captions for images.
+**ImageTaggerGUI** uses multiple local models—including the [ONNX version](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) of the image tagging model developed by [PixAI](https://pixai.art/)—and optional network VLMs to generate tags and captions for images.
+
+This project started as a GUI for PixAI Tagger (formerly PixAI Tagger ONNX GUI) and now supports multiple local models and network VLMs.
 
 The original PixAI Tagger supports over 13,000 rich tags, offering an advantage compared to common tagging models (e.g., wd-tagger's ~10,000 tags). This tool was developed to maximize its performance and support your image management.
 
@@ -16,9 +18,10 @@ It features automatic image tagging, tag browsing, individual editing, and power
 
 ## Installation & Usage
 
-1.  Download the latest `PixaiTaggerOnnxGui-vX.X.X.zip` from the release page.
+1.  Download the latest `ImageTaggerGUI-vX.X.X.zip` from the release page.
 2.  Unzip the file to your preferred location.
-3.  Run `pixai_tagger_gui.exe` inside.
+3.  Run `ImageTaggerGUI.exe` inside.
+4.  Upgrading from v1.7.0 or earlier: extract over the same folder and your `config.ini`, models, GPU components and saved API keys carry over. The old `pixai_tagger_gui.exe` can be deleted.
 
 ## How to Use
 Double-click an image and use the wheel or drag to move it around. Intuitive operation is possible.
@@ -82,6 +85,6 @@ This project is released under the **LGPLv3** and **Apache License 2.0** license
 
 ## Acknowledgements
 
-- This tool utilizes the excellent tagging model trained by [PixAI](https://pixai.art/). This application would not have been possible without the public release of Pixai Tagger. My heartfelt thanks.
+- This tool utilizes the excellent tagging model trained by [PixAI](https://pixai.art/). This application would not have been possible without the public release of Pixai Tagger. My heartfelt thanks. This project began as a GUI for PixAI Tagger (PixAI Tagger ONNX GUI). It was renamed ImageTaggerGUI as more models were added, but PixAI Tagger remains where it all started.
 - The ONNX model used is publicly available on Hugging Face by [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx). Thank you.
 - Thanks also to the authors who publish the other supported models and their ONNX builds — [SmilingWolf](https://huggingface.co/SmilingWolf) (WD tagger family), [Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2) (wd-eva02 2026 Canary ONNX), [Camais03](https://huggingface.co/Camais03/camie-tagger-v2) (camie-tagger v2), [cella110n](https://huggingface.co/cella110n/cl_tagger) (cl_tagger), [Grio43](https://huggingface.co/Grio43/OppaiOracle) (OppaiOracle), and [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) for the ONNX build of Florence-2 (Microsoft). Each model is used under its upstream license.

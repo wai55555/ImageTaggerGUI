@@ -17,7 +17,7 @@ docs/260910_gpu_acceleration_impl_plan.md を参照。
   `_read_ready_files` が検出して「未整備」扱いにする）。
 
 このモジュールはプラットフォーム非依存のロジックのみ（実際のダウンロードは
-gpu_runtime.GpuRuntimeInstaller、起動時の preload 呼び出しは pixai_tagger_gui.main）。
+gpu_runtime.GpuRuntimeInstaller、起動時の preload 呼び出しは image_tagger_gui.main）。
 """
 
 from __future__ import annotations

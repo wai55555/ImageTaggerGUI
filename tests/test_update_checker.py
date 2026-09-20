@@ -119,7 +119,7 @@ def test_returns_none_when_html_url_missing():
 
 @pytest.mark.parametrize("bad_url", [
     "https://evil.example/releases/tag/v1.8.0",      # other host
-    "http://github.com/wai55555/PixaiTaggerOnnxGui/releases/tag/v1.8.0",  # plain http
+    f"http://github.com/{UC.REPO}/releases/tag/v1.8.0",  # plain http
     "https://github.com/someone-else/repo/releases/tag/v1.8.0",           # other repo
     "file:///C:/Windows/System32/calc.exe",
     "javascript:alert(1)",
@@ -138,7 +138,11 @@ def test_accepts_html_url_under_our_release_prefix():
     http = _http(200, {"tag_name": "v1.8.0", "html_url": UC.RELEASE_URL_PREFIX + "tag/v1.8.0"})
     info = UC.check_for_update("1.7.0", http_get=http)
     assert info is not None
-    assert info.html_url.startswith("https://github.com/wai55555/PixaiTaggerOnnxGui/releases/")
+    assert info.html_url.startswith(UC.RELEASE_URL_PREFIX)
+
+
+def test_repo_slug_is_pinned():
+    assert UC.REPO == "wai55555/ImageTaggerGUI"
 
 
 def test_returns_none_when_payload_is_not_a_dict():

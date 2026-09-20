@@ -1,16 +1,18 @@
-# PixAI Tagger ONNX GUI
+# ImageTaggerGUI（旧名: PixAI Tagger ONNX GUI）
 ## [English](readme/readme_en.md) [简体中文](readme/readme_zh_CN.md) [繁體中文](readme/readme_zh_TW.md) [Русский](readme/readme_ru.md)
 
 ローカル環境にある大量の画像に対して、高速かつ正確なタグやキャプションを自動生成するGUIツールです。直感的な操作で、データセットの整理や管理を劇的に効率化します。複数のローカルtagger／captionerモデルに加え、Gemini・OpenAI・Claude・Grok・ローカルVLMなどに対応しています。
 
-|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
 
 ## 概要 (Overview)
 
-**PixAI Tagger ONNX GUI** は、[PixAI](https://pixai.art/) が開発した画像タグ付けモデルの[ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
+**ImageTaggerGUI** は、[PixAI](https://pixai.art/) が開発した画像タグ付けモデルの[ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
+
+本プロジェクトは PixAI Tagger の GUI（旧名 PixAI Tagger ONNX GUI）として始まり、現在は複数のローカルモデルとネットワーク VLM に対応しています。
 
 PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的なタグ付けモデル（例：wd-taggerの約10,000タグ）と比較して有利です。このツールはその性能を最大限に引き出し、あなたの画像管理をサポートするために開発されました。
 
@@ -18,9 +20,10 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 
 ## インストールと実行 (Installation & Usage)
 
-1.  リリースページから最新の `PixaiTaggerOnnxGui-vX.X.X.zip` をダウンロードします。
+1.  リリースページから最新の `ImageTaggerGUI-vX.X.X.zip` をダウンロードします。
 2.  zipファイルを好きな場所に解凍します。
-3.  中の `pixai_tagger_gui.exe` を実行します。
+3.  中の `ImageTaggerGUI.exe` を実行します。
+4.  v1.7.0 以前から更新する場合は、同じフォルダに上書き展開すれば `config.ini`・モデル・GPU コンポーネント・保存済み API キーはそのまま使えます。旧 `pixai_tagger_gui.exe` は削除して構いません。
 
 ## 使い方 (How to Use)
 画像をWクリックしてホイールやドラッグすれば大体OK、直感的操作で動かせます。
@@ -85,6 +88,6 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 
 ## 謝辞 (Acknowledgements)
 
-- このツールは [PixAI](https://pixai.art/) 様によってトレーニングされた素晴らしいタグ付けモデルを利用しています。Pixai Taggerが公開されていなければ、このアプリケーションは生まれませんでした。心から感謝申し上げます。
+- このツールは [PixAI](https://pixai.art/) 様によってトレーニングされた素晴らしいタグ付けモデルを利用しています。Pixai Taggerが公開されていなければ、このアプリケーションは生まれませんでした。心から感謝申し上げます。本プロジェクトは PixAI Tagger の GUI（PixAI Tagger ONNX GUI）として始まりました。対応モデルが増えたため ImageTaggerGUI に改名しましたが、出発点が PixAI Tagger であることに変わりはありません。
 - ONNXモデルは [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)様 によってHugging Faceで公開されているものを利用しています。ありがとうございます。
 - 追加対応しているモデルとその ONNX を公開してくださっている作者の皆さまにも感謝します。 [SmilingWolf](https://huggingface.co/SmilingWolf)（WD tagger系）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle）、および Florence-2（Microsoft）の ONNX 一式を公開する [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) の各氏。各モデルのライセンスは配布元に従います。

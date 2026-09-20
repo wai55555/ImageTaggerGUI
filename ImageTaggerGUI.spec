@@ -18,6 +18,16 @@ _model_datas = [
 ]
 
 
+def _app_name():
+    fallback = "ImageTaggerGUI"
+    try:
+        src = open(os.path.join(_source_dir, 'constants.py'), encoding='utf-8').read()
+        m = re.search(r'^APP_NAME\s*=\s*"([^"]+)"', src, re.M)
+        return m.group(1) if m else fallback
+    except Exception:
+        return fallback
+
+
 def _translation_suffixes():
     """The languages tag_utils actually loads, read straight from the source so a new
     language never silently misses the build. Falls back to the current list."""
@@ -49,7 +59,7 @@ _gpu_components = os.path.join(_project_root, 'gpu_components.json')
 _gpu_datas = [(_gpu_components, '.')] if os.path.isfile(_gpu_components) else []
 
 a = Analysis(
-    [os.path.join(_source_dir, 'pixai_tagger_gui.py')],
+    [os.path.join(_source_dir, 'image_tagger_gui.py')],
     pathex=[_source_dir],
     binaries=[],
     datas=[(os.path.join(_project_root, 'icons'), 'icons'),
@@ -87,7 +97,7 @@ if _stripped_cuda_provider and not _gpu_datas:
     # with exit code 0 reads as success (CodeRabbit review, PR #21). Fail the
     # build instead, so a mis-rolled release is caught here, not by a user.
     raise SystemExit(
-        'pixai_tagger_gui.spec: onnxruntime_providers_cuda.dll was stripped from '
+        'ImageTaggerGUI.spec: onnxruntime_providers_cuda.dll was stripped from '
         'this build but gpu_components.json is missing, which would permanently '
         'disable GPU acceleration in this build. Run tools/gen_gpu_components.py '
         'first, or delete onnxruntime-gpu from this environment if a CPU-only '
@@ -100,7 +110,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='pixai_tagger_gui',
+    name=_app_name(),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -120,5 +130,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='pixai_tagger_gui',
+    name=_app_name(),
 )
