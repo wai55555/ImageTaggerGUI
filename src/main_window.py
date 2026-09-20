@@ -1731,17 +1731,36 @@ class MainWindow(QMainWindow):
         """Safely cleans up the existing tagger thread and worker."""
         if self._tagger_thread:
             if self._tagger_thread.isRunning():
-                # 通常は worker.finished -> thread.quit で既に終了処理へ入っている。
-                # ここに到達するのは停止や異常経路だけなので、ユーザー向けの通常ログ
-                # へ「残存スレッド」を出さず、詳細はデバッグログへ残す。
+                # worker.finished は _on_tagger_finished（これがこの cleanup を呼ぶ）と
+                # thread.quit の両方に connect されており（この順）、この cleanup 自体が
+                # その1本目の帰結として、2本目の thread.quit がまだ処理される前に走る
+                # ことがある——「異常経路だけ」という想定は正確ではなく、正常完了でも
+                # 普通に起こりうる経路。
                 write_debug_log("tagger thread still running during cleanup; waiting")
                 self._tagger_thread.quit()
-                if not self._tagger_thread.wait(5000):
-                    write_debug_log("tagger thread did not finish within cleanup timeout")
+                # 素朴な wait(5000) はメインスレッドのイベントループを丸ごと止めてしまい、
+                # 同じ finished シグナルから2本目に繋がっている thread.quit（まだキューに
+                # 残っている可能性がある）や、ワーカースレッド側の後始末が必要とする
+                # メインスレッドとのやり取りが処理される機会を奪う。ここで小刻みに
+                # processEvents() を挟みながら待つことで、その機会を与えつつ、合計の
+                # 待ち時間の上限（5秒）は変えない。
+                deadline = time.monotonic() + 5.0
+                while self._tagger_thread.isRunning() and time.monotonic() < deadline:
+                    QApplication.processEvents()
+                    self._tagger_thread.wait(50)
+                if self._tagger_thread.isRunning():
+                    write_debug_log("tagger thread did not finish within cleanup timeout; "
+                                     "detaching without terminate()")
                     self.update_log(self.locale_manager.get_string(
-                        "MainWindow", "Thread_Shutdown_Failed"), "red")
-                    self._tagger_thread.terminate()
-                    self._tagger_thread.wait(1000)
+                        "MainWindow", "Thread_Shutdown_Slow"), "orange")
+                    # QThread.terminate()（Windows では TerminateThread 相当）は危険:
+                    # HTTPS ソケット処理などネイティブコードの最中に強制終了すると、
+                    # ヒープ/ローダーロックを保持したまま死に、以後プロセス全体が
+                    # ハングしうることを実機（オフスクリーン一括テスト）で確認した
+                    # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
+                    # スレッド自身は自分のイベントループが処理される限り、いずれ
+                    # 自然に終了する（Qt の deleteLater は稼働中の QThread に対しても
+                    # 安全——実際の破棄は終了後まで遅延される）。
             self._tagger_thread.deleteLater()
             self._tagger_thread = None
         if self._tagger_worker:
@@ -1833,8 +1852,15 @@ class MainWindow(QMainWindow):
         self.reload_tags_only()
 
         self._update_ui_for_processing(False, 'tagging')
-        
-        self._cleanup_tagger_thread()
+
+        # worker.finished は _on_tagger_finished（ここ）と thread.quit の両方に
+        # connect されている（この順）。ここで即座に _cleanup_tagger_thread() を
+        # 呼ぶと、まだキューに残っている thread.quit がこのイベントループの
+        # ターンでは処理されておらず、cleanup 側の isRunning() チェックが
+        # 「まだ動いている」と見えて無駄な wait/強制終了に倒れうる。
+        # QTimer.singleShot(0, ...) で次のイベントループターンへ回すことで、
+        # 先に thread.quit が処理される順序を保証する。
+        QTimer.singleShot(0, self._cleanup_tagger_thread)
 
     @Slot(bool)
     def _on_download_finished(self, success: bool):
