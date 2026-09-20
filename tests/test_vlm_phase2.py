@@ -54,6 +54,14 @@ def _patch(monkey):
     return old
 
 
+def test_retry_policy_default_read_timeout_is_60s():
+    """Pinned so nobody silently raises this back toward the old 120s default -
+    with retry_same_max=1 and multiple candidate connections it multiplies into
+    several minutes of a silent, apparently-frozen UI per image."""
+    from vlm_connections import RetryPolicy
+    assert RetryPolicy().read_timeout_s == 60.0
+
+
 def test_success_first_connection():
     conns = {"a": _conn("a"), "b": _conn("b")}
     r = _Responder({"x/v1": [RawHttpResponse(200, {}, _ok_body("first"), "")]})
@@ -155,6 +163,48 @@ def test_timeout_retry_then_failover():
     finally:
         T.execute_http = old
     print("  timeout -> retry_same once -> failover: OK")
+
+
+def test_on_attempt_start_fires_before_each_http_call():
+    """`on_attempt_start` must fire once per HTTP attempt, in order, with the
+    connection object and a 1-based same-connection attempt counter - this is
+    what lets the UI show "requesting X..." while a request (up to
+    read_timeout_s, default 60s) is still in flight instead of going silent."""
+    conns = {"a": _conn("a"), "b": _conn("b")}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        if responder.n < 2:
+            responder.n += 1
+            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, f"timeout {responder.n}")
+        return RawHttpResponse(200, {}, _ok_body("b ok"), "")
+    responder.n = 0
+    old = _patch(responder)
+    calls = []
+    try:
+        ex = VlmExecutor(conns, lambda ref: None,
+                         on_attempt_start=lambda conn, attempt: calls.append((conn.connection_id, attempt)))
+        res = ex.caption_one(_spec(), ["a", "b"])
+        assert res.ok and res.connection_id == "b"
+        assert calls == [("a", 1), ("a", 2), ("b", 1)]
+    finally:
+        T.execute_http = old
+    print("  on_attempt_start fires per attempt with connection + attempt number: OK")
+
+
+def test_on_attempt_start_exception_does_not_break_the_request():
+    """A broken callback (UI-side bug) must not prevent the actual HTTP attempt
+    from happening - it is a notification hook, not part of the request logic."""
+    conn = _conn("a")
+    responder = _Responder({"x/v1": [RawHttpResponse(200, {}, _ok_body("still works"), "")]})
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor({"a": conn}, lambda ref: None,
+                         on_attempt_start=lambda conn, attempt: (_ for _ in ()).throw(RuntimeError("boom")))
+        res = ex.caption_one(_spec(), ["a"])
+        assert res.ok and res.text == "still works"
+    finally:
+        T.execute_http = old
+    print("  on_attempt_start callback failure does not break the request: OK")
 
 
 def test_auth_error_excludes_connection():
@@ -715,10 +765,13 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
         lambda v: dataclasses.replace(M.GEMMA_4_26B_A4B_IT, bindings=verified))
     monkeypatch.setattr(vlm_secrets, "get_secret", lambda ref: "FAKEKEY")
 
-    monkeypatch.setattr(
-        T, "execute_http",
-        lambda req, **kw: RawHttpResponse(
-            200, {}, _ok_body("a detailed natural language description of the scene"), ""))
+    http_calls = []
+
+    def fake_http(req, **kw):
+        http_calls.append(req.url)
+        return RawHttpResponse(
+            200, {}, _ok_body("a detailed natural language description of the scene"), "")
+    monkeypatch.setattr(T, "execute_http", fake_http)
 
     from vlm_worker import VlmCaptionWorker
     logs = []
@@ -736,6 +789,14 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
     assert txt1.startswith("1girl, solo\n") and "natural language description" in txt1
     assert batch["v"] is not None and len(batch["v"]) == 3
     assert prog and prog[-1] == (3, 3)
+    # VlmExecutor.on_attempt_start must be wired to log_message: exactly one
+    # "requesting/retrying X..." notification per actual HTTP attempt (some
+    # bindings here parse-fail and fail over before one finally succeeds, so
+    # this isn't simply 3 - it must track the real attempt count 1:1, which is
+    # what lets the UI show something is happening for every attempt that can
+    # take up to read_timeout_s, not just the first one per image).
+    attempt_notifications = sum(1 for m, _ in logs if m in ("Attempt_Start", "Attempt_Retry"))
+    assert attempt_notifications == len(http_calls) > 0
     print(f"  worker batch (mock http): OK  ({len(batch['v'])} files written, {len(prog)} progress)")
 
 

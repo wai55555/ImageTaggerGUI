@@ -168,7 +168,8 @@ class VlmCaptionWorker(QObject):
 
         candidates = select_candidates(model_profile, connections, policy,
                                        has_auth=has_auth, supports_image=supports_image)
-        executor = VlmExecutor(connections, vlm_secrets.get_secret, stop_checker=self.is_stopped)
+        executor = VlmExecutor(connections, vlm_secrets.get_secret, stop_checker=self.is_stopped,
+                               on_attempt_start=self._on_attempt_start)
         image_cfg = ImagePreprocessConfig(
             max_long_edge=gen_profile.image_max_long_edge,
             fmt=gen_profile.image_format, jpeg_quality=gen_profile.image_jpeg_quality)
@@ -184,6 +185,21 @@ class VlmCaptionWorker(QObject):
             "user_prompt": build_user_prompt(gen_profile),
             "image_cfg": image_cfg,
         }
+
+    def _on_attempt_start(self, conn, attempt: int) -> None:
+        """VlmExecutor が接続を試行する直前に呼ぶ通知。UI へ「今何をしているか」を出す。
+
+        write_debug_log() は [Debug] debug_log がオフだと何も残さないので、これは
+        （Debug 設定に関係なく常に見える）log_message 経由にする。1リクエストが
+        最大 read_timeout_s（既定60秒）かかる上、同一接続で再試行もするため、これが
+        無いと成功/失敗が返るまで画面が完全に無反応に見える。
+        """
+        if attempt > 1:
+            self.log_message.emit(self.get_string(
+                "Vlm", "Attempt_Retry", connection=conn.display_name, attempt=attempt), "blue")
+        else:
+            self.log_message.emit(self.get_string(
+                "Vlm", "Attempt_Start", connection=conn.display_name), "blue")
 
     def _spec_base_for(self, image_path: Path, rt) -> dict | None:
         try:

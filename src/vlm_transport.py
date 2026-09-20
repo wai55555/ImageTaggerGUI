@@ -227,11 +227,18 @@ class VlmExecutor:
 
     def __init__(self, connections: dict[str, VlmConnection],
                  secret_resolver: Callable[[str], str | None],
-                 *, stop_checker: StopChecker | None = None):
+                 *, stop_checker: StopChecker | None = None,
+                 on_attempt_start: Callable[[VlmConnection, int], None] | None = None):
         self._connections = connections
         self._resolve_secret = secret_resolver
         self._stop = stop_checker or (lambda: False)
         self._runtime: dict[str, ConnectionRuntime] = {}
+        # UI 側で「今どの接続に問い合わせているか」を示すための通知フック。1リクエストが
+        # 最大 read_timeout_s（既定60秒）かかりうる上、失敗時は同一接続で再試行もするため、
+        # これが無いと成功/失敗が返るまで画面が完全に無反応に見える。呼び出し側
+        # （_try_connection）はこのコールバック自体の失敗で実行ループを止めないよう
+        # try/except で囲んで呼ぶ。
+        self._on_attempt_start = on_attempt_start
 
     def runtime(self, cid: str) -> ConnectionRuntime:
         return self._runtime.setdefault(cid, ConnectionRuntime())
@@ -315,6 +322,11 @@ class VlmExecutor:
             if self._stop():
                 return "stopped"
             same_conn_attempts += 1
+            if self._on_attempt_start is not None:
+                try:
+                    self._on_attempt_start(conn, same_conn_attempts)
+                except Exception:
+                    pass
             req = protocol.build_request(conn.base_url, default_key, call)
             apply_connection_auth(req, conn.auth.type, api_key,
                                   conn.auth.header_name, conn.auth.query_param)

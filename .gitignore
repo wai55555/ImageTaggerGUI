@@ -18,7 +18,8 @@ config.ini
 gpu_runtime/
 inputs/
 rules
-
+requirements-dev-cpu.txt
+requirements-tools.txt
 
 # Multi-model support: downloaded per-model files live under models/<model_id>/.
 # Only the hand-authored model_config.json for each model is tracked, plus PixAI's
