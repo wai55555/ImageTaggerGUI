@@ -15,8 +15,10 @@ debug_log.txt
 GEMINI.md
 AGENT.md
 config.ini
-rules
+gpu_runtime/
 inputs/
+rules
+
 
 # Multi-model support: downloaded per-model files live under models/<model_id>/.
 # Only the hand-authored model_config.json for each model is tracked, plus PixAI's
@@ -34,9 +36,7 @@ models/pixai-tagger-v0.9/selected_tags_en.csv
 diff.patch
 docs/
 onnx_model/
-
-# Release-local: generated per-release by tools/gen_gpu_components.py, with
-# SHA-256 pins tied to specific wheel versions (goes stale). The schema
-# reference gpu_components.example.json stays tracked.
+debug_log.*.txt
+error_log.txt
+# 作る度に使い捨てる生成物だからステージしない
 gpu_components.json
-gpu_runtime/

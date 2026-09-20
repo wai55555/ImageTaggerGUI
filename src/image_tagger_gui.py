@@ -83,6 +83,14 @@ def apply_dark_palette(app: QApplication) -> None:
 
 def main():
     """main entry point."""
+    # 未捕捉例外が黙って消える問題への対処。windowed ビルド（console=False）では
+    # sys.stderr/sys.stdout が None になり、既定の sys.excepthook は何も出力しない
+    # まま GUI だけが動き続ける。QApplication 生成より前に一番最初にインストールし、
+    # 以降のどの初期化コードで例外が出ても error_log.txt に残るようにする。
+    from utils import install_excepthook
+
+    install_excepthook()
+
     # GPU コンポーネント（gpu_runtime/）が入っていれば、最初の InferenceSession より
     # 前に CUDA/cuDNN DLL を明示ロードしておく（順序を誤るとシステム PATH 上の別
     # バージョン cuDNN を掴む）。未整備なら無害な no-op。例外は内部で握られる。

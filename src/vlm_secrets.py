@@ -21,7 +21,14 @@ _LEGACY_SERVICE = "PixaiTaggerOnnxGui.VLM"   # 改名前。既存エントリは
 
 
 def _service_for(secret_ref: str) -> str:
-    """この ref を書き込む先。旧サービス名に既にあればそれ（上書き更新）、無ければ新。"""
+    """この ref を書き込む先。旧サービス名に既にあればそれ（上書き更新）、無ければ新。
+
+    get_secret() とは逆に旧を先にチェックするのは意図的（CodeRabbit 指摘、却下）:
+    ここは「新規作成 or 既存更新のどちらか」を決める場であり、旧に無ければ新に作るのが
+    目的なので default は _SERVICE でなければならない。新を先にチェックして「無ければ旧」
+    にすると、_SERVICE への初回書き込み経路が無くなり（_SERVICE を返すには既に _SERVICE
+    にある必要がある、という循環）、改名後もずっと新規接続が旧サービス名に書かれ続ける。
+    """
     if keyring is not None:
         try:
             if keyring.get_password(_LEGACY_SERVICE, secret_ref):
