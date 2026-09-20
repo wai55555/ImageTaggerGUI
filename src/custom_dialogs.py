@@ -399,7 +399,10 @@ class ImageViewerDialog(QDialog):
 
     def _snap_to_edges(self, current_rect: QRect) -> QRect:
         snapped_rect = QRect(current_rect)
-        screen = QApplication.primaryScreen().availableGeometry()
+        # マルチディスプレイ対策: ドラッグ/リサイズ中にこのダイアログが実際に乗っている
+        # スクリーンを基準にする（常に primaryScreen だと非メインモニタ側で誤ってスナップする）。
+        target_screen = self.screen() or QApplication.primaryScreen()
+        screen = target_screen.availableGeometry()
         threshold = 30
         if abs(snapped_rect.left() - screen.left()) < threshold: snapped_rect.setLeft(screen.left())
         if abs(snapped_rect.right() - screen.right()) < threshold: snapped_rect.setRight(screen.right())

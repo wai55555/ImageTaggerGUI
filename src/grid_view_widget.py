@@ -650,7 +650,14 @@ class GridViewWidget(QWidget):
 
         # Set initial size and position only if it's the first time showing
         if not self._image_viewer_dialog.isVisible():
-            screen_rect = QApplication.primaryScreen().availableGeometry()
+            # マルチディスプレイ対策: 常に primaryScreen ではなく、本体ウィンドウが乗っている
+            # スクリーンを基準にする（main_window.show_enlarged_image と同じ方針）。
+            main_window = self.window()
+            anchor = main_window.frameGeometry().topLeft()
+            target_screen = (QApplication.screenAt(anchor)
+                              or main_window.screen()
+                              or QApplication.primaryScreen())
+            screen_rect = target_screen.availableGeometry()
             scaled_size = pixmap.size().scaled(screen_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
             self._image_viewer_dialog.resize(scaled_size)
             self._image_viewer_dialog.move(screen_rect.center() - self._image_viewer_dialog.rect().center())
