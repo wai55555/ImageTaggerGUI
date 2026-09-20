@@ -62,6 +62,15 @@ class VlmAttemptError:
             # retry_same_max > 1 by passing same_retries.
             if can_retry_same and (explicit_retry_count or consecutive_timeouts <= 1):
                 return VlmErrorClass.RETRY_SAME
+            # 1画像分の再試行（retry_same_max+1回）を使い切ってもなお毎回タイム
+            # アウトしているなら、この接続はセッション中ずっと壊れている可能性が
+            # 高い。auth_error 等と同様に EXCLUDE へ昇格し、次の画像から自動的に
+            # 外す——さもないと、無反応な1接続だけで画像1枚あたり最大で
+            # (retry_same_max+1)×read_timeout_s を毎回無駄にし続ける
+            # （2026-09 VLM デバッグ: 実機で NVIDIA 1接続が11枚中4枚で毎回
+            # ちょうど120秒ずつ無駄にしていたのを確認）。
+            if consecutive_timeouts >= max(1, int(retry_same_max)) + 1:
+                return VlmErrorClass.EXCLUDE
             return VlmErrorClass.FAILOVER
         if r is VlmErrorReason.RATE_LIMITED:
             return VlmErrorClass.FAILOVER          # 待機しない

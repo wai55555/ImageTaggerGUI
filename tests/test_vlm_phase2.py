@@ -165,6 +165,48 @@ def test_timeout_retry_then_failover():
     print("  timeout -> retry_same once -> failover: OK")
 
 
+def test_chronically_timing_out_connection_gets_excluded_across_images():
+    """A connection that times out on every attempt for one whole image
+    (initial + retry_same_max retries) must be excluded for the rest of the
+    session, not retried fresh on every subsequent image - this is the fix
+    for a real-world case where one dead connection wasted ~120s per image
+    across an entire batch (2026-09 VLM debugging)."""
+    conns = {"a": _conn("a"), "b": _conn("b")}
+    calls = {"a": 0, "b": 0}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        # both connections share a base_url in this test helper; distinguish
+        # by call order instead, since "a" is always tried before "b" while
+        # it remains a live candidate.
+        if calls["a"] < 2 and calls["b"] == 0:
+            calls["a"] += 1
+            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, f"timeout {calls['a']}")
+        calls["b"] += 1
+        return RawHttpResponse(200, {}, _ok_body("b ok"), "")
+
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor(conns, lambda ref: None)
+
+        res1 = ex.caption_one(_spec(), ["a", "b"])
+        assert res1.ok and res1.connection_id == "b"
+        assert calls["a"] == 2, "both of a's attempts (initial + 1 retry) must be spent"
+        assert ex.runtime("a").is_excluded, "a must be excluded after exhausting retries all-timeout"
+        assert ex.runtime("a").excluded_reason == "timeout"
+
+        # Image 2: "a" must no longer even be attempted - live_candidates()
+        # drops it, and caption_one only calls execute_http for "b".
+        live = ex.live_candidates(["a", "b"])
+        assert live == ["b"]
+        calls_to_a_before = calls["a"]
+        res2 = ex.caption_one(_spec(), live)
+        assert res2.ok and res2.connection_id == "b"
+        assert calls["a"] == calls_to_a_before, "excluded connection must not be retried on the next image"
+    finally:
+        T.execute_http = old
+    print("  chronic timeout -> excluded, not retried on later images: OK")
+
+
 def test_on_attempt_start_fires_before_each_http_call():
     """`on_attempt_start` must fire once per HTTP attempt, in order, with the
     connection object and a 1-based same-connection attempt counter - this is
