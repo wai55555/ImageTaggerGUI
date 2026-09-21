@@ -11,7 +11,7 @@ _get_string: GetString = default_get_string_fallback
 # VLM の既定値。新規設定だけでなく、欠落した [Vlm] キーのフォールバックにも
 # 同じ値を使う。既存ユーザーが明示的に選んだモデル／順序は上書きしない。
 DEFAULT_VLM_MODEL_PROFILE_ID = "gemma-4-31b-it"
-DEFAULT_VLM_CONNECTION_ORDER = "gemini,nvidia,openrouter,cloudflare,groq"
+DEFAULT_VLM_CONNECTION_ORDER = "gemini,openrouter,cloudflare"
 
 def set_get_string_func(func: GetString):
     global _get_string

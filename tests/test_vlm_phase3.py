@@ -198,7 +198,7 @@ def test_settings_dialog_roundtrip(monkeypatch):
     dlg = VlmSettingsDialog(s, T2)
     assert dlg.profile_combo.currentData() == "gemma-4-31b-it"
     assert [dlg._route_rows[cid]["conn"].provider_id for cid in dlg._route_order[:5]] == [
-        "gemini", "nvidia", "openrouter", "cloudflare", "groq"]
+        "gemini", "openrouter", "cloudflare", "groq", "nvidia"]
     assert dlg._route_rows["builtin-cloudflare"]["name"].text() == "Cloudflare"
     for row in dlg._route_rows.values():
         assert row["status"].width() == 180
@@ -226,7 +226,9 @@ def test_settings_dialog_roundtrip(monkeypatch):
     assert s.vlm.max_output_tokens == 1500
     assert not hasattr(s.vlm, "free_only")
     assert s.vlm.cloudflare_account_id == "fedcba9876543210fedcba9876543210"
-    assert "gemma-4-31b-it:cloudflare" in s.vlm.verified_set()
+    # Account-id confirmation is a models-list GET only, never a request to the
+    # profile's actual bound model - it must not mark that binding verified.
+    assert "gemma-4-31b-it:cloudflare" not in s.vlm.verified_set()
     assert s.vlm.language == "en"
     assert s.vlm.strict_identity is True
     dlg._on_anthropic_workspace_saved("wrkspc_test123")
@@ -513,19 +515,29 @@ def test_custom_connection_model_list_keeps_only_vlm_models():
     print("  custom connection model list filters non-VLM entries: OK")
 
 
-def test_lightweight_confirmation_is_persisted_for_next_dialog():
+def test_lightweight_confirmation_does_not_mark_binding_verified():
+    """A lightweight API-key check only does a models-list GET - it never sends a
+    request to the profile's actual bound model_id, so it cannot prove that model
+    works. Registering a key must not silently promote the currently-selected
+    profile's binding to VERIFIED on that basis alone (this is exactly the shape
+    of bug that hid a broken gemma-4-31b-it -> cloudflare binding: the account's
+    key was valid, so the unrelated model binding got marked verified even
+    though the model itself did not exist for this account). Only a full
+    connection diagnostic that reaches the actual model, or a real successful
+    generation, may promote a binding to verified."""
     import app_settings as A
     from vlm_settings_dialog import VlmSettingsDialog
 
     settings = A.load_settings(A.get_default_config())
     dialog = VlmSettingsDialog(settings, lambda sec, key, **kw: key)
     try:
-        dialog._on_api_key_binding_confirmed("gemini")
-        reloaded = A.load_settings(A.load_config())
-        assert "gemma-4-31b-it:gemini" in reloaded.vlm.verified_set()
+        assert not hasattr(dialog, "_on_api_key_binding_confirmed")
+        dialog._on_cloudflare_verified("acct123")
+        assert "gemma-4-31b-it:cloudflare" not in settings.vlm.verified_set()
+        assert settings.vlm.cloudflare_account_id == "acct123"
     finally:
         dialog.close()
-    print("  lightweight route confirmation is written to config and restored on reload: OK")
+    print("  lightweight/account-id confirmation alone does not mark a binding verified: OK")
 
 
 def test_settings_dialog_keeps_unbound_route_discoverable():
@@ -562,12 +574,19 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
             "groq/compound-mini", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile",
         ])
         assert row["model_ids"] == ["qwen/qwen3.8-27b"]
+        # qwen/qwen3.8-27b is already a shipped binding for this provider -> no
+        # "new model detected" notice should appear.
+        assert "Settings_Route_NewModelsDetected" not in row["status"].toolTip()
         from vlm_model_list import ModelCatalogEntry
         dlg._on_model_list("builtin-groq", [
             ModelCatalogEntry("provider/new-vision", True, True, "live metadata"),
             ModelCatalogEntry("provider/text-only", False, True, "live metadata"),
         ])
         assert row["model_ids"] == ["provider/new-vision"]
+        # "provider/new-vision" is not in the shipped catalog for groq -> flagged,
+        # but not auto-selected/added (the combo selection assertions below still
+        # require an explicit setCurrentText further down).
+        assert "Settings_Route_NewModelsDetected" in row["status"].toolTip()
         row["model_edit"].setCurrentText("provider/new-vision")
         dlg._on_model_id_edited("builtin-groq")
         assert vlm_config.build_connection_map(
@@ -633,14 +652,18 @@ def test_cancel_repersists_regular_fields_after_immediate_confirmation(tmp_path,
     try:
         assert settings.vlm.strict_identity is False
         settings.vlm.strict_identity = True  # representative unsaved regular edit
-        dialog._on_api_key_binding_confirmed("gemini")
+        # _on_cloudflare_verified persists immediately (account id), same as the
+        # old binding-confirmation path used to - a convenient trigger for
+        # "an immediate write already happened" independent of the regular edit above.
+        dialog._on_cloudflare_verified("acct123")
         assert A.load_settings(A.load_config()).vlm.strict_identity is True
+        assert A.load_settings(A.load_config()).vlm.cloudflare_account_id == "acct123"
 
         dialog._restore_unsaved_vlm()
         reloaded = A.load_settings(A.load_config()).vlm
         assert settings.vlm.strict_identity is False
         assert reloaded.strict_identity is False
-        assert "gemma-4-31b-it:gemini" in reloaded.verified_set()
+        assert reloaded.cloudflare_account_id == "acct123"
     finally:
         dialog.close()
 

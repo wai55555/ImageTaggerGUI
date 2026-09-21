@@ -30,7 +30,6 @@ class ApiKeyDialog(QDialog):
                  on_cloudflare_verified: Callable[[str], None] | None = None,
                  anthropic_workspace_id: str = "",
                  on_anthropic_workspace_saved: Callable[[str], None] | None = None,
-                 on_binding_confirmed: Callable[[str], None] | None = None,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self._t = get_string
@@ -44,7 +43,6 @@ class ApiKeyDialog(QDialog):
         self._on_cloudflare_verified = on_cloudflare_verified
         self._anthropic_workspace_id = anthropic_workspace_id
         self._on_anthropic_workspace_saved = on_anthropic_workspace_saved
-        self._on_binding_confirmed = on_binding_confirmed
         self._saved = False
         self._cancel_requested = False
         self._pending_done_result: int | None = None
@@ -208,7 +206,6 @@ class ApiKeyDialog(QDialog):
         self._verify_failed = ""
         self._model_warning = ""
         self._service_warning = ""
-        self._binding_confirmed = bool(getattr(report, "can_mark_binding_verified", False))
         items = {i.name: i for i in report.items}
         auth = items.get("Auth")
         http = items.get("HTTP response")
@@ -303,10 +300,6 @@ class ApiKeyDialog(QDialog):
             self._on_cloudflare_verified(self._pending_account_id)
         if self._is_anthropic and self._on_anthropic_workspace_saved is not None:
             self._on_anthropic_workspace_saved(getattr(self, "_pending_workspace_id", ""))
-        if self._binding_confirmed and self._on_binding_confirmed is not None:
-            provider_id = getattr(self._conn, "provider_id", "")
-            if provider_id:
-                self._on_binding_confirmed(provider_id)
         self._saved = True
         service_warn = getattr(self, "_service_warning", "")
         model_warn = getattr(self, "_model_warning", "")

@@ -198,13 +198,22 @@ GEMMA_4_31B_IT = VlmModelProfile(
     family="Gemma 4",
     base_model="gemma-4-31b-it",
     quantization="provider_managed",
-    aliases=("google/gemma-4-31b-it", "google/gemma-4-31b-it:free", "@cf/google/gemma-4-31b-it"),
+    aliases=("google/gemma-4-31b-it", "google/gemma-4-31b-it:free"),
     bindings={
         "gemini": ModelBinding("gemini", "gemma-4-31b-it", ModelIdentityStatus.DECLARED),
         "openrouter": ModelBinding("openrouter", "google/gemma-4-31b-it:free",
                                    ModelIdentityStatus.DECLARED),
-        "cloudflare": ModelBinding("cloudflare", "@cf/google/gemma-4-31b-it",
-                                   ModelIdentityStatus.DECLARED),
+        # Cloudflare does not currently host @cf/google/gemma-4-31b-it (confirmed
+        # live: absent from a real /ai/models/search listing of 65 models; a real
+        # generation request gets 403 "This account is not allowed to access
+        # @cf/google/gemma-4-31b-it" - worded like a permissions error but it is
+        # actually an unknown-model error, since the account's API key passed a
+        # lightweight auth-only check against the same endpoint). Cloudflare does
+        # host @cf/google/gemma-4-26b-a4b-it, but that is a different-sized model
+        # already correctly bound to GEMMA_4_26B_A4B_IT below, not a substitute
+        # for this one (see looks_same_family()'s "different size -> different
+        # model" rule). No cloudflare binding here until Cloudflare ships this
+        # exact model.
         "nvidia": ModelBinding("nvidia", "google/gemma-4-31b-it", ModelIdentityStatus.DECLARED),
         # Groq does not host any Gemma vision model (confirmed live: "model
         # gemma-4-31b-it does not exist" from Groq's API, and it is absent
@@ -672,7 +681,12 @@ _KNOWN_VISION_MODEL_IDS = {
     "cloudflare": frozenset({
         "@cf/google/gemma-3-12b-it",
         "@cf/google/gemma-4-26b-a4b-it",
-        "@cf/google/gemma-4-31b-it",
+        # "@cf/google/gemma-4-31b-it" removed: confirmed live absent from a real
+        # /ai/models/search listing, and a real generation request gets 403
+        # "This account is not allowed to access @cf/google/gemma-4-31b-it"
+        # (worded like a permissions error but is actually unknown-model - the
+        # same account's key passes a lightweight auth-only check against the
+        # same endpoint). See GEMMA_4_31B_IT's binding comment above.
         "@cf/meta/llama-3.2-11b-vision-instruct",
         "@cf/meta/llama-4-scout-17b-16e-instruct",
         # "@cf/mistral/mistral-small-3.1-24b-instruct",  # Mistral系VLMは一時停止
@@ -995,6 +1009,20 @@ def is_vlm_model_id(profile: VlmModelProfile | None, provider_id: str,
         if known_profile is not None and known_profile.profile_id != profile.profile_id:
             return False
         return looks_same_family(profile, model_id)
+    # No binding for this provider on the current profile: any known-good VLM id
+    # for the provider is normally an acceptable manual choice (a Gemma profile
+    # picking a Claude model via a manual override is a deliberate, unambiguous
+    # cross-vendor choice). But a same-family sibling profile's id (e.g.
+    # gemma-4-31b-it accepting gemma-4-26b-a4b-it's cloudflare id) looks like it
+    # could be "this same model, just this provider's exact ID" and would get
+    # silently accepted, wired in, and shown as an enabled/verified route -
+    # while actually running a different-sized model under the current
+    # profile's name. Reject that specific case; a genuinely different family
+    # from another profile is still fine (see is_vlm_model_id's docstring).
+    if (profile is not None and known_profile is not None
+            and known_profile.profile_id != profile.profile_id
+            and known_profile.family == profile.family):
+        return False
     low = _base_catalog_model_id(model_id)
     static_capability, _ = classify_model_capability(provider_id, model_id)
     return (low in _known_vision_model_ids(provider_id)
@@ -1012,6 +1040,26 @@ def filter_vlm_model_ids(profile: VlmModelProfile | None, provider_id: str,
         if model_id and model_id not in seen and is_vlm_model_id(profile, provider_id, model_id):
             seen.add(model_id)
             out.append(model_id)
+    return out
+
+
+def new_vlm_model_ids(provider_id: str, candidate_ids: list[str]) -> list[str]:
+    """VLM対応が確認できた一覧のうち、出荷カタログに未登録のIDだけを返す。
+
+    _ALL_PROFILES のbinding にも _KNOWN_VISION_MODEL_IDS にも無いIDを、
+    プロバイダーが新しく公開した可能性のあるモデルとして検出する（自動で
+    プロファイルへ追加はしない。UI側で「新モデルを検出」の通知材料として使う）。
+    """
+    known = _known_vision_model_ids(provider_id)
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidate_ids:
+        model_id = str(candidate or "").strip()
+        low = _base_catalog_model_id(model_id)
+        if not low or low in known or low in seen:
+            continue
+        seen.add(low)
+        out.append(model_id)
     return out
 
 

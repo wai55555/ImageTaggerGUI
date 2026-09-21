@@ -741,7 +741,7 @@ def test_default_vlm_profile_and_fallback_order():
     settings = A.load_settings(A.get_default_config())
     assert settings.vlm.model_profile_id == "gemma-4-31b-it"
     assert settings.vlm.order_list() == [
-        "gemini", "nvidia", "openrouter", "cloudflare", "groq"]
+        "gemini", "openrouter", "cloudflare"]
     assert CFG.ordered_builtin_provider_ids(settings.vlm) == settings.vlm.order_list()
     profile = CFG.resolve_model_profile(settings.vlm)
     connections = CFG.build_connection_map(settings.vlm, profile)
@@ -751,7 +751,7 @@ def test_default_vlm_profile_and_fallback_order():
         has_auth={cid: True for cid in connections},
     )
     assert candidates.connection_ids[0] == "builtin-gemini"
-    print("  default VLM profile Gemma 4 31B IT; fallback order Gemini -> NVIDIA -> OpenRouter -> Cloudflare -> Groq: OK")
+    print("  default VLM profile Gemma 4 31B IT; fallback order Gemini -> OpenRouter -> Cloudflare: OK")
 
 
 def test_model_id_match_against_profile():
@@ -778,6 +778,23 @@ def test_model_id_match_against_profile():
     assert M.looks_same_family(gemma, "gpt-4o") is False
     assert M.looks_same_family(gemma, "gemma-3-27b-it") is False   # different size -> different model
     print("  model-id match: exact alias, size mismatch rejected, family check: OK")
+
+
+def test_new_vlm_model_ids_flags_only_uncataloged_ids():
+    """new_vlm_model_ids() is the detection primitive behind the settings-dialog
+    'new model found, not auto-added' notice: a provider releasing a new vision
+    model shouldn't require waiting for a code update before a user even learns
+    it exists, but it also must never auto-register anything (that's how the
+    stale Groq/Gemma binding happened before)."""
+    # a model already bound in a shipped profile is not "new"
+    assert M.new_vlm_model_ids("gemini", ["gemini-2.5-flash"]) == []
+    # an entirely unseen provider id is flagged
+    new = M.new_vlm_model_ids("gemini", ["gemini-2.5-flash", "gemini-9.9-astra-preview"])
+    assert new == ["gemini-9.9-astra-preview"]
+    # duplicates in the candidate list are not repeated in the output
+    assert M.new_vlm_model_ids("gemini", ["gemini-9.9-astra", "gemini-9.9-astra"]) == ["gemini-9.9-astra"]
+    # empty/blank candidates are ignored, not reported as "new"
+    assert M.new_vlm_model_ids("gemini", ["", "   "]) == []
 
 
 def test_vlm_only_model_guard():
@@ -826,6 +843,17 @@ def test_vlm_only_model_guard():
     # does not exist"), so gemma-4-31b-it deliberately has no groq binding - this
     # used to assert the opposite before that stale binding was removed.
     assert not M.is_vlm_model_id(gemma31, "groq", "gemma-4-31b-it")
+    # Cloudflare has no gemma-4-31b-it binding either (removed: confirmed live
+    # that Cloudflare does not host that exact model). Cloudflare DOES host
+    # gemma-4-26b-a4b-it, a same-family ("Gemma 4") but different-sized sibling
+    # already correctly bound to GEMMA_4_26B_A4B_IT. A manual override must not
+    # silently accept that sibling's id for the 31b profile - build_connection_map
+    # would then enable/wire the route under the 31b profile's name while actually
+    # running the 26b model. A genuinely different family (e.g. a Claude id) is
+    # still an acceptable manual override for an unbound route - see the
+    # openai/anthropic cross-provider assertions above.
+    assert not M.is_vlm_model_id(gemma31, "cloudflare", "@cf/google/gemma-4-26b-a4b-it")
+    assert M.is_vlm_model_id(gemma31, "cloudflare", "@cf/meta/llama-4-scout-17b-16e-instruct")
 
     bad_profile = M.VlmModelProfile(
         profile_id="user-bad", display_name="bad", canonical_model_id="groq/compound-mini",

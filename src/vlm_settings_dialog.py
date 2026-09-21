@@ -536,6 +536,7 @@ class VlmSettingsDialog(QDialog):
                    for entry in result]
         vlm_entries = filter_vlm_catalog(entries)
         vlm_ids = [entry.model_id for entry in vlm_entries]
+        new_ids = vlm_models.new_vlm_model_ids(provider_id, vlm_ids)
         vlm_models.register_discovered_vlm_ids(provider_id, vlm_ids)
         r["model_ids"] = vlm_ids
         combo = r["model_edit"]
@@ -558,14 +559,22 @@ class VlmSettingsDialog(QDialog):
             self._on_model_id_edited(cid)
             key = "Settings_Route_FetchModels_Exact" if score >= 0.999 \
                 else "Settings_Route_FetchModels_Matched"
-            self._set_route_status(r, f"{okmsg} — " + self._t("Vlm", key, id=best))
+            status = f"{okmsg} — " + self._t("Vlm", key, id=best)
         else:
             combo.blockSignals(True)
             combo.setCurrentText("")
             combo.blockSignals(False)
-            self._set_route_status(r, f"{okmsg} — " + self._t(
+            status = f"{okmsg} — " + self._t(
                 "Vlm", "Settings_Route_FetchModels_NoMatch",
-                profile=(profile.display_name if profile else self._vlm.model_profile_id)))
+                profile=(profile.display_name if profile else self._vlm.model_profile_id))
+        if new_ids:
+            # 出荷カタログ(_ALL_PROFILES / _KNOWN_VISION_MODEL_IDS)に未登録の
+            # VLM対応モデルが見つかった場合、自動でプロファイルへ追加はせず、通知だけ行う
+            # (過去にGroqの偽バインディングを誤って登録した反省から、未検証IDの自動採用はしない)。
+            status += " — " + self._t(
+                "Vlm", "Settings_Route_NewModelsDetected",
+                n=len(new_ids), ids=", ".join(new_ids[:5]))
+        self._set_route_status(r, status)
 
     def _ml_cleanup(self) -> None:
         if getattr(self, "_ml_worker", None) is not None:
@@ -826,27 +835,28 @@ class VlmSettingsDialog(QDialog):
                                     if conn.provider_id == "anthropic" else ""),
             on_anthropic_workspace_saved=(self._on_anthropic_workspace_saved
                                            if conn.provider_id == "anthropic" else None),
-            on_binding_confirmed=self._on_api_key_binding_confirmed,
             parent=self,
         )
         dlg.exec()
         self._refresh_route_status(cid)
 
     def _on_cloudflare_verified(self, account_id: str) -> None:
-        """接続確認に使えた Account ID を保存する（binding確認は共通callbackで行う）。"""
+        """接続確認に使えた Account ID を保存する。
+
+        ここを通る確認はモデル一覧GETだけで、プロファイルが実際に使うモデルへは
+        到達していない（Cloudflareにそのモデルが存在しなくても、アカウント自体は
+        認証を通る）。そのためここでは binding の「検証済み」を立てない。検証済みへ
+        昇格させるのは、実際にそのモデルへリクエストを送って確認する「接続診断」
+        （フル診断、_on_diag_report）か、実際のキャプション生成成功
+        （main_window._on_vlm_binding_verified）のときだけにする。
+        """
         self._vlm.cloudflare_account_id = account_id
-        vlm_config.mark_binding_verified(self._vlm, "cloudflare")
         self._persist_immediate_settings()
 
     def _on_anthropic_workspace_saved(self, workspace_id: str) -> None:
         """検証に使えた任意のWorkspace IDを保存する。空は単一Workspaceキーを表す。"""
         self._vlm.anthropic_workspace_id = workspace_id
         self._persist_immediate_settings()
-
-    def _on_api_key_binding_confirmed(self, provider_id: str) -> None:
-        """キー登録時の軽量疎通確認を次回も表示できるよう保存する。"""
-        if provider_id and vlm_config.mark_binding_verified(self._vlm, provider_id):
-            self._persist_immediate_settings()
 
     def _set_diag_buttons_enabled(self, enabled: bool) -> None:
         for r in self._route_rows.values():

@@ -191,12 +191,11 @@ def test_api_key_dialog_verify_and_save(monkeypatch):
                                        header_name="x-goog-api-key"))
     T2 = lambda sec, key, **kw: key
 
-    def _run(diag_report, key, on_confirmed=None):
+    def _run(diag_report, key):
         monkeypatch.setattr(
             D, "diagnose", lambda c, k, do_live_request=True, **kwargs: diag_report)
         d = ApiKeyDialog(T2, display_name="Gemini API", secret_ref="vlm/gemini/api_key",
-                         conn=conn, key_url="http://k", login_url="http://l", instructions="a\\nb",
-                         on_binding_confirmed=on_confirmed)
+                         conn=conn, key_url="http://k", login_url="http://l", instructions="a\\nb")
         d.key_edit.setText(key)
         d._check_and_save()
         for _ in range(300):
@@ -213,15 +212,19 @@ def test_api_key_dialog_verify_and_save(monkeypatch):
     d = _run(good, "GOODKEY")
     assert stored.get("vlm/gemini/api_key") == "GOODKEY" and d.saved() is True
 
-    confirmed = []
+    # A lightweight check (models-list GET only) still saves the key, but it must
+    # not claim the profile's actual bound model was confirmed - that requires a
+    # full diagnostic or a real generation success (see
+    # test_lightweight_confirmation_does_not_mark_binding_verified in
+    # test_vlm_phase3.py).
     lightweight_good = DiagReport("builtin-gemini", lightweight=True)
     lightweight_good.add("Auth", DiagStatus.PASS, "accepted (server responded 200)")
     lightweight_good.add("Request build", DiagStatus.PASS, "GET https://x/v1/models")
     lightweight_good.add("HTTP response", DiagStatus.PASS, "200 OK (lightweight model-list check)")
     lightweight_good.http_status = 200
     stored.clear()
-    d_light = _run(lightweight_good, "LIGHTKEY", confirmed.append)
-    assert d_light.saved() is True and confirmed == ["gemini"]
+    d_light = _run(lightweight_good, "LIGHTKEY")
+    assert d_light.saved() is True
 
     stored.clear()
     bad = DiagReport("builtin-gemini")
