@@ -62,6 +62,41 @@ def test_retry_policy_default_read_timeout_is_60s():
     assert RetryPolicy().read_timeout_s == 60.0
 
 
+def test_adaptive_read_timeout_scales_with_max_output_tokens():
+    """A real 11-image GUI batch with the default maximum_detail profile
+    (max_output_tokens=3072) showed legitimate Gemini generations taking
+    40-70s, some tripping the flat 60s timeout and wasting ~2min/image on a
+    pointless retry+failover before an also-rate-limited fallback failed
+    instantly. The timeout must scale up for large output budgets, but stay
+    capped so a genuinely dead connection (the original NVIDIA problem) still
+    fails in bounded time."""
+    from vlm_transport import adaptive_read_timeout
+    assert adaptive_read_timeout(60.0, 3072) == 90.0          # default profile: capped at 1.5x
+    assert adaptive_read_timeout(60.0, 2048) == 60.0           # baseline: no change
+    assert adaptive_read_timeout(60.0, 512) == 60.0            # small budget: never shrinks below base
+    assert adaptive_read_timeout(60.0, 8192) == 90.0           # very large budget: still capped at 1.5x
+    assert adaptive_read_timeout(60.0, 0) == 60.0              # no tokens configured: unchanged
+
+
+def test_executor_passes_adaptive_timeout_to_execute_http():
+    seen = {}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        seen["read_timeout"] = read_timeout
+        return RawHttpResponse(200, {}, _ok_body(), "")
+
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor({"a": _conn("a")}, lambda ref: None)
+        spec = _spec()
+        spec["profile"] = GenerationProfile(max_output_tokens=3072)
+        res = ex.caption_one(spec, ["a"])
+        assert res.ok
+        assert seen["read_timeout"] == 90.0
+    finally:
+        T.execute_http = old
+
+
 def test_success_first_connection():
     conns = {"a": _conn("a"), "b": _conn("b")}
     r = _Responder({"x/v1": [RawHttpResponse(200, {}, _ok_body("first"), "")]})
@@ -165,46 +200,69 @@ def test_timeout_retry_then_failover():
     print("  timeout -> retry_same once -> failover: OK")
 
 
-def test_chronically_timing_out_connection_gets_excluded_across_images():
-    """A connection that times out on every attempt for one whole image
-    (initial + retry_same_max retries) must be excluded for the rest of the
-    session, not retried fresh on every subsequent image - this is the fix
-    for a real-world case where one dead connection wasted ~120s per image
-    across an entire batch (2026-09 VLM debugging)."""
+def test_chronically_timing_out_connection_gets_excluded_after_two_images():
+    """A connection that times out on EVERY attempt across two whole images
+    (2 x (initial + retry_same_max retries)) must be excluded for the rest of
+    the session - but not after just one bad image, since a real connection
+    (Gemini) was observed timing out on one image and then succeeding
+    normally on the next (2026-09 VLM debugging, real 11-image batch). A
+    too-eager 1-image threshold caused that still-working connection to be
+    excluded, which combined with another connection's rate-limit cooldown
+    left zero live candidates and silently abandoned 7 of 11 images."""
     conns = {"a": _conn("a"), "b": _conn("b")}
-    calls = {"a": 0, "b": 0}
+    # Both connections share a base_url in this test helper, so the responder
+    # can't tell "a" from "b" by request content - script by call index
+    # instead, matching the exact expected sequence: image1 tries a twice
+    # (timeout, timeout) then falls over to b (success); image2 repeats that
+    # on a (now excluded) then succeeds on b; image3 only ever reaches b.
+    script = [
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 1"),   # image1: a attempt 1
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 2"),   # image1: a attempt 2 (retry)
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image1: b
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 3"),   # image2: a attempt 1
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 4"),   # image2: a attempt 2 (retry)
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image2: b
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image3: b only (a excluded)
+    ]
+    calls = {"n": 0}
 
     def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
-        # both connections share a base_url in this test helper; distinguish
-        # by call order instead, since "a" is always tried before "b" while
-        # it remains a live candidate.
-        if calls["a"] < 2 and calls["b"] == 0:
-            calls["a"] += 1
-            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, f"timeout {calls['a']}")
-        calls["b"] += 1
-        return RawHttpResponse(200, {}, _ok_body("b ok"), "")
+        result = script[calls["n"]]
+        calls["n"] += 1
+        return result
 
     old = _patch(responder)
     try:
         ex = VlmExecutor(conns, lambda ref: None)
 
+        # Image 1: "a" times out on both attempts, but that is only one
+        # image's worth (consecutive_timeouts=2 < threshold 4) - failover to
+        # "b", and "a" must remain a live candidate for the next image.
         res1 = ex.caption_one(_spec(), ["a", "b"])
         assert res1.ok and res1.connection_id == "b"
-        assert calls["a"] == 2, "both of a's attempts (initial + 1 retry) must be spent"
-        assert ex.runtime("a").is_excluded, "a must be excluded after exhausting retries all-timeout"
+        assert calls["n"] == 3
+        assert not ex.runtime("a").is_excluded, \
+            "a must NOT be excluded after just one bad image - it may just be having a rough moment"
+        assert ex.live_candidates(["a", "b"]) == ["a", "b"]
+
+        # Image 2: "a" times out on both attempts again - now two whole
+        # images' worth of all-timeout attempts (consecutive_timeouts=4) -
+        # this time it gets excluded.
+        res2 = ex.caption_one(_spec(), ex.live_candidates(["a", "b"]))
+        assert res2.ok and res2.connection_id == "b"
+        assert calls["n"] == 6
+        assert ex.runtime("a").is_excluded, "a must be excluded after two whole images of all-timeout attempts"
         assert ex.runtime("a").excluded_reason == "timeout"
 
-        # Image 2: "a" must no longer even be attempted - live_candidates()
-        # drops it, and caption_one only calls execute_http for "b".
+        # Image 3: "a" must no longer even be attempted.
         live = ex.live_candidates(["a", "b"])
         assert live == ["b"]
-        calls_to_a_before = calls["a"]
-        res2 = ex.caption_one(_spec(), live)
-        assert res2.ok and res2.connection_id == "b"
-        assert calls["a"] == calls_to_a_before, "excluded connection must not be retried on the next image"
+        res3 = ex.caption_one(_spec(), live)
+        assert res3.ok and res3.connection_id == "b"
+        assert calls["n"] == 7, "excluded connection must not be retried on later images"
     finally:
         T.execute_http = old
-    print("  chronic timeout -> excluded, not retried on later images: OK")
+    print("  chronic timeout across 2 images -> excluded, not retried later; 1 bad image alone is not enough: OK")
 
 
 def test_on_attempt_start_fires_before_each_http_call():

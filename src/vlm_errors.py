@@ -62,14 +62,25 @@ class VlmAttemptError:
             # retry_same_max > 1 by passing same_retries.
             if can_retry_same and (explicit_retry_count or consecutive_timeouts <= 1):
                 return VlmErrorClass.RETRY_SAME
-            # 1画像分の再試行（retry_same_max+1回）を使い切ってもなお毎回タイム
-            # アウトしているなら、この接続はセッション中ずっと壊れている可能性が
-            # 高い。auth_error 等と同様に EXCLUDE へ昇格し、次の画像から自動的に
-            # 外す——さもないと、無反応な1接続だけで画像1枚あたり最大で
-            # (retry_same_max+1)×read_timeout_s を毎回無駄にし続ける
+            # 2画像分の再試行（(retry_same_max+1)×2回）を使い切ってもなお毎回
+            # タイムアウトしているなら、この接続はセッション中ずっと壊れている
+            # 可能性が高い。auth_error 等と同様に EXCLUDE へ昇格し、以後の画像
+            # から自動的に外す——さもないと、無反応な1接続だけで画像1枚あたり
+            # 最大で (retry_same_max+1)×read_timeout_s を毎回無駄にし続ける
             # （2026-09 VLM デバッグ: 実機で NVIDIA 1接続が11枚中4枚で毎回
             # ちょうど120秒ずつ無駄にしていたのを確認）。
-            if consecutive_timeouts >= max(1, int(retry_same_max)) + 1:
+            #
+            # 閾値は「1画像分」ではなく「2画像分」にしている: 実際の Gemini は
+            # 完全には壊れておらず単に間欠的に遅い／タイムアウトすることがあり
+            # （実機11枚バッチで4回中2回成功）、1画像分（consecutive_timeouts>=2）
+            # で即除外すると、たまたま1枚だけ運悪くタイムアウトが重なっただけの
+            # 健全な接続まで残りセッション全体から締め出してしまい、さらに他の
+            # 候補が同時に一時的なレート制限中だと「使える接続が1つも無い」で
+            # バッチ全体が中断する事故につながった（2026-09 実機11枚バッチで、
+            # 4枚目でGeminiが誤って除外され、5枚目以降7枚が一度も試行されずに
+            # 打ち切られたのを確認）。2画像分の全滅を要求することで、本当に
+            # 恒常的に壊れている接続（NVIDIA相当）だけを狙って除外する。
+            if consecutive_timeouts >= (max(1, int(retry_same_max)) + 1) * 2:
                 return VlmErrorClass.EXCLUDE
             return VlmErrorClass.FAILOVER
         if r is VlmErrorReason.RATE_LIMITED:

@@ -238,20 +238,26 @@ def test_error_classification():
     def mk(reason):
         return E.VlmAttemptError(reason)
     assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=1) is E.VlmErrorClass.RETRY_SAME
-    # retry_same_max=1（既定）を使い切ってなお consecutive_timeouts が2（=1画像分の
-    # 試行が丸ごとタイムアウト）に達したら、もう FAILOVER ではなく EXCLUDE
-    # （2026-09 VLM デバッグ: 壊れた接続を毎画像フルに再試行し続ける無駄を無くす）。
-    assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=2) is E.VlmErrorClass.EXCLUDE
+    # retry_same_max=1（既定）を使い切った直後（1画像分＝consecutive_timeouts=2）は
+    # まだ FAILOVER。間欠的に遅い／たまたま1枚だけ運悪くタイムアウトしただけの
+    # 健全な接続まで即座に締め出さないため、閾値は「2画像分」にしている
+    # （2026-09 VLM デバッグ: 実機で Gemini が4枚中2枚成功していたのに、1画像分の
+    # 失敗だけで除外され、後続7枚が一度も試行されず打ち切られた事故を踏まえた）。
+    assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=2) is E.VlmErrorClass.FAILOVER
+    assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=3) is E.VlmErrorClass.FAILOVER
+    # 2画像分（(retry_same_max+1)×2 = 4）に達して初めて EXCLUDE。壊れた接続を
+    # 毎画像フルに再試行し続ける無駄は、2画像分の犠牲で確実に止める。
+    assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=4) is E.VlmErrorClass.EXCLUDE
     # 再試行は使い切っていても、セッション全体としてはまだ1回しかタイムアウトして
     # いない（consecutive_timeouts が閾値未満）場合は、まだ EXCLUDE せず FAILOVER。
     assert mk(E.VlmErrorReason.TIMEOUT).classify(consecutive_timeouts=1, already_retried_same=True) is E.VlmErrorClass.FAILOVER
     assert mk(E.VlmErrorReason.TIMEOUT).classify(
         consecutive_timeouts=2, same_retries=1, retry_same_max=2) is E.VlmErrorClass.RETRY_SAME
-    # retry_same_max=2 なら閾値は3（=1画像分＝初回+再試行2回）。2ではまだ FAILOVER。
+    # retry_same_max=2 なら閾値は6（=2画像分＝(2+1)×2）。5ではまだ FAILOVER。
     assert mk(E.VlmErrorReason.TIMEOUT).classify(
-        consecutive_timeouts=2, same_retries=2, retry_same_max=2) is E.VlmErrorClass.FAILOVER
+        consecutive_timeouts=5, same_retries=2, retry_same_max=2) is E.VlmErrorClass.FAILOVER
     assert mk(E.VlmErrorReason.TIMEOUT).classify(
-        consecutive_timeouts=3, same_retries=2, retry_same_max=2) is E.VlmErrorClass.EXCLUDE
+        consecutive_timeouts=6, same_retries=2, retry_same_max=2) is E.VlmErrorClass.EXCLUDE
     assert mk(E.VlmErrorReason.RATE_LIMITED).classify() is E.VlmErrorClass.FAILOVER
     assert mk(E.VlmErrorReason.SERVER_ERROR).classify() is E.VlmErrorClass.RETRY_SAME
     assert mk(E.VlmErrorReason.SERVER_ERROR).classify(already_retried_same=True) is E.VlmErrorClass.FAILOVER

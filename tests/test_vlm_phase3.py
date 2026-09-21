@@ -156,8 +156,11 @@ def test_skip_mode_leaves_existing(monkeypatch):
     print("  SKIP mode leaves existing .txt untouched: OK")
 
 
-def test_all_connections_excluded_breaks_once(monkeypatch):
-    """Every connection returns 401 -> excluded -> batch stops with a single message, not per-image."""
+def test_all_connections_excluded_logs_exhaustion_once(monkeypatch):
+    """Every connection returns 401 -> excluded -> the batch keeps going (each
+    remaining image gets a fresh live_candidates() check, in case a temporary
+    rate-limit cooldown elsewhere clears later - 2026-09 VLM debugging), but
+    the exhaustion message is logged only once, not once per remaining image."""
     app = _APP
     d = Path(tempfile.mkdtemp())
     for i in range(2, 30):
@@ -167,12 +170,19 @@ def test_all_connections_excluded_breaks_once(monkeypatch):
     T.execute_http = lambda req, **kw: RawHttpResponse(401, {}, {"error": {"message": "bad"}}, "unauthorized")
     try:
         from vlm_worker import VlmCaptionWorker
-        logs = _run(VlmCaptionWorker(s, get_string=lambda *a, **k: (a[-1] if a else "")))
+        worker = VlmCaptionWorker(s, get_string=lambda *a, **k: (a[-1] if a else ""))
+        failed_paths = []
+        worker.batch_failed.connect(failed_paths.extend)
+        logs = _run(worker)
     finally:
         T.execute_http = old
     exhausted = [m for m, c in logs if "All_Connections_Exhausted" in m]
     image_failed = [m for m, c in logs if "Image_Failed" in m]
-    assert exhausted, "expected an exhaustion message"
+    assert len(exhausted) == 1, f"exhaustion message must be logged exactly once, got {len(exhausted)}"
+    # every image must still end up recorded as failed (not silently dropped) even though
+    # the batch keeps looping past the first exhaustion instead of stopping outright.
+    # _setup() seeds i0/i1 itself, plus this test's own i2..i29 = 30 images total.
+    assert len(failed_paths) == 30, f"all 30 images must be marked failed, got {len(failed_paths)}"
     # first image triggers 3x 401 -> all excluded; subsequent images short-circuit (no per-image error spam)
     assert len(image_failed) <= 1, f"too many per-image error lines: {len(image_failed)}"
     print(f"  all-excluded -> single exhaustion message (image_failed lines: {len(image_failed)}): OK")

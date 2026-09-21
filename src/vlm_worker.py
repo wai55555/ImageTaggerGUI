@@ -335,6 +335,7 @@ class VlmCaptionWorker(QObject):
                     return [p for p in pending if not p.with_suffix(".txt").is_file()]
                 return list(pending)
 
+            exhausted_logged = False
             for i, image_path in enumerate(image_paths):
                 if self.is_stopped():
                     self.log_message.emit(self.get_string("Vlm", "Stopped_By_User"), "orange")
@@ -352,9 +353,22 @@ class VlmCaptionWorker(QObject):
                 # 既存出力をSKIPする画像は、接続が尽きていても失敗では
                 # ない。それを解決した後、実際に生成が必要な画像でだけ打ち切る。
                 if not executor.live_candidates(candidates.connection_ids):
-                    self.log_message.emit(self.get_string("Vlm", "All_Connections_Exhausted"), "red")
-                    failed.extend(remaining_failures(i))
-                    break
+                    # break で残り全部を一括で見捨てない: ここでの「候補が尽きた」は
+                    # 恒久的な EXCLUDE だけでなく、レート制限のような時間で解ける
+                    # cooldown が原因のこともある。この画像だけ失敗にして次へ進めば、
+                    # 後続画像の処理に要する実時間の分だけ cooldown が明けている
+                    # 可能性があり、バッチ全体を無駄に早期終了させずに済む
+                    # （2026-09 VLM デバッグ: 実機11枚バッチで、レート制限中の接続と
+                    # 誤って除外された接続が重なり、break のせいで4枚目以降7枚が
+                    # 一度も試行されずに打ち切られたのを確認）。ただしメッセージは
+                    # 大量画像で毎回スパムしないよう、バッチにつき1回だけ出す
+                    # （PR時からの既存仕様: image_failed の乱発を避ける）。
+                    n_errors += 1
+                    failed.append(image_path)
+                    if not exhausted_logged:
+                        self.log_message.emit(self.get_string("Vlm", "All_Connections_Exhausted"), "red")
+                        exhausted_logged = True
+                    continue
                 eff_placement = "OVERWRITE" if decision is OverwriteDecision.OVERWRITE else placement
                 # 「常に追記」を選んでいるのに placement が既定の OVERWRITE のままだと
                 # 既存キャプションを丸ごと捨ててしまう（PR#16 の caption_core 修正と同方針）。
