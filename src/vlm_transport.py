@@ -141,6 +141,24 @@ def _scrub_exc(exc: Exception) -> str:
     return text[:300]
 
 
+def adaptive_read_timeout(base_read_timeout_s: float, max_output_tokens: int) -> float:
+    """max_output_tokens に応じて読み取りタイムアウトを引き上げる。
+
+    既定プロファイル(maximum_detail, max_output_tokens=3072)の実機11枚バッチ検証で、
+    正常に生成できている呼び出しが40〜70秒かかり、一部が既定の60秒タイムアウトに
+    引っかかって不要な再試行・フェイルオーバー・失敗を引き起こしていた（デバッグログ上
+    "timeout (http=None)" が繰り返し記録され、その後の再試行/フェイルオーバー先も
+    無料枠のレート制限で即失敗し、画像1枚あたり約2分を浪費）。
+    max_output_tokens=2048 を基準点とし、それ以上は最大1.5倍まで線形に引き上げる。
+    上限を1.5倍に留めているのは、NVIDIA のように本当に壊れた接続を掴んだ場合の
+    無駄待ちを際限なく増やさないため（元の問題は1接続あたり最大120秒の浪費だった）。
+    """
+    if max_output_tokens <= 0:
+        return base_read_timeout_s
+    ratio = min(1.5, max(1.0, max_output_tokens / 2048.0))
+    return base_read_timeout_s * ratio
+
+
 def execute_http(req, *, connect_timeout: float, read_timeout: float,
                  verify_tls: bool = True) -> RawHttpResponse | VlmAttemptError:
     """1回の HTTP リクエストを実行する。ネットワーク例外は VlmAttemptError にして返す。"""
@@ -333,7 +351,8 @@ class VlmExecutor:
             apply_request_headers(req, conn.request_headers)
             apply_request_body(req, conn.request_body)
             raw = execute_http(req, connect_timeout=conn.retry.connect_timeout_s,
-                               read_timeout=conn.retry.read_timeout_s,
+                               read_timeout=adaptive_read_timeout(
+                                   conn.retry.read_timeout_s, profile.max_output_tokens),
                                verify_tls=conn.verify_tls)
             if isinstance(raw, VlmAttemptError):
                 parsed = VlmParseResult(error=raw)
