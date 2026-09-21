@@ -606,8 +606,12 @@ class MainWindow(QMainWindow):
         
         if selected_item:
             self.image_list.setCurrentItem(selected_item)
-            # Schedule the image loading to ensure the widget is sized correctly
-            QTimer.singleShot(100, lambda: self._load_and_fit_image(selected_item))
+            # Schedule the image loading to ensure the widget is sized correctly.
+            # Re-fetch the current item at fire time instead of capturing selected_item
+            # in the closure: if reload_image_list() runs again before this timer fires
+            # (e.g. a fast-failing tagging run completes within 100ms), image_list.clear()
+            # deletes the underlying C++ object and the captured reference goes dangling.
+            QTimer.singleShot(100, lambda: self._load_and_fit_image(self.image_list.currentItem()))
         else:
             self._clear_image_display()
 
