@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from PIL import Image
 
 from vlm_connections import VlmConnection, is_local_host
-from vlm_errors import VlmErrorReason
+from vlm_errors import VlmErrorReason, reason_label_key
 from vlm_image import ImagePreprocessConfig, prepare_image
 from vlm_profiles import GenerationProfile, build_system_prompt, build_user_prompt
 from vlm_protocols import (
@@ -39,11 +39,61 @@ class DiagStatus(str, Enum):
     SKIP = "SKIP"
 
 
+# 診断項目の内部ID（DiagItem.name）→ 表示ラベルの翻訳キー。
+# name は api_key_dialog / DiagReport.can_mark_binding_verified などの判定にも
+# 使われる安定IDなので英語のまま固定し、翻訳は表示時にここを引いて行う。
+# 診断の実リクエストで使う出力トークン上限。長文生成を待つ必要はないので絞るが、
+# thinking 対応モデルは思考でトークンを食うため、回答が数トークン残る程度は確保する。
+# 「打ち切られた」旨の詳細文にもこの値を差し込むので、名前付き定数にしておく。
+_DIAG_MAX_OUTPUT_TOKENS = 128
+
+DIAG_ITEM_LABEL_KEYS: dict[str, str] = {
+    "URL format": "Diag_Item_Url_Format",
+    "Model ID": "Diag_Item_Model_Id",
+    "Protocol": "Diag_Item_Protocol",
+    "DNS / TCP": "Diag_Item_Dns_Tcp",
+    "TLS": "Diag_Item_Tls",
+    "Auth": "Diag_Item_Auth",
+    "Request build": "Diag_Item_Request_Build",
+    "Image input": "Diag_Item_Image_Input",
+    "HTTP response": "Diag_Item_Http_Response",
+    "Caption extraction": "Diag_Item_Caption_Extraction",
+    "Rate-limit info": "Diag_Item_Rate_Limit_Info",
+}
+
+DIAG_STATUS_LABEL_KEYS: dict[str, str] = {
+    DiagStatus.PASS.value: "Diag_Status_Pass",
+    DiagStatus.WARN.value: "Diag_Status_Warn",
+    DiagStatus.FAIL.value: "Diag_Status_Fail",
+    DiagStatus.SKIP.value: "Diag_Status_Skip",
+}
+
+
+@dataclass(frozen=True)
+class DiagArgKey:
+    """`detail_args` の値が、それ自体翻訳キーであることを示す包み。
+
+    「トランスポート層の失敗理由」のように、差し込む値の側も訳したいものがある。
+    表示時に item_detail() が先にこれを解決してから本文へ差し込む。
+    """
+    section: str
+    key: str
+    fallback: str = ""
+
+
 @dataclass
 class DiagItem:
     name: str
     status: DiagStatus
     detail: str = ""
+    # 表示用の翻訳キーと差し込み値。`detail` は英語のまま残す:
+    # デバッグログに出すのは英語が望ましく、api_key_dialog が
+    # is_billing_or_credit_block() など文字列判定に使っているため、
+    # ここを翻訳済み文字列に差し替えると判定が壊れる。
+    detail_key: str = ""
+    detail_args: dict = field(default_factory=dict)
+    # 翻訳文の末尾に素のまま足す供給元のメッセージ（プロバイダーのエラー本文など）。
+    detail_suffix: str = ""
 
 
 @dataclass
@@ -54,8 +104,11 @@ class DiagReport:
     billing_blocked: bool = False    # 到達・認証後に課金／残高で生成を拒否された
     lightweight: bool = False        # 推論を行わず、モデル一覧GETだけで疎通確認した
 
-    def add(self, name: str, status: DiagStatus, detail: str = "") -> None:
-        self.items.append(DiagItem(name, status, detail))
+    def add(self, name: str, status: DiagStatus, detail: str = "", *,
+            detail_key: str = "", detail_args: dict | None = None,
+            detail_suffix: str = "") -> None:
+        self.items.append(DiagItem(name, status, detail, detail_key,
+                                   dict(detail_args or {}), detail_suffix))
 
     def item(self, name: str) -> DiagItem | None:
         for i in self.items:
@@ -157,6 +210,50 @@ def is_billing_or_credit_block(detail: str) -> bool:
     ))
 
 
+def item_label(name: str, get_string) -> str:
+    """診断項目の表示ラベル。未知のIDは内部IDをそのまま返す。"""
+    key = DIAG_ITEM_LABEL_KEYS.get(name)
+    return get_string("Vlm", key) if key else name
+
+
+def status_label(status: DiagStatus, get_string) -> str:
+    """PASS / WARN / FAIL / SKIP の表示ラベル。"""
+    key = DIAG_STATUS_LABEL_KEYS.get(status.value)
+    return get_string("Vlm", key) if key else status.value
+
+
+def item_detail(item: DiagItem, get_string) -> str:
+    """診断項目の詳細を表示用に翻訳する。
+
+    翻訳キーを持たない項目（URL・モデルID・生の例外文など、そもそも翻訳対象では
+    ない値）は英語の `detail` をそのまま返す。
+    """
+    if not item.detail_key:
+        return item.detail
+    args = {}
+    for name, value in item.detail_args.items():
+        if isinstance(value, DiagArgKey):
+            resolved = get_string(value.section, value.key) if value.key else ""
+            args[name] = (value.fallback or value.key
+                          if not resolved or resolved == value.key else resolved)
+        else:
+            args[name] = value
+    text = get_string("Vlm", item.detail_key, **args)
+    if not text or text == item.detail_key:
+        # ini にキーが無い等で引けなかった場合は英語へ落とす（生キーを見せない）。
+        text = item.detail
+    if item.detail_suffix:
+        text = f"{text}: {item.detail_suffix}" if text else item.detail_suffix
+    return text
+
+
+def format_report_lines(report: DiagReport, get_string) -> list[str]:
+    """`[状態] 項目: 詳細` の表示行を組み立てる。"""
+    return [f"[{status_label(i.status, get_string)}] "
+            f"{item_label(i.name, get_string)}: {item_detail(i, get_string)}"
+            for i in report.items]
+
+
 def _cloudflare_token_probe(rep: DiagReport, api_key: str, *, verify_tls: bool = True) -> None:
     """Cloudflare API トークンを専用エンドポイントで検証し、結果を Auth / HTTP response
     項目へ反映する（api_key_dialog はこの2項目で保存可否を決める）。"""
@@ -164,8 +261,13 @@ def _cloudflare_token_probe(rep: DiagReport, api_key: str, *, verify_tls: bool =
                          headers={"Authorization": f"Bearer {api_key}"})
     raw = execute_http(req, connect_timeout=10.0, read_timeout=15.0, verify_tls=verify_tls)
     if not isinstance(raw, RawHttpResponse):
-        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}")
-        rep.add("Caption extraction", DiagStatus.SKIP, "no response to check")
+        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}",
+                detail_key="Diag_D_Transport_Error",
+                detail_args={"reason": DiagArgKey(
+                    "Vlm", reason_label_key(raw.reason), str(raw.reason.value))},
+                detail_suffix=raw.message)
+        rep.add("Caption extraction", DiagStatus.SKIP, "no response to check",
+                detail_key="Diag_D_No_Response_To_Check")
         return
     rep.http_status = raw.status
     body = raw.json_body if isinstance(raw.json_body, dict) else {}
@@ -173,24 +275,39 @@ def _cloudflare_token_probe(rep: DiagReport, api_key: str, *, verify_tls: bool =
     token_status = str(result.get("status", "")).lower()
     auth_item = rep.item("Auth")
     if raw.status == 200 and body.get("success") is True and token_status in ("", "active"):
-        rep.add("HTTP response", DiagStatus.PASS, "token valid and active")
+        rep.add("HTTP response", DiagStatus.PASS, "token valid and active",
+                detail_key="Diag_D_Token_Valid")
         if auth_item is not None:
             auth_item.status = DiagStatus.PASS
             auth_item.detail = "Cloudflare token verified"
+            auth_item.detail_key = "Diag_D_Cf_Token_Verified"
     elif raw.status in (401, 403) or body.get("success") is False:
-        msg = _first_cf_message(body) or f"{raw.status} token rejected"
-        rep.add("HTTP response", DiagStatus.FAIL, msg)
+        cf_message = _first_cf_message(body)
+        msg = cf_message or f"{raw.status} token rejected"
+        rep.add("HTTP response", DiagStatus.FAIL, msg,
+                detail_key="Diag_D_Token_Rejected",
+                detail_args={"status": raw.status},
+                detail_suffix=cf_message)
         if auth_item is not None:
             auth_item.status = DiagStatus.FAIL
             auth_item.detail = msg
+            if not cf_message:
+                auth_item.detail_key = "Diag_D_Token_Rejected"
+                auth_item.detail_args = {"status": raw.status}
     elif raw.status == 200 and body.get("success") is True:
-        rep.add("HTTP response", DiagStatus.FAIL, f"token is {token_status or 'not active'}")
+        rep.add("HTTP response", DiagStatus.FAIL, f"token is {token_status or 'not active'}",
+                detail_key="Diag_D_Token_Not_Active",
+                detail_args={"status": token_status or "not active"})
         if auth_item is not None:
             auth_item.status = DiagStatus.FAIL
             auth_item.detail = f"token is {token_status or 'not active'}"
+            auth_item.detail_key = "Diag_D_Token_Not_Active"
+            auth_item.detail_args = {"status": token_status or "not active"}
     else:
-        rep.add("HTTP response", DiagStatus.WARN, f"HTTP {raw.status}")
-    rep.add("Caption extraction", DiagStatus.SKIP, "Cloudflare token-verify check only")
+        rep.add("HTTP response", DiagStatus.WARN, f"HTTP {raw.status}",
+                detail_key="Diag_D_Http_Status", detail_args={"status": raw.status})
+    rep.add("Caption extraction", DiagStatus.SKIP, "Cloudflare token-verify check only",
+            detail_key="Diag_D_Cf_Token_Only")
 
 
 def _model_list_request(conn: VlmConnection, api_key: str | None) -> VlmHttpRequest:
@@ -226,13 +343,19 @@ def _run_lightweight_probe(rep: DiagReport, conn: VlmConnection,
         rep.add("Request build", DiagStatus.FAIL, f"{type(e).__name__}: {e}")
         return
     rep.add("Image input", DiagStatus.SKIP,
-            "lightweight connectivity check; no inference request")
+            "lightweight connectivity check; no inference request",
+            detail_key="Diag_D_Lightweight_No_Inference")
     raw = execute_http(req, connect_timeout=min(conn.retry.connect_timeout_s, 10.0),
                        read_timeout=min(conn.retry.read_timeout_s, 15.0),
                        verify_tls=conn.verify_tls)
     if not isinstance(raw, RawHttpResponse):
-        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}")
-        rep.add("Caption extraction", DiagStatus.SKIP, "no response to extract from")
+        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}",
+                detail_key="Diag_D_Transport_Error",
+                detail_args={"reason": DiagArgKey(
+                    "Vlm", reason_label_key(raw.reason), str(raw.reason.value))},
+                detail_suffix=raw.message)
+        rep.add("Caption extraction", DiagStatus.SKIP, "no response to extract from",
+                detail_key="Diag_D_No_Response_To_Extract")
         return
 
     rep.http_status = raw.status
@@ -245,50 +368,70 @@ def _run_lightweight_probe(rep: DiagReport, conn: VlmConnection,
             model_entries = []
         if model_entries:
             rep.add("HTTP response", DiagStatus.PASS,
-                    f"200 OK (lightweight model-list check; {len(model_entries)} entries)")
+                    f"200 OK (lightweight model-list check; {len(model_entries)} entries)",
+                    detail_key="Diag_D_Model_List_Ok",
+                    detail_args={"count": len(model_entries)})
         else:
             rep.add("HTTP response", DiagStatus.FAIL,
-                    "200 OK but model-list response contained no model entries")
+                    "200 OK but model-list response contained no model entries",
+                    detail_key="Diag_D_Model_List_Empty")
     elif rep.billing_blocked:
         detail = f"{raw.status} billing / credits unavailable (endpoint reached; inference not verified)"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Billing_Blocked",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
     elif raw.status in (401, 403):
         detail = f"{raw.status} auth rejected"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.FAIL, detail)
+        rep.add("HTTP response", DiagStatus.FAIL, detail,
+                detail_key="Diag_D_Auth_Rejected",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
     elif raw.status == 429:
         detail = "429 rate limited (lightweight endpoint reachable)"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Rate_Limited",
+                detail_suffix=provider_detail)
     elif raw.status == 200:
         rep.add("HTTP response", DiagStatus.WARN,
-                "200 OK but model-list response was not JSON")
+                "200 OK but model-list response was not JSON",
+                detail_key="Diag_D_Model_List_Not_Json")
     else:
         detail = f"HTTP {raw.status}"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Http_Status",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
 
     auth_item = rep.item("Auth")
     if auth_item is not None and conn.auth.type != "none":
         if rep.billing_blocked:
             auth_item.status = DiagStatus.PASS
             auth_item.detail = f"accepted; billing / credits unavailable (server responded {raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Accepted_Billing"
+            auth_item.detail_args = {"status": raw.status}
         elif raw.status in (401, 403):
             auth_item.status = DiagStatus.FAIL
             auth_item.detail = f"rejected by the server ({raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Rejected_By_Server"
+            auth_item.detail_args = {"status": raw.status}
         else:
             auth_item.status = DiagStatus.PASS
             auth_item.detail = f"accepted (server responded {raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Accepted"
+            auth_item.detail_args = {"status": raw.status}
     rep.add("Caption extraction", DiagStatus.SKIP,
-            "lightweight connectivity check; inference skipped")
+            "lightweight connectivity check; inference skipped",
+            detail_key="Diag_D_Lightweight_Inference_Skipped")
     rl_names = [k for k in raw.headers if k.lower().startswith(("x-ratelimit", "ratelimit", "retry-after"))]
     rep.add("Rate-limit info", DiagStatus.PASS,
-            ", ".join(rl_names) if rl_names else "none exposed (falls back to 429 Retry-After)")
+            ", ".join(rl_names) if rl_names else "none exposed (falls back to 429 Retry-After)",
+            detail_key="" if rl_names else "Diag_D_Rate_Limit_None")
 
 
 def diagnose(conn: VlmConnection, api_key: str | None, *,
@@ -306,10 +449,12 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         # Accessing .port is itself validating for malformed ports and bracketed IPv6.
         parsed_port = parsed.port
     except ValueError as e:
-        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {e}")
+        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {e}",
+                detail_key="Diag_D_Invalid_Base_Url", detail_suffix=str(e))
         return rep
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {conn.base_url!r}")
+        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {conn.base_url!r}",
+                detail_key="Diag_D_Invalid_Base_Url", detail_suffix=repr(conn.base_url))
         return rep
     is_cloudflare = (conn.provider_id == "cloudflare"
                      or (parsed.hostname or "").endswith("api.cloudflare.com"))
@@ -321,24 +466,32 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
     cf_missing_account = is_cloudflare and unresolved == ["{account_id}"]
     if unresolved and not cf_missing_account:
         rep.add("URL format", DiagStatus.FAIL,
-                f"unresolved placeholder in base_url: {' '.join(unresolved)}")
+                f"unresolved placeholder in base_url: {' '.join(unresolved)}",
+                detail_key="Diag_D_Unresolved_Placeholder",
+                detail_args={"placeholders": " ".join(unresolved)})
         return rep
     if cf_missing_account:
         rep.add("URL format", DiagStatus.WARN,
                 "Cloudflare account ID is not set - the key can still be verified, "
                 "but this route will not run until Register API key is opened and the "
-                "Account ID is entered there")
+                "Account ID is entered there",
+                detail_key="Diag_D_Cf_Account_Missing")
     elif parsed.scheme == "http" and not _looks_localish(parsed.hostname or ""):
-        rep.add("URL format", DiagStatus.WARN, "plain http to a non-local host")
+        rep.add("URL format", DiagStatus.WARN, "plain http to a non-local host",
+                detail_key="Diag_D_Plain_Http_Remote")
     else:
         rep.add("URL format", DiagStatus.PASS, conn.base_url)
     if not conn.model_id:
-        rep.add("Model ID", DiagStatus.FAIL, "model_id is empty")
+        rep.add("Model ID", DiagStatus.FAIL, "model_id is empty",
+                detail_key="Diag_D_Model_Id_Empty")
     else:
         rep.add("Model ID", DiagStatus.PASS, conn.model_id)
     if conn.protocol not in ("openai_chat_completions", "openai_responses",
                              "anthropic_messages", "gemini_generate_content"):
-        rep.add("Protocol", DiagStatus.WARN, f"unknown protocol {conn.protocol!r}, treated as OpenAI compatible")
+        rep.add("Protocol", DiagStatus.WARN,
+                f"unknown protocol {conn.protocol!r}, treated as OpenAI compatible",
+                detail_key="Diag_D_Unknown_Protocol",
+                detail_args={"protocol": conn.protocol})
     else:
         rep.add("Protocol", DiagStatus.PASS, conn.protocol)
 
@@ -347,15 +500,19 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
 
     if not do_live_request:
         # 静的検査モード: ネットワークに触れない（DNS / TCP / TLS / 実リクエストを飛ばす）。
-        rep.add("DNS / TCP", DiagStatus.SKIP, "static check only")
-        rep.add("TLS", DiagStatus.SKIP, "static check only")
+        rep.add("DNS / TCP", DiagStatus.SKIP, "static check only",
+                detail_key="Diag_D_Static_Only")
+        rep.add("TLS", DiagStatus.SKIP, "static check only",
+                detail_key="Diag_D_Static_Only")
     else:
         # 2. DNS / TCP
         try:
             socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
             rep.add("DNS / TCP", DiagStatus.PASS, f"{host}:{port}")
         except OSError as e:
-            rep.add("DNS / TCP", DiagStatus.FAIL, f"cannot resolve/connect {host}:{port}: {e}")
+            rep.add("DNS / TCP", DiagStatus.FAIL, f"cannot resolve/connect {host}:{port}: {e}",
+                    detail_key="Diag_D_Dns_Failed",
+                    detail_args={"host": host, "port": port}, detail_suffix=str(e))
             return rep
 
         # 3. TLS
@@ -369,23 +526,34 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
                     with ctx.wrap_socket(sock, server_hostname=host):
                         pass
                 rep.add("TLS", DiagStatus.PASS if conn.verify_tls else DiagStatus.WARN,
-                        "verified" if conn.verify_tls else "verification disabled")
+                        "verified" if conn.verify_tls else "verification disabled",
+                        detail_key=("Diag_D_Tls_Verified" if conn.verify_tls
+                                    else "Diag_D_Tls_Not_Verified"))
             except (ssl.SSLError, OSError) as e:
-                rep.add("TLS", DiagStatus.FAIL, f"TLS handshake failed: {e}")
+                rep.add("TLS", DiagStatus.FAIL, f"TLS handshake failed: {e}",
+                        detail_key="Diag_D_Tls_Failed", detail_suffix=str(e))
         else:
-            rep.add("TLS", DiagStatus.SKIP, "plain http")
+            rep.add("TLS", DiagStatus.SKIP, "plain http",
+                    detail_key="Diag_D_Plain_Http")
 
     # 4. Auth presence
     if conn.auth.type == "none":
-        rep.add("Auth", DiagStatus.PASS, "no auth required")
+        rep.add("Auth", DiagStatus.PASS, "no auth required",
+                detail_key="Diag_D_No_Auth_Required")
     elif api_key:
-        rep.add("Auth", DiagStatus.PASS, f"{conn.auth.type} credential present")
+        rep.add("Auth", DiagStatus.PASS, f"{conn.auth.type} credential present",
+                detail_key="Diag_D_Credential_Present",
+                detail_args={"type": conn.auth.type})
     else:
-        rep.add("Auth", DiagStatus.FAIL, f"{conn.auth.type} required but no credential found")
+        rep.add("Auth", DiagStatus.FAIL, f"{conn.auth.type} required but no credential found",
+                detail_key="Diag_D_Credential_Required",
+                detail_args={"type": conn.auth.type})
         # 認証情報が無い状態で未認証リクエストを送ると、Vercel等の401本文だけが表示されて
         # 「キーが不正」と誤解しやすい。ネットワーク到達性は上で確認済みなので、ここで終了。
-        rep.add("HTTP response", DiagStatus.SKIP, "credential missing")
-        rep.add("Caption extraction", DiagStatus.SKIP, "credential missing")
+        rep.add("HTTP response", DiagStatus.SKIP, "credential missing",
+                detail_key="Diag_D_Credential_Missing")
+        rep.add("Caption extraction", DiagStatus.SKIP, "credential missing",
+                detail_key="Diag_D_Credential_Missing")
         return rep
 
     # 4b. Account ID が未設定の Cloudflare だけは、専用エンドポイントでトークン単体を
@@ -395,18 +563,24 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         if do_live_request:
             _cloudflare_token_probe(rep, api_key, verify_tls=conn.verify_tls)
         else:
-            rep.add("HTTP response", DiagStatus.SKIP, "live request disabled")
-            rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled")
+            rep.add("HTTP response", DiagStatus.SKIP, "live request disabled",
+                    detail_key="Diag_D_Live_Disabled")
+            rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled",
+                    detail_key="Diag_D_Live_Disabled")
         return rep
 
     if lightweight:
         if do_live_request:
             _run_lightweight_probe(rep, conn, api_key)
         else:
-            rep.add("Request build", DiagStatus.SKIP, "live request disabled")
-            rep.add("Image input", DiagStatus.SKIP, "lightweight connectivity check")
-            rep.add("HTTP response", DiagStatus.SKIP, "live request disabled")
-            rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled")
+            rep.add("Request build", DiagStatus.SKIP, "live request disabled",
+                    detail_key="Diag_D_Live_Disabled")
+            rep.add("Image input", DiagStatus.SKIP, "lightweight connectivity check",
+                    detail_key="Diag_D_Lightweight_Check")
+            rep.add("HTTP response", DiagStatus.SKIP, "live request disabled",
+                    detail_key="Diag_D_Live_Disabled")
+            rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled",
+                    detail_key="Diag_D_Live_Disabled")
         return rep
 
     # 5. Request build
@@ -415,7 +589,7 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         # 診断は「200 が返り、テキストが取り出せるか」の確認。長文生成を待つ必要はないので
         # 出力トークンを絞る（既定 1024 のままだと Gemma 等で timeout する）。ただし thinking
         # 対応モデルは思考でトークンを食うので、回答が数トークンは残るよう 128 にする。
-        profile = GenerationProfile(max_output_tokens=128)
+        profile = GenerationProfile(max_output_tokens=_DIAG_MAX_OUTPUT_TOKENS)
         call = VlmCallSpec(conn.model_id, build_system_prompt(profile), build_user_prompt(profile), prepared, profile)
         protocol = get_protocol(conn.protocol)
         if conn.text_path:
@@ -430,11 +604,15 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         return rep
 
     # 6. Image input format (静的確認のみ)
-    rep.add("Image input", DiagStatus.PASS, f"{prepared.mime_type}, base64/data-url ready")
+    rep.add("Image input", DiagStatus.PASS, f"{prepared.mime_type}, base64/data-url ready",
+            detail_key="Diag_D_Image_Ready",
+            detail_args={"mime": prepared.mime_type})
 
     if not do_live_request:
-        rep.add("HTTP response", DiagStatus.SKIP, "live request disabled")
-        rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled")
+        rep.add("HTTP response", DiagStatus.SKIP, "live request disabled",
+                detail_key="Diag_D_Live_Disabled")
+        rep.add("Caption extraction", DiagStatus.SKIP, "live request disabled",
+                detail_key="Diag_D_Live_Disabled")
         return rep
 
     # 7-11. 実リクエスト。診断は「疎通確認」なのでタイムアウトは短めに固定する
@@ -443,7 +621,11 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
                        read_timeout=min(conn.retry.read_timeout_s, 30.0),
                        verify_tls=conn.verify_tls)
     if not isinstance(raw, RawHttpResponse):
-        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}")
+        rep.add("HTTP response", DiagStatus.FAIL, f"{raw.reason.value}: {raw.message}",
+                detail_key="Diag_D_Transport_Error",
+                detail_args={"reason": DiagArgKey(
+                    "Vlm", reason_label_key(raw.reason), str(raw.reason.value))},
+                detail_suffix=raw.message)
         return rep
 
     rep.http_status = raw.status
@@ -451,32 +633,43 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
     billing_blocked = is_billing_or_credit_block(provider_detail)
     rep.billing_blocked = billing_blocked
     if raw.status == 200:
-        rep.add("HTTP response", DiagStatus.PASS, "200 OK")
+        rep.add("HTTP response", DiagStatus.PASS, "200 OK",
+                detail_key="Diag_D_Http_Ok")
     elif billing_blocked:
         detail = f"{raw.status} billing / credits unavailable (endpoint reached; inference not verified)"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Billing_Blocked",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
     elif raw.status in (401, 403):
         detail = f"{raw.status} auth rejected"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.FAIL, detail)
+        rep.add("HTTP response", DiagStatus.FAIL, detail,
+                detail_key="Diag_D_Auth_Rejected",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
     elif raw.status in (404, 400, 422):
         detail = f"{raw.status} model / request rejected (auth was accepted)"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.FAIL, detail)
+        rep.add("HTTP response", DiagStatus.FAIL, detail,
+                detail_key="Diag_D_Model_Request_Rejected",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
     elif raw.status == 429:
         detail = "429 rate limited (endpoint reachable)"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Rate_Limited",
+                detail_suffix=provider_detail)
     else:
         detail = f"HTTP {raw.status}"
         if provider_detail:
             detail += f": {provider_detail}"
-        rep.add("HTTP response", DiagStatus.WARN, detail)
+        rep.add("HTTP response", DiagStatus.WARN, detail,
+                detail_key="Diag_D_Http_Status",
+                detail_args={"status": raw.status}, detail_suffix=provider_detail)
 
     # 4'. Auth の判定を実応答で上書きする。請求設定・残高不足が明記された403等は
     # 認証成功として扱い、それ以外の401/403だけを「キー不正」とする。
@@ -485,27 +678,40 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         if billing_blocked:
             auth_item.status = DiagStatus.PASS
             auth_item.detail = f"accepted; billing / credits unavailable (server responded {raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Accepted_Billing"
+            auth_item.detail_args = {"status": raw.status}
         elif raw.status in (401, 403):
             auth_item.status = DiagStatus.FAIL
             auth_item.detail = f"rejected by the server ({raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Rejected_By_Server"
+            auth_item.detail_args = {"status": raw.status}
         else:
             auth_item.status = DiagStatus.PASS
             auth_item.detail = f"accepted (server responded {raw.status})"
+            auth_item.detail_key = "Diag_D_Auth_Accepted"
+            auth_item.detail_args = {"status": raw.status}
 
-    ext_status, ext_detail = _classify_extraction(raw, protocol, conn.text_path)
-    rep.add("Caption extraction", ext_status, ext_detail)
+    ext_status, ext_detail, ext_key, ext_args, ext_suffix = _classify_extraction(
+        raw, protocol, conn.text_path)
+    rep.add("Caption extraction", ext_status, ext_detail,
+            detail_key=ext_key, detail_args=ext_args, detail_suffix=ext_suffix)
 
     # 10. Rate-limit headers（情報表示のみ。無くても正常＝多くの API は付けない。
     # その場合は 429 応答の Retry-After を見て事後クールダウンする。WARN にしない）。
     rl_names = [k for k in raw.headers if k.lower().startswith(("x-ratelimit", "ratelimit", "retry-after"))]
     rep.add("Rate-limit info", DiagStatus.PASS,
-            ", ".join(rl_names) if rl_names else "none exposed (falls back to 429 Retry-After)")
+            ", ".join(rl_names) if rl_names else "none exposed (falls back to 429 Retry-After)",
+            detail_key="" if rl_names else "Diag_D_Rate_Limit_None")
 
     return rep
 
 
-def _classify_extraction(raw: RawHttpResponse, protocol, configured_path: str = "") -> tuple[DiagStatus, str]:
+def _classify_extraction(raw: RawHttpResponse, protocol, configured_path: str = ""
+                         ) -> tuple[DiagStatus, str, str, dict, str]:
     """live レスポンスからテキストが取り出せるかを判定する。
+
+    戻り値は (状態, 英語の詳細, 表示用翻訳キー, 差し込み値, 素で末尾へ足す文字列)。
+    英語の詳細はデバッグログ用にそのまま残す。
 
     診断は出力トークンを絞るので、テキストが出る前に打ち切られること（finishReason=
     MAX_TOKENS / length）がある。その場合はエンドポイント・認証・リクエスト形状は通って
@@ -513,12 +719,20 @@ def _classify_extraction(raw: RawHttpResponse, protocol, configured_path: str = 
     """
     parsed = protocol.parse_response(raw.status, raw.json_body, raw.text_body)
     if parsed.ok:
-        via = f" via {configured_path}" if configured_path else ""
-        return DiagStatus.PASS, f"got {len(parsed.text or '')} chars{via}"
+        chars = len(parsed.text or "")
+        if configured_path:
+            return (DiagStatus.PASS, f"got {chars} chars via {configured_path}",
+                    "Diag_D_Extract_Ok_Via",
+                    {"chars": chars, "path": configured_path}, "")
+        return (DiagStatus.PASS, f"got {chars} chars",
+                "Diag_D_Extract_Ok", {"chars": chars}, "")
     if parsed.error and parsed.error.reason is VlmErrorReason.CONTENT_POLICY:
-        return DiagStatus.WARN, "content policy on the test image (extraction path unverified)"
+        return (DiagStatus.WARN,
+                "content policy on the test image (extraction path unverified)",
+                "Diag_D_Extract_Content_Policy", {}, "")
     if raw.status != 200:
-        return DiagStatus.SKIP, "no successful response to extract from"
+        return (DiagStatus.SKIP, "no successful response to extract from",
+                "Diag_D_Extract_No_Response", {}, "")
     finish_reason = str(
         extract_by_path(raw.json_body, "candidates[0].finishReason")
         or extract_by_path(raw.json_body, "choices[0].finish_reason")
@@ -526,15 +740,18 @@ def _classify_extraction(raw: RawHttpResponse, protocol, configured_path: str = 
         or extract_by_path(raw.json_body, "stop_reason") or ""
     ).upper()
     if finish_reason in ("MAX_TOKENS", "MAX_OUTPUT_TOKENS", "LENGTH"):
-        return DiagStatus.WARN, (
-            "response truncated at diagnostic max_output_tokens=128; endpoint is reachable, "
-            "but this VLM may need a larger generation budget")
+        return (DiagStatus.WARN,
+                "response truncated at diagnostic max_output_tokens="
+                f"{_DIAG_MAX_OUTPUT_TOKENS}; endpoint is reachable, "
+                "but this VLM may need a larger generation budget",
+                "Diag_D_Extract_Truncated", {"limit": _DIAG_MAX_OUTPUT_TOKENS}, "")
     preview = (raw.text_body or "")[:200].replace("\n", " ")
     path = configured_path or getattr(protocol, "default_text_path", "") or "(protocol default)"
     detail = f"200 OK but response text path {path!r} did not match; verify protocol/path settings"
     if preview:
         detail += f" — body starts: {preview}"
-    return DiagStatus.FAIL, detail
+    return (DiagStatus.FAIL, detail, "Diag_D_Extract_Path_Mismatch",
+            {"path": path}, preview)
 
 
 def _looks_localish(host: str) -> bool:

@@ -570,11 +570,11 @@ def test_diagnostics_live_extraction_branches():
     def _cls(body, text="{}"):
         return D._classify_extraction(RawHttpResponse(200, {}, body, text), proto)
 
-    st, _ = _cls({"candidates": [{"content": {"parts": [{"text": "a cat"}]}, "finishReason": "STOP"}]})
+    st, *_ = _cls({"candidates": [{"content": {"parts": [{"text": "a cat"}]}, "finishReason": "STOP"}]})
     assert st is D.DiagStatus.PASS
 
     # low token cap -> no parts, finishReason MAX_TOKENS: endpoint is fine -> WARN not FAIL
-    st, _ = _cls({"candidates": [{"finishReason": "MAX_TOKENS"}], "usageMetadata": {}})
+    st, *_ = _cls({"candidates": [{"finishReason": "MAX_TOKENS"}], "usageMetadata": {}})
     assert st is D.DiagStatus.WARN
 
     cf_error = RawHttpResponse(403, {}, {
@@ -589,28 +589,31 @@ def test_diagnostics_live_extraction_branches():
     assert not D.is_billing_or_credit_block("Invalid API key")
 
     # genuinely wrong shape -> FAIL with a body preview
-    st, detail = _cls({"unexpected": "shape"}, '{"unexpected": "shape"}')
+    st, detail, key, _args, preview = _cls({"unexpected": "shape"}, '{"unexpected": "shape"}')
     assert st is D.DiagStatus.FAIL and "unexpected" in detail
+    # 表示用は翻訳キー + 素のレスポンス本文プレビュー（本文は訳さない）。
+    assert key == "Diag_D_Extract_Path_Mismatch"
+    assert "unexpected" in preview
 
     # non-200 -> SKIP (nothing to extract)
-    st, _ = D._classify_extraction(RawHttpResponse(500, {}, {}, "boom"), proto)
+    st, *_ = D._classify_extraction(RawHttpResponse(500, {}, {}, "boom"), proto)
     assert st is D.DiagStatus.SKIP
 
     responses = get_protocol("openai_responses")
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
         "output": []}, "{}"), responses)
     assert st is D.DiagStatus.WARN
 
     anthropic = get_protocol("anthropic_messages")
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "content": [], "stop_reason": "max_tokens"}, "{}"), anthropic)
     assert st is D.DiagStatus.WARN
 
     # A custom extraction path must not bypass protocol-level safety signals.
     custom_gemini = get_protocol("gemini_generate_content")
     custom_gemini.default_text_path = "custom.caption"
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "promptFeedback": {"blockReason": "SAFETY"},
         "custom": {"caption": "misleading text"},
     }, "{}"), custom_gemini, "custom.caption")

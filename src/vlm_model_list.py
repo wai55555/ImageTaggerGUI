@@ -48,7 +48,8 @@ def fetch_model_catalog(conn: VlmConnection, api_key: str | None,
     entries = _extract_catalog(raw, conn.provider_id)
     if not entries:
         return VlmAttemptError(VlmErrorReason.BAD_RESPONSE, 200,
-                               "no model ids in response")
+                               "no model ids in response",
+                               message_key="ModelList_No_Model_Ids")
     seen: set[str] = set()
     out: list[ModelCatalogEntry] = []
     for entry in entries:
@@ -71,7 +72,8 @@ def fetch_model_ids(conn: VlmConnection, api_key: str | None,
     ids = _extract_ids(raw)
     if not ids:
         return VlmAttemptError(VlmErrorReason.BAD_RESPONSE, 200,
-                               "no model ids in response")
+                               "no model ids in response",
+                               message_key="ModelList_No_Model_Ids")
     seen: set[str] = set()
     out: list[str] = []
     for mid in ids:
@@ -86,7 +88,8 @@ def _fetch_model_body(conn: VlmConnection, api_key: str | None,
     base = (conn.base_url or "").rstrip("/")
     if not base or "{account_id}" in base:
         return VlmAttemptError(VlmErrorReason.UNKNOWN, None,
-                               "connection base url is not ready (Cloudflare account id?)")
+                               "connection base url is not ready (Cloudflare account id?)",
+                               message_key="ModelList_Base_Url_Not_Ready")
     # Cloudflare Workers AI はモデル一覧が別パス（/ai/models/search）。
     if conn.provider_id == "cloudflare" and base.endswith("/ai/v1"):
         url = base[: -len("/v1")] + "/models/search"
@@ -119,7 +122,9 @@ def _fetch_model_body(conn: VlmConnection, api_key: str | None,
         return VlmAttemptError(VlmErrorReason.AUTH_ERROR, raw.status, f"{raw.status} auth rejected")
     if raw.status != 200 or not isinstance(raw.json_body, (dict, list)):
         return VlmAttemptError(VlmErrorReason.BAD_RESPONSE, raw.status,
-                               f"HTTP {raw.status} (model list unavailable)")
+                               f"HTTP {raw.status} (model list unavailable)",
+                               message_key="ModelList_Unavailable",
+                               message_args={"status": raw.status})
     return raw.json_body
 
 

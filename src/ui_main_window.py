@@ -152,6 +152,9 @@ class Ui_MainWindow(object):
         browse_button = QPushButton(main_window.locale_manager.get_string("MainWindow", "Browse_Button"))
         browse_button.clicked.connect(main_window.browse_folder)
         
+        # 「3x3 edit」はどの言語でも訳さずそのまま出す（"3x3 編集" のように
+        # 半角数字と訳語が混ざると見栄えが悪い、との判断。ツールチップ側は
+        # Switch_To_Grid_View で訳される）。
         main_window.grid_view_button = QPushButton("3x3 edit")
         main_window.grid_view_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Switch_To_Grid_View"))
         main_window.grid_view_button.clicked.connect(main_window._show_grid_view)  # type: ignore
@@ -270,7 +273,8 @@ class Ui_MainWindow(object):
         header_layout.addStretch(1)
         
         # Undo button
-        main_window.undo_button = QPushButton("↶ Undo")
+        main_window.undo_button = QPushButton(
+            main_window.locale_manager.get_string("MainWindow", "Undo_Button"))
         main_window.undo_button.setEnabled(False)
         main_window.undo_button.setMaximumWidth(80)
         main_window.undo_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Undo_No_Actions"))
@@ -278,7 +282,8 @@ class Ui_MainWindow(object):
         header_layout.addWidget(main_window.undo_button)
         
         # Redo button
-        main_window.redo_button = QPushButton("↷ Redo")
+        main_window.redo_button = QPushButton(
+            main_window.locale_manager.get_string("MainWindow", "Redo_Button"))
         main_window.redo_button.setEnabled(False)
         main_window.redo_button.setMaximumWidth(80)
         main_window.redo_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Redo_No_Actions"))

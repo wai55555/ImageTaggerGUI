@@ -13,7 +13,7 @@ if __name__ == '__main__':
 from constants import MODEL_POINTER_PATH, BASE_DIR
 from utils import write_debug_log, GetString, default_get_string_fallback
 from app_settings import load_config, load_settings
-from locale_manager import LocaleManager
+from locale_manager import LocaleManager, available_language_codes, normalize_language_code
 
 def get_model_info_from_pointer(url: str, get_string: GetString | None = None) -> tuple[str | None, int | None]:
     """
@@ -55,8 +55,10 @@ def get_model_info_from_pointer(url: str, get_string: GetString | None = None) -
 if __name__ == '__main__':
     config = load_config()
     settings = load_settings(config)
-    default_locale = locale.getdefaultlocale()[0]
-    os_lang = default_locale.split('_')[0] if default_locale else "en"
+    # `'_' の前だけを取る` と zh_CN / zh_TW が存在しない "zh" に潰れるので、
+    # main_window と同じ正規化を通す（同 ini が無いコードは en へ落ちる）。
+    os_lang = normalize_language_code(
+        locale.getdefaultlocale()[0] or "", available_language_codes(BASE_DIR / "lang"))
     locale_manager = LocaleManager(settings.language_code or os_lang, BASE_DIR)
     _ = locale_manager.get_string
 

@@ -36,6 +36,11 @@ class RawHttpResponse:
     text_body: str
 
 
+# 推論系VLM向けに助言する max_output_tokens。GenerationProfile の既定値と揃える
+# （vlm_profiles.GenerationProfile.max_output_tokens）。
+_SUGGESTED_MAX_OUTPUT_TOKENS = 3072
+
+
 def _output_limit_reason(protocol_name: str, body: Any) -> str:
     """空本文が生成上限到達によるものなら終了理由を返す。"""
     if not isinstance(body, dict):
@@ -83,30 +88,45 @@ def _enrich_parse_failure(parsed: VlmParseResult, *, protocol, body: Any,
             "output limit reached: max_output_tokens={} finish_reason={}; "
             "the model returned no final text. Increase VLM max tokens to 3072 or higher "
             "for reasoning VLMs.".format(max_output_tokens, limit_reason),
-            error.provider_code))
+            error.provider_code,
+            message_key="Advice_Output_Limit",
+            message_args={"limit": max_output_tokens, "finish_reason": limit_reason,
+                          "suggested": _SUGGESTED_MAX_OUTPUT_TOKENS}))
 
+    # 対処案は英語の message へ足したまま（デバッグログ用）にし、表示用には
+    # 翻訳キーを別に持たせる。以前は英語の対処案がそのまま翻訳済みメッセージの
+    # {reason} へ差し込まれ、どの言語でも助言だけ英語になっていた。
     hints = {
-        VlmErrorReason.EMPTY_RESPONSE:
+        VlmErrorReason.EMPTY_RESPONSE: (
             "no text at response path {!r}; verify API protocol and custom response extraction path".format(path),
-        VlmErrorReason.BAD_RESPONSE:
+            "Advice_Empty_Response", {"path": path}),
+        VlmErrorReason.BAD_RESPONSE: (
             "verify API protocol, model ID, request format, and response path {!r}".format(path),
-        VlmErrorReason.AUTH_ERROR:
+            "Advice_Bad_Response", {"path": path}),
+        VlmErrorReason.AUTH_ERROR: (
             "verify API key, authentication type, header name, and query parameter",
-        VlmErrorReason.MODEL_UNSUPPORTED:
+            "Advice_Auth_Error", {}),
+        VlmErrorReason.MODEL_UNSUPPORTED: (
             "verify the model ID and select a model supported by this endpoint",
-        VlmErrorReason.PROMPT_FORMAT_ERROR:
+            "Advice_Model_Unsupported", {}),
+        VlmErrorReason.PROMPT_FORMAT_ERROR: (
             "verify API protocol and image/message format for this endpoint",
-        VlmErrorReason.TIMEOUT:
+            "Advice_Prompt_Format_Error", {}),
+        VlmErrorReason.TIMEOUT: (
             "verify the server is running and increase connect/read timeout if needed",
-        VlmErrorReason.NETWORK:
+            "Advice_Timeout", {}),
+        VlmErrorReason.NETWORK: (
             "verify base URL, host/port, TLS settings, and server availability",
+            "Advice_Network", {}),
     }
-    hint = hints.get(error.reason)
-    if not hint:
+    entry = hints.get(error.reason)
+    if entry is None:
         return parsed
+    hint, hint_key, hint_args = entry
     detail = (error.message or "").strip()
     message = f"{detail}; {hint}" if detail else hint
-    return replace(parsed, error=replace(error, message=message[:800]))
+    return replace(parsed, error=replace(error, message=message[:800],
+                                         message_key=hint_key, message_args=hint_args))
 
 
 # URL トークン（絶対 URL でも `url: /rel/path?...` の相対形でも）のクエリ文字列を丸ごと伏せる。

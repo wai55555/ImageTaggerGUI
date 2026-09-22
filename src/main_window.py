@@ -35,7 +35,7 @@ from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSetting
 from grid_view_widget import GridViewWidget
 from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker, UpdateCheckWorker
 from vlm_worker import VlmCaptionWorker
-from locale_manager import LocaleManager
+from locale_manager import LocaleManager, available_language_codes, normalize_language_code
 from ui_main_window import Ui_MainWindow
 from undo_manager import (
     UndoManager, AddTagsAction, RemoveTagAction, BulkAddTagsAction, BulkRemoveTagsAction,
@@ -44,36 +44,66 @@ from undo_manager import (
 from model_registry import ModelEntry, config_mapping, discover_models, get_model_entry
 from model_mode_controller import ModelModeController
 
-def get_os_language() -> str:
-    """
-    Gets the OS's UI language in a robust, cross-platform way.
-    Uses ctypes for Windows, QLocale for macOS/Linux, and falls back to locale.
-    """
-    try:
-        if sys.platform == "win32":
-            # Windows: Use ctypes to call Windows API for the most reliable result.
-            import ctypes
-            windll = ctypes.windll.kernel32
-            # GetUserDefaultUILanguage returns a LANGID, e.g., 0x0411 for ja-JP
-            lang_id = windll.GetUserDefaultUILanguage()
-            # Primary language ID is in the lower 10 bits
-            primary_lang_id = lang_id & 0x3FF
-            # A map for common primary language IDs to ISO 639-1 codes
-            lang_map = {0x09: "en", 0x11: "ja", 0x07: "de", 0x0c: "fr", 0x12: "ko", 0x04: "zh"}
-            return lang_map.get(primary_lang_id, "en")
-    except Exception as e:
-        write_debug_log(f"Failed to get OS language via ctypes: {e}")
+# GetUserDefaultUILanguage() の primary language ID → 言語コード。
+# LCIDToLocaleName() が使えなかったときだけ使う保険なので、同梱している9言語ぶん。
+_WIN_PRIMARY_LANGID_TO_CODE = {
+    0x09: "en", 0x11: "ja", 0x07: "de", 0x0c: "fr",
+    0x12: "ko", 0x0a: "es", 0x19: "ru", 0x04: "zh",
+}
+# 中国語だけは primary language ID では簡体字／繁体字が決まらないので
+# sublanguage ID（上位ビット）で分ける。1=TW, 2=CN, 3=HK, 4=SG, 5=MO。
+_WIN_CHINESE_SUBLANG_TO_CODE = {
+    0x01: "zh_TW", 0x02: "zh_CN", 0x03: "zh_TW", 0x04: "zh_CN", 0x05: "zh_TW",
+}
 
-    # Fallback for non-Windows (macOS, Linux) or if ctypes fails.
+
+def _os_language_raw() -> str:
+    """OS の UI 言語を、正規化前の生のタグ（`ja-JP` / `zh_TW` 等）で返す。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # GetUserDefaultUILanguage returns a LANGID, e.g. 0x0411 for ja-JP.
+            lang_id = kernel32.GetUserDefaultUILanguage()
+            # LCIDToLocaleName は "ja-JP" / "zh-TW" のような BCP-47 名を返す。
+            # 自前の LANGID 表では地域が落ちるため、中国語の簡体字／繁体字を
+            # 区別できない（zh.ini は存在しない）。まずこちらを使う。
+            buffer = ctypes.create_unicode_buffer(85)  # LOCALE_NAME_MAX_LENGTH
+            if kernel32.LCIDToLocaleName(lang_id, buffer, len(buffer), 0) and buffer.value:
+                return buffer.value
+            primary = lang_id & 0x3FF
+            if primary == 0x04:
+                return _WIN_CHINESE_SUBLANG_TO_CODE.get(lang_id >> 10, "zh")
+            return _WIN_PRIMARY_LANGID_TO_CODE.get(primary, "")
+        except Exception as e:
+            write_debug_log(f"Failed to get OS language via ctypes: {e}")
+
+    # Non-Windows (macOS, Linux), or Windows if ctypes failed.
     # locale.getdefaultlocale() is more reliable in bundled apps than QLocale
     # as it doesn't depend on the QApplication instance's state.
+    # 地域まで含めた値をそのまま返す（以前はここで '_' の前だけを取っており、
+    # zh_CN / zh_TW が存在しない "zh" に潰れていた）。
     try:
         import locale
         lang_code, _ = locale.getdefaultlocale()
-        return lang_code.split('_')[0] if lang_code else "en"
+        return lang_code or ""
     except (ImportError, ValueError, IndexError) as e:
         write_debug_log(f"Failed to get OS language via locale: {e}")
-        return "en"
+        return ""
+
+
+def get_os_language() -> str:
+    """OS の UI 言語を、実在する翻訳ファイルの言語コードへ正規化して返す。
+
+    戻り値は必ず `lang/<code>.ini` が存在するコード（見つからなければ "en"）。
+    この値は初回起動時に config.ini へ保存され、以後の起動でも使われるため、
+    存在しないコードを返すと利用者はずっと英語表示のままになる。
+    """
+    raw = _os_language_raw()
+    codes = available_language_codes(constants.LANG_DIR, constants.LANG_RESOURCE_DIR)
+    normalized = normalize_language_code(raw, codes)
+    write_debug_log(f"OS language '{raw}' resolved to '{normalized}'")
+    return normalized
 
 class StoppableWorker(Protocol): # type: ignore
     """A protocol for worker objects that have a thread-safe stop() method."""
@@ -1376,7 +1406,8 @@ class MainWindow(QMainWindow):
             self._handle_folder_drop(folder_path, None)
         else:
             # Using a hardcoded string for now. Should be added to locale.
-            self.update_log(f"無効なフォルダパスです: {folder_path}", "red")
+            self.update_log(self.locale_manager.get_string(
+                "MainWindow", "Error_Invalid_Folder_Path", folder_path=folder_path), "red")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         write_debug_log(f"DEBUG: dragEnterEvent - hasUrls: {event.mimeData().hasUrls()}")
@@ -2118,6 +2149,10 @@ class MainWindow(QMainWindow):
         for key, row_index in keys.items():
             is_float = step < 1
             label_suffix = self.locale_manager.get_string("MainWindow", "Threshold_Suffix") if section == 'Thresholds' else self.locale_manager.get_string("MainWindow", "Max_Count_Suffix")
+            # [CategoryDialog] Category_<key> は「詳細」ダイアログ向けに
+            # "General（一般）" のような訳語併記になっているため、しきい値ラベルの
+            # 頭に付けると "General（一般） しきい値:" と冗長になる。ここは
+            # 短いカテゴリ名のまま出す。
             label = QLabel(f"{key.capitalize()} {label_suffix}:")
             
             settings_section = getattr(self.settings, section.lower())
@@ -2459,7 +2494,8 @@ class MainWindow(QMainWindow):
             return
 
         self.central_widget.setCurrentWidget(self.grid_view_widget)
-        self.setWindowTitle(f"{constants.MSG_WINDOW_TITLE} - Grid View")
+        self.setWindowTitle(f"{constants.MSG_WINDOW_TITLE} - "
+                            + self.locale_manager.get_string("GridView", "Window_Title"))
         self.grid_view_widget.set_caption_mode(self._is_text_output_mode())
         self.grid_view_widget.load_images(image_paths, self._tag_cache, Path(self.settings.paths.input_dir))
         self.showMaximized()

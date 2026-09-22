@@ -27,7 +27,8 @@ import vlm_secrets
 import app_settings
 from custom_connection_dialog import CustomConnectionDialog
 from vlm_connections import ConnectionKind, VlmConnection
-from vlm_diagnostics import DiagStatus
+from vlm_diagnostics import DiagStatus, format_report_lines, status_label
+from vlm_errors import VlmAttemptError, attempt_error_text
 from vlm_model_list import (
     ModelCatalogEntry, catalog_entry_from_id, filter_vlm_catalog,
 )
@@ -652,7 +653,11 @@ class VlmSettingsDialog(QDialog):
         if r is None:
             return
         if not isinstance(result, list):
-            detail = getattr(result, "message", "") or str(result)
+            # VlmAttemptError なら理由ラベル＋翻訳済み本文へ。message_key を持たない
+            # （＝サーバー本文そのまま等）ものは英語のまま出す。
+            detail = (attempt_error_text(result, self._t)
+                      if isinstance(result, VlmAttemptError)
+                      else (getattr(result, "message", "") or str(result)))
             self._set_route_status(r, self._t("Vlm", "Settings_Route_FetchModels_Fail", detail=detail))
             return
 
@@ -1204,7 +1209,9 @@ class VlmSettingsDialog(QDialog):
         self._finish_pending_done_if_ready()
 
     def _show_diag_report(self, conn, report) -> None:
-        lines = [f"[{i.status.value}] {i.name}: {i.detail}" for i in report.items]
+        # 項目名・状態・詳細はすべて表示時に訳す（report 側は英語のまま保つ:
+        # デバッグログと api_key_dialog の文字列判定がそれに依存している）。
+        lines = format_report_lines(report, self._t)
         if getattr(report, "can_mark_binding_verified", False):
             http_item = report.item("HTTP response")
             extraction_item = report.item("Caption extraction")
@@ -1217,14 +1224,15 @@ class VlmSettingsDialog(QDialog):
             summary_key = ("Settings_Diagnose_Content_Verified"
                            if content_verified
                            else "Settings_Diagnose_Reachability_Verified")
-            lines.append("[PASS] " + self._t("Vlm", summary_key))
+            lines.append(f"[{status_label(DiagStatus.PASS, self._t)}] "
+                         + self._t("Vlm", summary_key))
         icon = {DiagStatus.PASS: QMessageBox.Icon.Information,
                 DiagStatus.WARN: QMessageBox.Icon.Warning,
                 DiagStatus.FAIL: QMessageBox.Icon.Critical}.get(report.overall, QMessageBox.Icon.Information)
         box = QMessageBox(self)
         box.setIcon(icon)
         box.setWindowTitle(self._t("Vlm", "Settings_Diagnose"))
-        box.setText(f"{conn.display_name}: {report.overall.value}")
+        box.setText(f"{conn.display_name}: {status_label(report.overall, self._t)}")
         box.setDetailedText("\n".join(lines))
         box.exec()
 

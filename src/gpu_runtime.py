@@ -35,7 +35,9 @@ _STAGING_DIRNAME = ".staging"
 SHA_PLACEHOLDER_PREFIX = "TODO"
 
 ProgressCb = Callable[[int, int], None]   # (done_bytes, total_bytes)
-LogCb = Callable[[str, str], None]        # (message, level)  level: "info"|"warn"|"error"
+# (message, level, *, key, args)。message は英語（デバッグログ用）、key/args は
+# 受け取り側が [Gpu] から訳して表示するための翻訳キーと差し込み値。
+LogCb = Callable[..., None]
 StopCb = Callable[[], bool]
 
 
@@ -148,7 +150,7 @@ class GpuRuntimeInstaller:
 
     def install(self, spec: dict, *, progress_cb: ProgressCb | None = None,
                 log_cb: LogCb | None = None, stop_cb: StopCb | None = None) -> bool:
-        log = log_cb or (lambda m, lv="info": log_dbg(f"gpu_runtime[{lv}]: {m}"))
+        log = log_cb or (lambda m, lv="info", **_kw: log_dbg(f"gpu_runtime[{lv}]: {m}"))
         stop = stop_cb or (lambda: False)
         total = spec_total_bytes(spec) or 0
         done = 0
@@ -186,16 +188,20 @@ class GpuRuntimeInstaller:
             self._place(planned, log)
             self._write_manifest(spec, planned)
             self._reset_staging(remove_only=True)  # success: nothing left to resume
-            log("GPU components installed; restart to enable GPU inference")
+            log("GPU components installed; restart to enable GPU inference",
+                key="Runtime_Installed_Restart")
             return True
         except _Stopped:
-            log("download cancelled; a retry will resume from where this left off", "warn")
+            log("download cancelled; a retry will resume from where this left off", "warn",
+                key="Runtime_Cancelled_Resumable")
             return False
         except GpuRuntimeError as exc:
-            log(f"install aborted: {exc}", "error")
+            log(f"install aborted: {exc}", "error",
+                key="Runtime_Install_Aborted", args={"detail": str(exc)})
             return False
         except Exception as exc:  # noqa: BLE001 - network / zip / io
-            log(f"install failed: {exc!r}", "error")
+            log(f"install failed: {exc!r}", "error",
+                key="Runtime_Install_Failed", args={"detail": repr(exc)})
             return False
 
     def uninstall(self) -> None:
@@ -255,7 +261,7 @@ class GpuRuntimeInstaller:
         if location not in ("gpu_runtime", "capi"):
             raise GpuRuntimeError(f"unknown location {location!r}")
         dest = self._staging / name
-        log(f"downloading {name}")
+        log(f"downloading {name}", key="Runtime_Downloading", args={"name": name})
         self._download(url, dest, stop, bump)
         sha = self._verify(dest, item.get("sha256"), name)
         return _Planned(name=name, staged=dest, location=location, sha256=sha)
@@ -311,7 +317,8 @@ class GpuRuntimeInstaller:
         # rewrites the full member from scratch, so a stale/truncated leftover from
         # an interrupted earlier extraction is fully overwritten, never trusted.
         whl = self._staging / (_basename(url) or "component.whl")
-        log(f"downloading {whl.name}")
+        log(f"downloading {whl.name}", key="Runtime_Downloading",
+            args={"name": whl.name})
         self._download(url, whl, stop, bump)
         self._verify(whl, item.get("sha256"), whl.name)
 
@@ -413,7 +420,8 @@ class GpuRuntimeInstaller:
                 os.replace(p.staged, self._root / p.name)
             except OSError as exc:
                 raise GpuRuntimeError(f"cannot write {self._root / p.name}: {exc}") from exc
-        log(f"placed {len(planned)} file(s)")
+        log(f"placed {len(planned)} file(s)", key="Runtime_Placed_Files",
+            args={"count": len(planned)})
 
     def _write_manifest(self, spec: dict, planned: list[_Planned]) -> None:
         payload = {

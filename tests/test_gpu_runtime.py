@@ -429,7 +429,7 @@ def test_install_stop_aborts(tmp_path):
 
 
 def test_install_stop_logs_warn_not_error(tmp_path):
-    logs: list[tuple[str, str]] = []
+    logs: list[tuple[str, str, str]] = []
     calls = {"n": 0}
 
     def stop():
@@ -437,9 +437,14 @@ def test_install_stop_logs_warn_not_error(tmp_path):
         return calls["n"] > 2
 
     _installer(tmp_path).install(_spec(), stop_cb=stop,
-                                 log_cb=lambda m, lv="info": logs.append((m, lv)))
-    assert not any(lv == "error" for _, lv in logs)
-    assert any(lv == "warn" for _, lv in logs)
+                                 # log_cb は表示用の翻訳キー(key/args)も受け取る。
+                                 log_cb=lambda m, lv="info", **kw: logs.append(
+                                     (m, lv, kw.get("key", ""))))
+    assert not any(lv == "error" for _, lv, _key in logs)
+    assert any(lv == "warn" for _, lv, _key in logs)
+    # 中断の通知は表示用の翻訳キーを伴う（英語のまま画面へ出ない）。
+    assert any(key == "Runtime_Cancelled_Resumable"
+               for _, lv, key in logs if lv == "warn")
 
 
 def test_install_unsafe_member_name_aborts(tmp_path):
