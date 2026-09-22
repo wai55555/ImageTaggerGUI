@@ -25,6 +25,7 @@ from PySide6.QtGui import (
 
 from utils import write_debug_log
 import constants
+import vlm_config
 import app_settings # Added import
 from app_settings import load_config, load_settings, save_config # Updated import
 from custom_widgets import PathLineEdit, TagListWidget
@@ -90,6 +91,66 @@ def _os_language_raw() -> str:
     except (ImportError, ValueError, IndexError) as e:
         write_debug_log(f"Failed to get OS language via locale: {e}")
         return ""
+
+
+# 停止要求に応じなかったスレッドを、実際に終了するまで保持する置き場。通常は空。
+#
+# MainWindow のインスタンス属性ではなく**モジュール変数**に置くのが要点。
+# ウィンドウが破棄されるとインスタンス属性のリストも一緒に消え、稼働中の QThread に
+# 対する最後の Python 参照が失われる。PySide6 は親を持たない QThread を Python 側の
+# 所有物として扱うため、そこで C++ オブジェクトが破棄され、Qt の
+# 「Deleting a running QThread」経路でプロセスが fail-fast する
+# （最小再現で終了コード 0xC0000409 を確認、260922 レビュー指摘）。
+# `finished → deleteLater` の配線だけでは、finished より前に参照が消えるこの経路を
+# 防げない。
+_detached_threads: list[QThread] = []
+
+
+def detached_thread_count() -> int:
+    """まだ終了していない退避済みスレッドの数（テスト・終了処理用）。"""
+    _prune_detached_threads()
+    return len(_detached_threads)
+
+
+def _prune_detached_threads() -> None:
+    """終了済み／既に破棄済みのぶんをリストから外す。"""
+    global _detached_threads
+    alive: list[QThread] = []
+    for thread in _detached_threads:
+        try:
+            if not thread.isFinished():
+                alive.append(thread)
+        except RuntimeError:  # 既に C++ 側が破棄済み
+            pass
+    _detached_threads = alive
+
+
+def wait_for_detached_threads(timeout_ms: int = 5000) -> bool:
+    """退避済みスレッドの終了を待つ。全て終了できたら True。
+
+    終了処理から呼ぶ。待ちきれなくても強制破棄はしない（稼働中の QThread を
+    破棄する方がクラッシュとして重い）。プロセス終了まで参照を持ち続けるため、
+    ここで False を返してもリストからは外さない。
+    """
+    _prune_detached_threads()
+    if not _detached_threads:
+        return True
+    deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+    for thread in list(_detached_threads):
+        try:
+            if thread.isFinished():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.quit()
+            thread.wait(int(remaining * 1000))
+        except RuntimeError:
+            continue
+    _prune_detached_threads()
+    if _detached_threads:
+        write_debug_log(
+            f"{len(_detached_threads)} detached thread(s) still running at shutdown; "
+            "keeping the references alive instead of destroying them")
+    return not _detached_threads
 
 
 def get_os_language() -> str:
@@ -191,6 +252,11 @@ class MainWindow(QMainWindow):
             self.settings.language_code = os_lang
             save_config(self.settings)
 
+        # 保存済みの「ライブ一覧で確認したVLMモデルID」をプロセス内カタログへ戻す。
+        # is_vlm_model_id() の判定が再起動を跨いで一致し、明示的に選んだ経路が
+        # 黙って別経路へ差し替わらないようにする（260922 レビュー指摘）。
+        vlm_config.restore_discovered_vlm_ids(self.settings.vlm)
+
         self.locale_manager = LocaleManager(self.settings.language_code, constants.LANG_DIR, constants.LANG_RESOURCE_DIR)
         app_settings.set_get_string_func(self.locale_manager.get_string) # Add this line
         write_debug_log(self.locale_manager.get_string("MainWindow", "Application_Startup"))
@@ -204,10 +270,6 @@ class MainWindow(QMainWindow):
         # Thread and worker management
         self._tagger_thread: QThread | None = None
         self._tagger_worker: TaggerThreadWorker | CaptionerThreadWorker | VlmCaptionWorker | None = None
-        # 停止要求に応じなかったスレッドを、実際に終了して破棄されるまで持ち続ける
-        # 置き場（_detach_running_thread 参照）。self から参照を外した後も Python 側の
-        # 参照が消えないようにするためで、通常は常に空。
-        self._detached_threads: list[QThread] = []
         self._vlm_settings_dialog = None
         self._download_thread: QThread | None = None
         self._downloader_worker: DownloaderWorker | None = None
@@ -1004,7 +1066,6 @@ class MainWindow(QMainWindow):
     def _on_vlm_binding_verified(self, provider_id: str, profile_id: str):
         """実出力を確認できた内蔵 binding を `[Vlm] verified_bindings` に永続化する
         （次回以降 VERIFIED 扱い。UI スレッドで config を書く）。"""
-        import vlm_config
         if vlm_config.mark_binding_verified(self.settings.vlm, provider_id, profile_id=profile_id):
             self.save_current_config()
             self.update_log(self.locale_manager.get_string(
@@ -1303,6 +1364,16 @@ class MainWindow(QMainWindow):
                     thread.terminate() # Last resort
                 else:
                     write_debug_log(f"DEBUG: closeEvent: Thread {thread} finished gracefully.")
+
+        # 退避済みスレッド（_cleanup_tagger_thread が5秒待っても終わらず手放した分）も
+        # ここで待つ。closeEvent が列挙していなかったため、稼働中のまま破棄されて
+        # プロセスがクラッシュしうる状態だった（260922 レビュー指摘）。
+        # 待ちきれなくても terminate はしない: 参照はモジュール変数が持ち続けるので、
+        # 破棄されてクラッシュすることはない。
+        if not wait_for_detached_threads(5000):
+            write_debug_log(
+                "DEBUG: closeEvent: detached thread(s) outlived the wait; "
+                "references are kept for the remaining process lifetime")
 
         write_debug_log("DEBUG: closeEvent: Proceeding with application close.")
         super().closeEvent(event)
@@ -1826,19 +1897,17 @@ class MainWindow(QMainWindow):
         finished を emit するので、メインのイベントループが DeferredDelete を
         処理する時点では確実に停止済みになる。
 
-        スレッドが永久に終わらない場合はここで保持したまま残る（プロセス終了まで
-        のリークだが、クラッシュより望ましい）。
+        参照はモジュール変数 `_detached_threads` が持つ。MainWindow の属性に置くと、
+        ウィンドウ破棄時にリストごと最後の参照が消えて、まさに避けたかった
+        「稼働中の QThread の破棄」が起きる（closeEvent は退避済みスレッドを
+        列挙していなかった）。終了処理は wait_for_detached_threads() で待つ。
+
+        スレッドが永久に終わらない場合はプロセス終了まで参照が残る（リークだが、
+        クラッシュより望ましい）。
         """
         # 既に終了・破棄済みのぶんを掃除する。detach 自体が稀なのでここで十分。
-        still: list[QThread] = []
-        for t in self._detached_threads:
-            try:
-                if not t.isFinished():
-                    still.append(t)
-            except RuntimeError:  # 既に C++ 側が破棄済み
-                pass
-        self._detached_threads = still
-        self._detached_threads.append(thread)
+        _prune_detached_threads()
+        _detached_threads.append(thread)
         if worker is not None:
             thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)

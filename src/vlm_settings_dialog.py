@@ -619,6 +619,14 @@ class VlmSettingsDialog(QDialog):
                                          profile_id=self._vlm.model_profile_id)
         if text:
             r["conn"].model_id = text   # 診断・キー登録がこの場で新IDを使えるように
+            # このIDが「モデル一覧を取得」で拾ったVLM（出荷カタログに無いかもしれない）
+            # なら、能力判定を再起動後も引き継げるよう保存する。プロセス内登録
+            # （register_discovered_vlm_ids）だけでは再起動後に非VLM扱いへ戻り、
+            # 利用者が選んだ経路が黙って別経路へ差し替わっていた。
+            if text in (r.get("model_ids") or ()):
+                vlm_config.mark_override_vlm_capable(
+                    self._vlm, r["conn"].provider_id, text,
+                    profile_id=self._vlm.model_profile_id)
         # bindingが無い経路でも、有効なオーバーライドを設定した直後ならチェックを
         # 押せるようにする(次にダイアログを開き直すまで待たせない)。
         if not r.get("has_binding", True):
@@ -846,6 +854,13 @@ class VlmSettingsDialog(QDialog):
                 # 足しておかないと最終列がその幅ぶん欠ける。
                 natural_width += self._routes_scroll.verticalScrollBar().sizeHint().width()
             cap = self._width_cap()
+            if cap is not None:
+                # _width_cap() は「ダイアログ全体に許される幅」。経路欄はグループ
+                # ボックスとルートレイアウトの内側にあるので、その左右余白ぶんを
+                # 引かないと子だけがダイアログの外へはみ出し、右端の縦スクロール
+                # バーがクリップされる（実測: 800px画面でダイアログ幅720に対し
+                # 経路欄が x=23, width=720 で右端が23pxはみ出す。260922 レビュー指摘）。
+                cap = max(cap - self._routes_horizontal_inset(), _DIALOG_MIN_WIDTH // 2)
             capped_width = natural_width if cap is None else min(natural_width, cap)
             self._routes_scroll.setMinimumWidth(capped_width)
             self._routes_scroll.setHorizontalScrollBarPolicy(
@@ -864,6 +879,30 @@ class VlmSettingsDialog(QDialog):
         # ても古い値のままになる。QTimer.singleShot(0, ...)でイベントループが
         # 一巡した直後まで遅延させ、その時点の正しい値で最小幅を追従させる。
         QTimer.singleShot(0, self._sync_min_width_to_content)
+
+    def _routes_horizontal_inset(self) -> int:
+        """経路欄がダイアログ内側で失う左右の幅（余白・枠ぶん）。
+
+        `_routes_scroll` からダイアログまでの祖先をたどり、各レイアウトの左右
+        マージンとフレーム幅を積む。実測値を定数で決め打ちするとスタイルや DPI で
+        ずれるため、実際のウィジェット構成から求める。
+        """
+        inset = 0
+        widget = self._routes_scroll
+        while widget is not None and widget is not self:
+            parent = widget.parentWidget()
+            if parent is None:
+                break
+            layout = parent.layout()
+            if layout is not None:
+                left, _top, right, _bottom = layout.getContentsMargins()
+                inset += left + right
+            if parent is not self:
+                # QGroupBox の枠・タイトルぶんは contentsMargins に出る。
+                margins = parent.contentsMargins()
+                inset += margins.left() + margins.right()
+            widget = parent
+        return max(inset, 0)
 
     def _width_cap(self) -> int | None:
         """この画面に収まる最大幅。画面が取れなければ None(＝上限なし)。

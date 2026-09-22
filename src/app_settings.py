@@ -246,6 +246,12 @@ class Vlm:
     # キー登録時の軽量モデル一覧GET、接続診断のフルPASS、または1枚テスト成功で追記される。
     # UNKNOWN 出荷でもここに載れば VERIFIED 扱いになり、「厳格」モードでも候補に残る。
     verified_bindings: str = ""
+    # プロバイダーのモデル一覧メタデータで「画像入力に対応」と確認できた override の
+    # モデルID。`<profile_id>:<provider_id>=<model_id>` をカンマ区切りで保持する。
+    # 出荷カタログに無いIDはプロセス内登録（vlm_models.register_discovered_vlm_ids）
+    # にしか残らないため、これが無いと再起動後に同じIDが非VLM扱いへ戻り、利用者が
+    # 明示的に選んだ経路が黙って別の経路へ差し替わる（260922 レビュー指摘）。
+    vlm_capable_overrides: str = ""
     # True のとき、内蔵フォールバックは VERIFIED（実証済み or verified_bindings 収録）
     # の接続だけを候補にする。既定 False（同一と宣言されていれば未実証でも使う）。
     strict_identity: bool = False
@@ -309,7 +315,8 @@ def get_default_config() -> configparser.ConfigParser:
             'markdown': 'disabled', 'prompt_mode': 'standard',
             'max_output_tokens': str(DEFAULT_MAX_OUTPUT_TOKENS),
             'image_max_long_edge': '1536',
-            'verified_bindings': '', 'strict_identity': 'False', 'model_id_overrides': '',
+            'verified_bindings': '',
+            'vlm_capable_overrides': '', 'strict_identity': 'False', 'model_id_overrides': '',
         },
         'Debug': {'debug_log': 'False'},
         'General': {'language_code': ''}
@@ -466,6 +473,7 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
         max_output_tokens=gi('max_output_tokens', d.max_output_tokens),
         image_max_long_edge=gi('image_max_long_edge', d.image_max_long_edge),
         verified_bindings=g('verified_bindings', d.verified_bindings),
+        vlm_capable_overrides=g('vlm_capable_overrides', d.vlm_capable_overrides),
         strict_identity=gb('strict_identity', d.strict_identity),
         model_id_overrides=g('model_id_overrides', d.model_id_overrides),
     )

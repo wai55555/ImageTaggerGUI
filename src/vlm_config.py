@@ -16,7 +16,8 @@ from constants import BASE_DIR
 from utils import write_debug_log
 from vlm_connections import VlmConnection, default_builtin_connections
 from vlm_models import (
-    ModelBinding, ModelIdentityStatus, VlmModelProfile, default_registry, is_vlm_model_id,
+    ModelBinding, ModelIdentityStatus, VlmModelProfile, default_registry,
+    is_vlm_model_id, register_discovered_vlm_ids,
 )
 from vlm_profiles import GenerationProfile
 from vlm_router import RouterPolicy, parse_execution_mode
@@ -357,16 +358,102 @@ def set_model_id_override(vlm_settings, provider_id: str, model_id: str,
                           *, profile_id: str | None = None) -> None:
     """内蔵経路のモデル ID を上書きする。空文字なら上書きを解除。
 
+    上書き先のモデル ID が変わったときは、その経路の「確認済み」状態
+    （`verified_bindings`）も一緒に落とす。`verified_bindings` のトークンは
+    `<profile>:<provider>` だけでモデル ID を含まないため、落とさないと
+    「モデル A で診断に通してから override を B へ差し替える」と、一度も試して
+    いない B が即 VERIFIED として扱われる。合成 binding（binding が無い経路の
+    override）では model_id が利用者の入力で変わるので、この取り違えが実際に
+    起きる（260922 レビュー指摘）。「厳格」モードは VERIFIED だけを通す設計なので、
+    ここを放置すると同一モデルの保証がそのまま破れる。
+
     呼び出し側で `save_config(settings)` を実行して永続化すること。
     """
     key = f"{profile_id or vlm_settings.model_profile_id}:{provider_id}"
     m = vlm_settings.model_id_override_map()
     model_id = (model_id or "").strip()
+    previous = (m.get(key) or "").strip()
     if model_id:
         m[key] = model_id
     else:
         m.pop(key, None)
     vlm_settings.model_id_overrides = ",".join(f"{k}={v}" for k, v in sorted(m.items()))
+    if previous != model_id:
+        clear_binding_verified(vlm_settings, provider_id, profile_id=profile_id)
+        if not model_id:
+            # override 自体が消えたら、その能力記録も残さない。
+            mark_override_vlm_capable(vlm_settings, provider_id, "", profile_id=profile_id)
+
+
+def vlm_capable_override_map(vlm_settings) -> dict[str, str]:
+    """`<profile>:<provider>` → 能力確認済みのモデルID。"""
+    raw = str(getattr(vlm_settings, "vlm_capable_overrides", "") or "")
+    out: dict[str, str] = {}
+    for token in raw.split(","):
+        key, _, value = token.strip().partition("=")
+        if key.strip() and value.strip():
+            out[key.strip()] = value.strip()
+    return out
+
+
+def mark_override_vlm_capable(vlm_settings, provider_id: str, model_id: str, *,
+                              profile_id: str | None = None) -> None:
+    """ライブのモデル一覧で画像入力対応を確認できた override を記録する。
+
+    空の model_id を渡すと記録を消す。呼び出し側で `save_config(settings)` を
+    実行して永続化すること。
+    """
+    if not provider_id:
+        return
+    key = _binding_token(profile_id or vlm_settings.model_profile_id, provider_id)
+    current = vlm_capable_override_map(vlm_settings)
+    model_id = (model_id or "").strip()
+    if model_id:
+        current[key] = model_id
+    else:
+        current.pop(key, None)
+    vlm_settings.vlm_capable_overrides = ",".join(
+        f"{k}={v}" for k, v in sorted(current.items()))
+
+
+def restore_discovered_vlm_ids(vlm_settings) -> int:
+    """保存済みの「能力確認済み override」を vlm_models のプロセス内登録へ戻す。
+
+    起動時に1度呼ぶ。これを通すことで、`is_vlm_model_id()` が再起動後も同じ判定に
+    なり、`build_connection_map()` と `_override_only_bindings()` の両方が同じ
+    override を受け入れる（片方だけ直すと、経路が有効なのに binding が無い、の
+    ような食い違いになる）。戻した件数を返す。
+    """
+    restored = 0
+    per_provider: dict[str, list[str]] = {}
+    for key, model_id in vlm_capable_override_map(vlm_settings).items():
+        _, _, provider_id = key.partition(":")
+        if provider_id and model_id:
+            per_provider.setdefault(provider_id, []).append(model_id)
+    for provider_id, model_ids in per_provider.items():
+        register_discovered_vlm_ids(provider_id, model_ids)
+        restored += len(model_ids)
+    if restored:
+        write_debug_log(
+            f"vlm_config: restored {restored} VLM-capable override id(s) from config")
+    return restored
+
+
+def clear_binding_verified(vlm_settings, provider_id: str, *,
+                           profile_id: str | None = None) -> bool:
+    """この経路の「確認済み」状態を落とす。落とすものがあれば True。
+
+    呼び出し側で `save_config(settings)` を実行して永続化すること。
+    """
+    if not provider_id:
+        return False
+    token = _binding_token(profile_id or vlm_settings.model_profile_id, provider_id)
+    current = vlm_settings.verified_set()
+    if token not in current:
+        return False
+    current.discard(token)
+    vlm_settings.verified_bindings = ",".join(sorted(current))
+    return True
 
 
 def mark_binding_verified(vlm_settings, provider_id: str, *, profile_id: str | None = None) -> bool:

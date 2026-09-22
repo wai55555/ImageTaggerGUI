@@ -349,15 +349,15 @@ def test_detached_running_thread_is_deleted_only_after_it_finishes():
     "Deleting a running QThread will probably result in a program crash" に当たる。
     当時のコメントは「deleteLater は稼働中でも安全」と逆のことを書いていた。
     """
-    import types
-
+    import main_window as MW
     from main_window import MainWindow
 
+    MW._detached_threads.clear()
     thread = QThread()
-    holder = types.SimpleNamespace(_detached_threads=[])
-    # self からは _detached_threads だけを触るので、MainWindow を丸ごと作らずに済む。
-    MainWindow._detach_running_thread(holder, thread, None)
-    assert thread in holder._detached_threads
+    # self からはモジュール変数しか触らないので、MainWindow を丸ごと作らずに済む。
+    MainWindow._detach_running_thread(None, thread, None)
+    assert thread in MW._detached_threads
+    assert MW.detached_thread_count() == 1
 
     thread.start()
     assert thread.isRunning()
@@ -376,13 +376,12 @@ def test_detached_running_thread_is_deleted_only_after_it_finishes():
 
 def test_detach_prunes_already_finished_threads():
     """detach 置き場が溜まり続けないこと（次の detach 時に掃除される）。"""
-    import types
-
+    import main_window as MW
     from main_window import MainWindow
 
-    holder = types.SimpleNamespace(_detached_threads=[])
+    MW._detached_threads.clear()
     first = QThread()
-    MainWindow._detach_running_thread(holder, first, None)
+    MainWindow._detach_running_thread(None, first, None)
     first.start()
     first.quit()
     assert first.wait(5000)
@@ -390,10 +389,11 @@ def test_detach_prunes_already_finished_threads():
         _APP.processEvents()
 
     second = QThread()
-    MainWindow._detach_running_thread(holder, second, None)
-    assert holder._detached_threads == [second]
+    MainWindow._detach_running_thread(None, second, None)
+    assert MW._detached_threads == [second]
     second.start()
     second.quit()
     assert second.wait(5000)
     for _ in range(3):
         _APP.processEvents()
+    MW._detached_threads.clear()
