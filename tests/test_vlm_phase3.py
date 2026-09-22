@@ -741,6 +741,43 @@ def test_routes_all_tab_shows_every_route():
     print("  'show all' tab shows every builtin route: OK")
 
 
+def test_routes_all_tab_caps_scroll_height_to_about_four_rows():
+    """"すべて表示"(最大10行)がダイアログ全体を長くしすぎないよう、経路欄
+    だけを約4行分の高さに固定してスクロールさせる(260922のフィードバック:
+    「すべて表示の時に縦の長さが長すぎる」)。ダイアログ本体の実際の高さが
+    モード切替で伸びるとしても、それは経路欄が(1〜2行想定の「おすすめ」から)
+    最大4行分に広がった差分だけで、10行分の高さまでは絶対に伸びない。"""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.show()
+        QApplication.instance().processEvents()
+        dialog_height_before = dlg.height()
+        recommended_scroll_height = dlg._routes_scroll.height()
+
+        dlg.routes_mode_all.setChecked(True)
+        QApplication.instance().processEvents()
+        all_scroll_height = dlg._routes_scroll.height()
+        # 全10行がそのまま並んだ高さより明確に小さい(スクロールが必要になる)。
+        full_grid_height = dlg._routes_grid.sizeHint().height()
+        assert all_scroll_height < full_grid_height
+        # おおむね4行分程度(1行あたりの高さ*4 + 余白)に収まっている。
+        per_row = full_grid_height / len(dlg._route_order)
+        assert all_scroll_height <= per_row * 4 + 16
+        # ダイアログ本体が伸びるとしても、経路欄の伸び幅(おすすめ→すべて表示)を
+        # 超えては伸びない(=10行分の高さまで際限なく伸びるバグの再発防止)。
+        scroll_height_delta = all_scroll_height - recommended_scroll_height
+        assert dlg.height() <= dialog_height_before + scroll_height_delta + 16
+        assert all_scroll_height >= recommended_scroll_height
+    finally:
+        dlg.close()
+    print("  'show all' tab caps the routes area to ~4 rows with its own scrollbar"
+          " instead of growing the whole dialog: OK")
+
+
 def test_routes_recommended_tab_updates_when_checkbox_toggled():
     """Unchecking the sole visible route in the recommended tab must make it
     disappear from that view immediately (switch to the empty message), not

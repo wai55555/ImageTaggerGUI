@@ -13,11 +13,11 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable
 
-from PySide6.QtCore import Qt, QThread, Slot
+from PySide6.QtCore import Qt, QThread, QTimer, Slot
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPushButton, QRadioButton, QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 import vlm_config
@@ -275,7 +275,21 @@ class VlmSettingsDialog(QDialog):
         self._routes_grid.setHorizontalSpacing(6)
         self._routes_grid.setVerticalSpacing(_ROUTES_GRID_VSPACING[self._routes_view_mode])
         self._routes_grid.setColumnStretch(_ROUTE_COL_MODEL, 1)
-        rv.addLayout(self._routes_grid)
+        # 「すべて表示」(最大10行)をそのまま並べるとダイアログの縦がとても長くなる
+        # (実測: プロファイルによっては1000px近い)。経路欄だけを約4行分の高さで
+        # 固定し、それを超える分はここだけスクロールさせる(ダイアログ全体は
+        # スクロールさせない - 過去にダイアログ全体を包んで幅・高さとも
+        # self.sizeHint() が壊れた反省から、ここでは高さ・幅とも
+        # _relayout_routes() で明示的に設定し、QScrollArea自身の自動サイズ計算には
+        # 頼らない)。
+        routes_content = QWidget()
+        routes_content.setLayout(self._routes_grid)
+        self._routes_scroll = QScrollArea()
+        self._routes_scroll.setWidgetResizable(True)
+        self._routes_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._routes_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._routes_scroll.setWidget(routes_content)
+        rv.addWidget(self._routes_scroll)
         self._routes_empty_label = QLabel()
         self._routes_empty_label.setStyleSheet("color: gray;")
         self._routes_empty_label.setWordWrap(True)
@@ -710,10 +724,14 @@ class VlmSettingsDialog(QDialog):
     def _set_routes_view_mode(self, mode: str) -> None:
         self._routes_view_mode = mode
         self._relayout_routes()
-        # 中身はスクロール領域(_build()参照)に入っているため、モード切替で行数が
-        # 変わってもダイアログ自体をリサイズする必要はない(スクロールバーの有無だけが
-        # 変わる)。以前はここでダイアログを手動リサイズしていたが、スクロール領域
-        # 導入後は sizeHint がコンテンツに追従しなくなり不要になった。
+        # 経路欄自体は_relayout_routes()内で高さを約4行分に固定しているため、
+        # モード切替で行数が変わってもダイアログ本体を明示的にリサイズする必要は
+        # ない。ただし、_relayout_routes()が更新する最小幅(・付随して最小高さ)を
+        # 現在のダイアログの実サイズが下回っている場合、Qtがその最小サイズを
+        # 満たすよう自動でウィンドウを広げることがある(例: 狭い画面向けに縮めた
+        # 状態から「すべて表示」へ切り替え、経路欄が必要とする幅が今の幅を
+        # 超えた場合)。これは経路欄が必要とする分だけの意図した広がりであり、
+        # 10行分フルに広がるような不具合ではない。
 
     def _relayout_routes(self) -> None:
         # 最大10行分の setVisible/addWidget をまとめて行う間、ダイアログの再描画を止める。
@@ -773,6 +791,45 @@ class VlmSettingsDialog(QDialog):
         self._routes_empty_label.setVisible(not visible_cids)
         if not visible_cids:
             self._routes_empty_label.setText(self._t("Vlm", "Settings_Routes_Recommended_Empty"))
+        self._routes_scroll.setVisible(bool(visible_cids))
+        if visible_cids:
+            # QScrollArea自身のsizeHint()はウィジェット内容の自然なサイズを反映しない
+            # (widgetResizable(True)でも小さい既定値を返す)ため、幅・高さとも
+            # 中身のQGridLayoutのsizeHint()から明示的に決める。高さは約4行分に
+            # 固定し(1行あたりの高さ = 現在の行数から逆算)、それを超える行数分は
+            # スクロールで見せる。幅はスクロールバーを出さないよう常に中身の自然な
+            # 幅を確保する。
+            grid_hint = self._routes_grid.sizeHint()
+            self._routes_scroll.setMinimumWidth(max(grid_hint.width(), 1))
+            row_count = len(visible_cids)
+            per_row_height = grid_hint.height() / row_count
+            max_visible_rows = 4
+            capped_height = int(per_row_height * max_visible_rows) + 8
+            needs_scroll = grid_hint.height() > capped_height
+            self._routes_scroll.setFixedHeight(
+                max(min(grid_hint.height(), capped_height), 1))
+            # Windows既定の「触るまで見えない」自動非表示スクロールバーだと、隠れた
+            # 行があること自体に気付けない(実機フィードバック)。実際にスクロールが
+            # 必要な時だけ、常時表示のスクロールバーに切り替えて明示する。
+            self._routes_scroll.setVerticalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOn if needs_scroll
+                else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # __init__ で setMinimumWidth(520) を1度だけ設定したきりだと、後から
+        # 「すべて表示」でroutes_scrollの必要幅が広がっても、その明示済みの
+        # 最小幅を上書きしてくれない(Qtは一度setMinimumWidthされると、レイアウト
+        # 側が計算した本来の最小幅(minimumSizeHint)へ自動では追従しない)。
+        # 実機で「幅方向だけウィンドウを縮められ、経路欄のスクロールバーが
+        # ダイアログの外に出て見えなくなる」不具合として確認された。
+        #
+        # minimumSizeHint()は子ウィジェットの幅変更(updateGeometry())を
+        # 即座には反映しない(実際の再計算はQtがLayoutRequestイベントを処理する
+        # 次のイベントループの巡目まで遅延する)。そのためここで同期的に問い合わせ
+        # ても古い値のままになる。QTimer.singleShot(0, ...)でイベントループが
+        # 一巡した直後まで遅延させ、その時点の正しい値で最小幅を追従させる。
+        QTimer.singleShot(0, self._sync_min_width_to_content)
+
+    def _sync_min_width_to_content(self) -> None:
+        self.setMinimumWidth(max(520, self.minimumSizeHint().width()))
 
     def _move_route(self, cid: str, delta: int) -> None:
         i = self._route_order.index(cid)
