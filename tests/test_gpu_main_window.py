@@ -337,3 +337,63 @@ def test_gpu_checkbox_construction_does_not_overwrite_auto(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_detached_running_thread_is_deleted_only_after_it_finishes():
+    """停止要求に応じなかったスレッドを、稼働中に破棄しないこと。
+
+    260922 PR#27 レビュー指摘: _cleanup_tagger_thread() はタイムアウト後に
+    deleteLater() を呼んでいたが、DeferredDelete は QThread *オブジェクト* の所属
+    スレッド（=生成元のメインスレッド）へ post されるため、ワーカーの終了を待たず
+    次のイベントループ巡目で破棄され、Qt の言う
+    "Deleting a running QThread will probably result in a program crash" に当たる。
+    当時のコメントは「deleteLater は稼働中でも安全」と逆のことを書いていた。
+    """
+    import types
+
+    from main_window import MainWindow
+
+    thread = QThread()
+    holder = types.SimpleNamespace(_detached_threads=[])
+    # self からは _detached_threads だけを触るので、MainWindow を丸ごと作らずに済む。
+    MainWindow._detach_running_thread(holder, thread, None)
+    assert thread in holder._detached_threads
+
+    thread.start()
+    assert thread.isRunning()
+    for _ in range(3):
+        _APP.processEvents()
+    # ここで破棄されていると、以降の属性アクセスが RuntimeError になる。
+    assert thread.isRunning(), "稼働中のスレッドを破棄してはいけない"
+
+    thread.quit()
+    assert thread.wait(5000)
+    for _ in range(3):
+        _APP.processEvents()
+    with pytest.raises(RuntimeError):
+        thread.isFinished()  # finished 後に初めて破棄される
+
+
+def test_detach_prunes_already_finished_threads():
+    """detach 置き場が溜まり続けないこと（次の detach 時に掃除される）。"""
+    import types
+
+    from main_window import MainWindow
+
+    holder = types.SimpleNamespace(_detached_threads=[])
+    first = QThread()
+    MainWindow._detach_running_thread(holder, first, None)
+    first.start()
+    first.quit()
+    assert first.wait(5000)
+    for _ in range(3):
+        _APP.processEvents()
+
+    second = QThread()
+    MainWindow._detach_running_thread(holder, second, None)
+    assert holder._detached_threads == [second]
+    second.start()
+    second.quit()
+    assert second.wait(5000)
+    for _ in range(3):
+        _APP.processEvents()

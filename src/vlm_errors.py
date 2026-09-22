@@ -80,7 +80,12 @@ class VlmAttemptError:
             # 4枚目でGeminiが誤って除外され、5枚目以降7枚が一度も試行されずに
             # 打ち切られたのを確認）。2画像分の全滅を要求することで、本当に
             # 恒常的に壊れている接続（NVIDIA相当）だけを狙って除外する。
-            if consecutive_timeouts >= (max(1, int(retry_same_max)) + 1) * 2:
+            # 1画像あたりの試行回数は vlm_transport の
+            # `max_same_conn_attempts = max(0, retry_same_max) + 1` が基準。
+            # ここを max(1, ...) にしていると retry_same_max=0（カスタム接続の
+            # スピンボックスは下限0なので設定できる）のとき閾値が2ではなく4に
+            # なり、コメントの「2画像分」と食い違って除外が2枚ぶん遅れる。
+            if consecutive_timeouts >= (max(0, int(retry_same_max)) + 1) * 2:
                 return VlmErrorClass.EXCLUDE
             return VlmErrorClass.FAILOVER
         if r is VlmErrorReason.RATE_LIMITED:

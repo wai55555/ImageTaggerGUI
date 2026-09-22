@@ -21,20 +21,26 @@ _LEGACY_SERVICE = "PixaiTaggerOnnxGui.VLM"   # 改名前。既存エントリは
 
 
 def _service_for(secret_ref: str) -> str:
-    """この ref を書き込む先。旧サービス名に既にあればそれ（上書き更新）、無ければ新。
+    """この ref を書き込む先。既に値がある方（新を優先）、どちらにも無ければ新。
 
-    get_secret() とは逆に旧を先にチェックするのは意図的（CodeRabbit 指摘、却下）:
-    ここは「新規作成 or 既存更新のどちらか」を決める場であり、旧に無ければ新に作るのが
-    目的なので default は _SERVICE でなければならない。新を先にチェックして「無ければ旧」
-    にすると、_SERVICE への初回書き込み経路が無くなり（_SERVICE を返すには既に _SERVICE
-    にある必要がある、という循環）、改名後もずっと新規接続が旧サービス名に書かれ続ける。
+    default は _SERVICE でなければならない（過去の CodeRabbit 指摘を却下した理由）:
+    ここは「新規作成 or 既存更新のどちらか」を決める場であり、既存が無ければ新に
+    作るのが目的。default を _LEGACY_SERVICE にすると _SERVICE への初回書き込み
+    経路が無くなり（_SERVICE を返すには既に _SERVICE にある必要がある、という循環）、
+    改名後もずっと新規接続が旧サービス名に書かれ続ける。
+
+    チェック順は get_secret() と揃える（260922 PR#27 レビュー指摘）。両サービスに
+    同じ ref の値があるとき旧を返すと、保存は旧へ行くのに get_secret() は新を先に
+    読むため、保存した値が以後一切読まれない（古い新サービス値が返り続ける）。
+    default を _SERVICE に保つ限り、順序を揃えても上記の初回書き込み経路は壊れない。
     """
     if keyring is not None:
-        try:
-            if keyring.get_password(_LEGACY_SERVICE, secret_ref):
-                return _LEGACY_SERVICE
-        except Exception:
-            pass
+        for service in (_SERVICE, _LEGACY_SERVICE):
+            try:
+                if keyring.get_password(service, secret_ref):
+                    return service
+            except Exception:
+                pass
     return _SERVICE
 
 

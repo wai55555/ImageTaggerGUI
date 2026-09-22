@@ -75,6 +75,14 @@ QPushButton#routesModeBtn:hover:!checked {
 # 「すべて表示」は10行を詰めて並べるため現行の4pxを維持する。
 _ROUTES_GRID_VSPACING = {"recommended": 10, "all": 4}
 
+# ダイアログの下限サイズと、画面に対して残す余白(タスクバー・ウィンドウ枠ぶん)。
+# 初期サイズのクランプ(__init__)と、後から経路欄に合わせて動かす最小幅
+# (_sync_min_width_to_content)の両方で同じ値を使う。片方だけが画面サイズを
+# 考慮していると「画面より広く、しかも縮められない」状態になる。
+_DIALOG_MIN_WIDTH = 520
+_DIALOG_MIN_HEIGHT = 400
+_SCREEN_MARGIN = 80
+
 _BUILTIN_SECRET_REF = {
     "builtin-gemini": "vlm/gemini/api_key",
     "builtin-openrouter": "vlm/openrouter/api_key",
@@ -175,7 +183,7 @@ class VlmSettingsDialog(QDialog):
         # 開くたびに常に「おすすめ」から始める(260922_vlm_fallback_ui_candidate_c_plan.md 3節)。
         self._routes_view_mode: str = "recommended"
         self.setWindowTitle(get_string("Vlm", "Settings_Title"))
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(_DIALOG_MIN_WIDTH)
         self._build()
         self._load()
         # スクロール領域は使わない(過去に導入したが、ウィンドウの手動拡縮に内容が
@@ -183,12 +191,13 @@ class VlmSettingsDialog(QDialog):
         # なる等の表示バグの元だった)。自然なサイズのまま開き、画面より大きい
         # 場合だけ縮小する(ダイアログ自体はユーザーが手でリサイズ・移動できる)。
         screen = self.screen() or QApplication.primaryScreen()
-        margin = 80  # タスクバー・ウィンドウ枠等の余白
         hint = self.sizeHint()
         if screen:
             avail = screen.availableGeometry()
-            target_w = min(hint.width(), max(avail.width() - margin, 520))
-            target_h = min(hint.height(), max(avail.height() - margin, 400))
+            target_w = min(hint.width(), max(avail.width() - _SCREEN_MARGIN,
+                                             _DIALOG_MIN_WIDTH))
+            target_h = min(hint.height(), max(avail.height() - _SCREEN_MARGIN,
+                                              _DIALOG_MIN_HEIGHT))
         else:
             target_w, target_h = hint.width(), hint.height()
         self.resize(target_w, target_h)
@@ -797,10 +806,8 @@ class VlmSettingsDialog(QDialog):
             # (widgetResizable(True)でも小さい既定値を返す)ため、幅・高さとも
             # 中身のQGridLayoutのsizeHint()から明示的に決める。高さは約4行分に
             # 固定し(1行あたりの高さ = 現在の行数から逆算)、それを超える行数分は
-            # スクロールで見せる。幅はスクロールバーを出さないよう常に中身の自然な
-            # 幅を確保する。
+            # スクロールで見せる。
             grid_hint = self._routes_grid.sizeHint()
-            self._routes_scroll.setMinimumWidth(max(grid_hint.width(), 1))
             row_count = len(visible_cids)
             per_row_height = grid_hint.height() / row_count
             max_visible_rows = 4
@@ -814,6 +821,22 @@ class VlmSettingsDialog(QDialog):
             self._routes_scroll.setVerticalScrollBarPolicy(
                 Qt.ScrollBarPolicy.ScrollBarAlwaysOn if needs_scroll
                 else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            # 幅は原則として中身の自然な幅を確保する(横スクロールバーを出さない)。
+            # ただし経路欄の自然幅は実測で「すべて表示」時に1700px超まで伸びるため、
+            # そのまま最小幅に流すと狭い画面では画面幅を超えたまま縮小もできなく
+            # なり、右端の「診断」列に手が届かない。画面に収まる分で打ち切り、
+            # 切り詰めた時だけ横スクロールで残りへ到達できるようにする。
+            natural_width = max(grid_hint.width(), 1)
+            if needs_scroll:
+                # 縦スクロールバーを常時表示にした分だけビューポートが狭くなる。
+                # 足しておかないと最終列がその幅ぶん欠ける。
+                natural_width += self._routes_scroll.verticalScrollBar().sizeHint().width()
+            cap = self._width_cap()
+            capped_width = natural_width if cap is None else min(natural_width, cap)
+            self._routes_scroll.setMinimumWidth(capped_width)
+            self._routes_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOn if capped_width < natural_width
+                else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # __init__ で setMinimumWidth(520) を1度だけ設定したきりだと、後から
         # 「すべて表示」でroutes_scrollの必要幅が広がっても、その明示済みの
         # 最小幅を上書きしてくれない(Qtは一度setMinimumWidthされると、レイアウト
@@ -828,8 +851,27 @@ class VlmSettingsDialog(QDialog):
         # 一巡した直後まで遅延させ、その時点の正しい値で最小幅を追従させる。
         QTimer.singleShot(0, self._sync_min_width_to_content)
 
+    def _width_cap(self) -> int | None:
+        """この画面に収まる最大幅。画面が取れなければ None(＝上限なし)。
+
+        __init__ の初期クランプは resize() にしか効かず、後から
+        setMinimumWidth() された値には勝てない(最小幅は resize より強い)。
+        最小幅を触る側でも同じ上限を掛けないと、「すべて表示」で経路欄が
+        必要とする幅がそのまま縮小下限になり、1366/1600px幅の画面では
+        はみ出したまま縮められなくなる。
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return None
+        return max(screen.availableGeometry().width() - _SCREEN_MARGIN,
+                   _DIALOG_MIN_WIDTH)
+
     def _sync_min_width_to_content(self) -> None:
-        self.setMinimumWidth(max(520, self.minimumSizeHint().width()))
+        width = max(_DIALOG_MIN_WIDTH, self.minimumSizeHint().width())
+        cap = self._width_cap()
+        if cap is not None:
+            width = min(width, cap)
+        self.setMinimumWidth(width)
 
     def _move_route(self, cid: str, delta: int) -> None:
         i = self._route_order.index(cid)

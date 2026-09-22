@@ -174,6 +174,10 @@ class MainWindow(QMainWindow):
         # Thread and worker management
         self._tagger_thread: QThread | None = None
         self._tagger_worker: TaggerThreadWorker | CaptionerThreadWorker | VlmCaptionWorker | None = None
+        # 停止要求に応じなかったスレッドを、実際に終了して破棄されるまで持ち続ける
+        # 置き場（_detach_running_thread 参照）。self から参照を外した後も Python 側の
+        # 参照が消えないようにするためで、通常は常に空。
+        self._detached_threads: list[QThread] = []
         self._vlm_settings_dialog = None
         self._download_thread: QThread | None = None
         self._downloader_worker: DownloaderWorker | None = None
@@ -1763,13 +1767,50 @@ class MainWindow(QMainWindow):
                     # ハングしうることを実機（オフスクリーン一括テスト）で確認した
                     # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
                     # スレッド自身は自分のイベントループが処理される限り、いずれ
-                    # 自然に終了する（Qt の deleteLater は稼働中の QThread に対しても
-                    # 安全——実際の破棄は終了後まで遅延される）。
+                    # 自然に終了する。
+                    self._detach_running_thread(self._tagger_thread, self._tagger_worker)
+                    self._tagger_thread = None
+                    self._tagger_worker = None
+                    return
             self._tagger_thread.deleteLater()
             self._tagger_thread = None
         if self._tagger_worker:
             self._tagger_worker.deleteLater()
             self._tagger_worker = None
+
+    def _detach_running_thread(self, thread: QThread, worker) -> None:
+        """終了しなかったスレッドを、実際に終了した後で破棄するよう繋いで手放す。
+
+        ここで直接 deleteLater() してはいけない。deleteLater() の DeferredDelete は
+        「その QObject が所属するスレッド」へ post されるが、QThread *オブジェクト* の
+        所属は管理対象のワーカースレッドではなく生成元（メインスレッド）なので、
+        次にメインのイベントループが回った時点で——ワーカーの終了を待たずに——破棄
+        される。Qt のドキュメントどおり、稼働中の QThread を破棄すると
+        "Deleting a running QThread will probably result in a program crash"。
+        以前ここには「deleteLater は稼働中でも安全（破棄は終了後まで遅延される）」
+        というコメントがあったが、これは誤りだった（260922 PR#27 レビュー指摘）。
+
+        代わりに Qt 公式の後始末イディオム（finished → deleteLater）を使う。
+        QThreadPrivate::finish() は running=false / finished=true を立ててから
+        finished を emit するので、メインのイベントループが DeferredDelete を
+        処理する時点では確実に停止済みになる。
+
+        スレッドが永久に終わらない場合はここで保持したまま残る（プロセス終了まで
+        のリークだが、クラッシュより望ましい）。
+        """
+        # 既に終了・破棄済みのぶんを掃除する。detach 自体が稀なのでここで十分。
+        still: list[QThread] = []
+        for t in self._detached_threads:
+            try:
+                if not t.isFinished():
+                    still.append(t)
+            except RuntimeError:  # 既に C++ 側が破棄済み
+                pass
+        self._detached_threads = still
+        self._detached_threads.append(thread)
+        if worker is not None:
+            thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
 
     def _stop_tagging_thread(self):
         """Requests the tagging thread to stop."""

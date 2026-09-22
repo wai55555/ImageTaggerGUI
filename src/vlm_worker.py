@@ -156,8 +156,12 @@ class VlmCaptionWorker(QObject):
         # connection_order から外された provider は候補から完全に除外する（足し戻さない）。
         if policy.execution_mode is ExecutionMode.BUILTIN_FALLBACK:
             order = vlm_config.ordered_builtin_provider_ids(vlm, model_profile)
-            ordered_bindings = {pid: model_profile.bindings[pid]
-                                for pid in order if pid in model_profile.bindings}
+            # 設定画面でチェックできた「binding は無いが検証済み override がある」
+            # 経路も候補に含める。素の binding だけで絞ると、利用者がモデル一覧から
+            # 実在IDを選んでチェックした経路が一度も試されない（260922 PR#27）。
+            effective = vlm_config.profile_with_override_bindings(vlm, model_profile)
+            ordered_bindings = {pid: effective.bindings[pid]
+                                for pid in order if pid in effective.bindings}
             model_profile = dataclasses.replace(model_profile, bindings=ordered_bindings)
 
         has_auth = {}

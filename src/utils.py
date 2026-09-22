@@ -229,20 +229,29 @@ def _uncaught_error_strings() -> tuple[str, str]:
 def _maybe_show_uncaught_dialog(title: str, body: str) -> None:
     """Shows the uncaught-exception dialog at most once per process.
 
-    Skips the dialog entirely (log-only) if there is no QApplication instance -
-    e.g. an exception before QApplication() is constructed, or an exception on a
-    non-GUI thread. Qt/QMessageBox are imported lazily here so utils.py keeps its
-    current no-Qt-dependency at module load time.
+    Skips the dialog entirely (log-only) unless there is a QApplication instance
+    AND we are on its GUI thread. Both skip cases are real: an exception can be
+    raised before QApplication() is constructed, and - because both
+    sys.excepthook and threading.excepthook route here - an exception can also be
+    raised on a worker thread, where creating a QMessageBox would be a Qt widget
+    operation off the GUI thread (crash or hang). Qt is imported lazily here so
+    utils.py keeps its current no-Qt-dependency at module load time.
     """
     global _uncaught_dialog_shown
     if _uncaught_dialog_shown:
         return
     try:
+        from PySide6.QtCore import QThread
         from PySide6.QtWidgets import QApplication, QMessageBox
     except Exception:
         return
     try:
-        if QApplication.instance() is None:
+        app = QApplication.instance()
+        # The guard has to come before _uncaught_dialog_shown is set, or a
+        # worker-thread exception would consume the one dialog this process
+        # shows without ever displaying it - and the later main-thread
+        # exception would then be silently log-only.
+        if app is None or QThread.currentThread() != app.thread():
             return
         _uncaught_dialog_shown = True
         QMessageBox.critical(None, title, body)

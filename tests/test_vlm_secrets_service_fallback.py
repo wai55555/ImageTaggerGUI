@@ -76,3 +76,31 @@ def test_get_secret_prefers_new_service_when_both_have_it(fake_keyring):
     fake_keyring.set_password(VS._SERVICE, "vlm/gemini/api_key", "new-value")
     fake_keyring.set_password(VS._LEGACY_SERVICE, "vlm/gemini/api_key", "legacy-value")
     assert VS.get_secret("vlm/gemini/api_key") == "new-value"
+
+
+def test_set_secret_writes_where_get_secret_reads_when_both_have_it(fake_keyring):
+    """両サービスに同じ ref の値があるとき、保存先と読み出し先が食い違ってはいけない。
+
+    260922 PR#27 レビュー指摘: _service_for が旧を先に見ていたため、保存は旧へ
+    行くのに get_secret は新を先に読み、保存した値が以後一切読まれなかった。
+    """
+    fake_keyring.set_password(VS._SERVICE, "vlm/gemini/api_key", "new-value")
+    fake_keyring.set_password(VS._LEGACY_SERVICE, "vlm/gemini/api_key", "legacy-value")
+    assert VS.set_secret("vlm/gemini/api_key", "typed-now", persist=True) is True
+    # 読み出し側（新サービス優先）が、今保存した値を返す。
+    assert VS.get_secret("vlm/gemini/api_key") == "typed-now"
+    assert fake_keyring.get_password(VS._SERVICE, "vlm/gemini/api_key") == "typed-now"
+    # 旧サービス側は触らない（delete_secret が両方から消すので残っていても害はない）。
+    assert fake_keyring.get_password(VS._LEGACY_SERVICE, "vlm/gemini/api_key") == "legacy-value"
+
+
+def test_set_secret_still_creates_in_new_service_when_legacy_lookup_raises(fake_keyring,
+                                                                          monkeypatch):
+    """keyring の読みが落ちても、default が _SERVICE なので新規作成経路は死なない。"""
+    def _boom(service, ref):
+        raise Exception("backend unavailable")
+    monkeypatch.setattr(fake_keyring, "get_password", _boom)
+    assert VS.set_secret("vlm/openai/api_key", "fresh", persist=True) is True
+    monkeypatch.undo()
+    assert fake_keyring.get_password(VS._SERVICE, "vlm/openai/api_key") == "fresh"
+    assert fake_keyring.get_password(VS._LEGACY_SERVICE, "vlm/openai/api_key") is None

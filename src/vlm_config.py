@@ -385,6 +385,65 @@ def mark_binding_verified(vlm_settings, provider_id: str, *, profile_id: str | N
     return True
 
 
+def _override_only_bindings(vlm_settings, model_profile) -> dict:
+    """binding が無い provider に対する、検証済み手動 override の実行時 binding。
+
+    設定画面では、プロファイルに binding が無い経路でも「モデル一覧を取得」で
+    実在する VLM の ID を選んで保存すれば、実行対象チェックを押せる
+    （vlm_settings_dialog._rebuild_routes の has_override）。ところが実行側は
+    プロファイルの binding しか見ないため、チェックして保存できるのに一度も
+    試行されず、候補の除外理由にも出てこない——という無言の不一致になっていた
+    （260922 PR#27 レビュー指摘）。ここで override を binding へ昇格させて、
+    UI で押せる状態と実行できる状態を一致させる。
+
+    identity は DECLARED。UNKNOWN にすると select_candidates が
+    identity_unknown で無条件に落としてしまうし、利用者がライブのモデル一覧から
+    能動的に選んだ実在 ID なので「不明」ではない。ただし同一モデルである保証は
+    プロファイル側に無いので VERIFIED でもない（`verified_bindings` に載れば
+    _apply_verified_promotions 同様にここでも昇格させる）。「厳格」モードでは
+    DECLARED は候補から外れるが、その場合も not_verified として除外理由に載る
+    ので、黙って消えるのとは違う。
+    """
+    if model_profile is None:
+        return {}
+    overrides = (vlm_settings.model_id_override_map()
+                 if hasattr(vlm_settings, "model_id_override_map") else {})
+    if not overrides:
+        return {}
+    verified = vlm_settings.verified_set()
+    out: dict[str, ModelBinding] = {}
+    for provider_id in KNOWN_BUILTIN_PROVIDERS:
+        if model_profile.binding_for(provider_id) is not None:
+            continue
+        model_id = str(overrides.get(
+            _binding_token(model_profile.profile_id, provider_id), "") or "").strip()
+        if not model_id or not is_vlm_model_id(model_profile, provider_id, model_id):
+            continue
+        status = (ModelIdentityStatus.VERIFIED
+                  if _binding_token(model_profile.profile_id, provider_id) in verified
+                  else ModelIdentityStatus.DECLARED)
+        out[provider_id] = ModelBinding(provider_id=provider_id, model_id=model_id,
+                                        identity_status=status, vlm_capable=True)
+    return out
+
+
+def profile_with_override_bindings(vlm_settings, model_profile):
+    """検証済み override を binding として合成したプロファイルを返す。
+
+    経路の順序決定（ordered_builtin_provider_ids）と実行時の候補選定
+    （VlmCaptionWorker._build_runtime）の両方がこれを通す。設定画面の
+    「binding が無い経路」表示自体は resolve_model_profile の素のプロファイルを
+    使い続ける（灰色表示と「同一モデル保証は無い」ツールチップを残すため）。
+    """
+    if model_profile is None:
+        return model_profile
+    extra = _override_only_bindings(vlm_settings, model_profile)
+    if not extra:
+        return model_profile
+    return dataclasses.replace(model_profile,
+                               bindings={**model_profile.bindings, **extra})
+
+
 KNOWN_BUILTIN_PROVIDERS = (
     "gemini", "nvidia", "openrouter", "cloudflare", "groq",
     "huggingface", "vercel", "openai", "anthropic", "xai",
@@ -420,6 +479,10 @@ def ordered_builtin_provider_ids(vlm_settings, model_profile=None) -> list[str]:
             seen.add(p)
             out.append(p)
     if model_profile is not None:
+        # 検証済み override を binding 扱いに含める。含めないと、設定画面で
+        # チェックできた override 経路がここで落ち、保存→再開で勝手にチェックが
+        # 外れ、実行時も候補にすら入らない。
+        model_profile = profile_with_override_bindings(vlm_settings, model_profile)
         profile_order = [pid for pid in model_profile.bindings if pid in known]
         if profile_order:
             if not any(pid in profile_order for pid in out):

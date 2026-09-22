@@ -780,6 +780,51 @@ def test_routes_all_tab_caps_scroll_height_to_about_four_rows():
           " instead of growing the whole dialog: OK")
 
 
+def test_routes_width_stays_within_the_screen_and_scrolls_horizontally():
+    """経路欄の自然幅がダイアログの縮小下限になって画面を超えないこと。
+
+    260922 PR#27 レビュー指摘: _sync_min_width_to_content() が
+    setMinimumWidth(minimumSizeHint().width()) としていたため、経路欄が必要とする
+    幅（実測で「すべて表示」時 1700px超）がそのまま縮小下限になっていた。__init__ の
+    初期クランプは resize() にしか効かず最小幅には勝てないので、狭い画面では
+    「画面幅を超えたまま縮小もできず、右端の『診断』列に手が届かない」状態になる。
+    画面に収まる分で打ち切り、切り詰めた時だけ横スクロールで到達させる。
+    """
+    import app_settings as A
+    from PySide6.QtCore import Qt
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    app = QApplication.instance()
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.show()
+        app.processEvents()
+        dlg.routes_mode_all.setChecked(True)
+        app.processEvents()
+        width_cap = dlg._width_cap()
+        assert width_cap is not None, "テスト環境に画面が無い"
+        natural = dlg._routes_grid.sizeHint().width()
+        # 経路欄は画面に収まる幅を超えない。
+        assert dlg._routes_scroll.minimumWidth() <= width_cap
+        # ダイアログの縮小下限も画面に収まる。
+        assert dlg.minimumWidth() <= width_cap
+        # 切り詰めたぶんは横スクロールで到達できる（切り詰めていなければ出さない）。
+        capped = dlg._routes_scroll.minimumWidth() < natural
+        assert dlg._routes_scroll.horizontalScrollBarPolicy() is (
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn if capped
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 画面より狭い幅を要求したら、少なくとも上限までは縮む
+        # （最小幅が自然幅に張り付いて一切縮まない、という退行の再発防止）。
+        dlg.resize(dlg.minimumWidth() // 2, dlg.height())
+        app.processEvents()
+        assert dlg.width() <= width_cap
+    finally:
+        dlg.close()
+    print("  routes area is capped to the screen and scrolls horizontally instead"
+          " of pinning the dialog wider than the display: OK")
+
+
 def test_routes_recommended_tab_updates_when_checkbox_toggled():
     """Unchecking the sole visible route in the recommended tab must make it
     disappear from that view immediately (switch to the empty message), not

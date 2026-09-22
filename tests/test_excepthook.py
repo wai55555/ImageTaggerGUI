@@ -155,3 +155,38 @@ def test_install_excepthook_wires_both_hooks(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_uncaught_dialog_is_skipped_off_the_gui_thread(monkeypatch):
+    """ワーカースレッドからの未捕捉例外で QMessageBox を作らない。
+
+    260922 PR#27 レビュー指摘: sys.excepthook / threading.excepthook はどちらも
+    失敗したスレッドで走るので、QApplication があるだけで QMessageBox を作ると
+    GUIスレッド外での Qt ウィジェット操作になり、クラッシュやハングになりうる。
+    docstring は元から「非GUIスレッドなら出さない」と書いていたが、実装は
+    QApplication の有無しか見ていなかった。
+    """
+    import threading
+
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    assert QApplication.instance() is not None, "このテストは QApplication 前提"
+    monkeypatch.setattr(utils, "_uncaught_dialog_shown", False)
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(QMessageBox, "critical",
+                        classmethod(lambda cls, *a, **k: shown.append(a[1:3])))
+
+    def _worker():
+        utils._maybe_show_uncaught_dialog("t", "b")
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join()
+    assert shown == [], "非GUIスレッドからダイアログを作ってはいけない"
+    # ワーカー側で「1回しか出さない」フラグを消費していないこと。消費していると、
+    # 後続のメインスレッド例外が無言でログのみになってしまう。
+    assert utils._uncaught_dialog_shown is False
+
+    utils._maybe_show_uncaught_dialog("t", "b")
+    assert shown == [("t", "b")], "GUIスレッドからは従来どおり出す"
+    assert utils._uncaught_dialog_shown is True

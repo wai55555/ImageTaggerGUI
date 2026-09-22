@@ -258,6 +258,14 @@ def test_error_classification():
         consecutive_timeouts=5, same_retries=2, retry_same_max=2) is E.VlmErrorClass.FAILOVER
     assert mk(E.VlmErrorReason.TIMEOUT).classify(
         consecutive_timeouts=6, same_retries=2, retry_same_max=2) is E.VlmErrorClass.EXCLUDE
+    # retry_same_max=0（カスタム接続のスピンボックスは下限0）なら1画像1試行なので
+    # 閾値は2。max(1, ...) でクランプしていた頃は4になり、コメントの「2画像分」と
+    # 食い違って除外が2枚ぶん遅れていた（260922 PR#27 レビュー指摘）。基準は
+    # vlm_transport の max_same_conn_attempts = max(0, retry_same_max) + 1。
+    assert mk(E.VlmErrorReason.TIMEOUT).classify(
+        consecutive_timeouts=1, same_retries=0, retry_same_max=0) is E.VlmErrorClass.FAILOVER
+    assert mk(E.VlmErrorReason.TIMEOUT).classify(
+        consecutive_timeouts=2, same_retries=0, retry_same_max=0) is E.VlmErrorClass.EXCLUDE
     assert mk(E.VlmErrorReason.RATE_LIMITED).classify() is E.VlmErrorClass.FAILOVER
     assert mk(E.VlmErrorReason.SERVER_ERROR).classify() is E.VlmErrorClass.RETRY_SAME
     assert mk(E.VlmErrorReason.SERVER_ERROR).classify(already_retried_same=True) is E.VlmErrorClass.FAILOVER
@@ -806,6 +814,85 @@ def test_builtin_binding_order_puts_vendor_then_openrouter_then_vercel():
                                      profile.bindings["openrouter"].model_id)
     assert checked_claude == 11, checked_claude
     print("  builtin binding order: vendor -> OpenRouter -> Vercel, Claude included: OK")
+
+
+def test_validated_override_route_is_executable_not_just_checkable():
+    """設定画面でチェックできた override 専用経路が、実行時にも候補へ入ること。
+
+    260922 PR#27 レビュー指摘: プロファイルに binding が無い経路でも「モデル一覧を
+    取得」で実在IDを選べばチェックを押せるのに、実行側はプロファイルの binding しか
+    見ていなかった。結果、チェックして保存できるのに一度も試行されず、
+    CandidateSet.excluded にも出てこない（＝ログからも理由が分からない）無言の
+    不一致になっていた。
+    """
+    import dataclasses
+    import types
+
+    import vlm_config as CFG
+
+    settings = types.SimpleNamespace(
+        model_profile_id="gemma-4-31b-it", cloudflare_account_id="",
+        verified_bindings="", model_id_overrides="", connection_order="gemini,openai")
+    settings.verified_set = lambda: {
+        t.strip() for t in settings.verified_bindings.split(",") if t.strip()}
+    settings.order_list = lambda: [p for p in settings.connection_order.split(",") if p]
+    settings.model_id_override_map = lambda: {
+        k.strip(): v.strip()
+        for k, _, v in (tok.partition("=") for tok in settings.model_id_overrides.split(","))
+        if k.strip() and v.strip()}
+
+    profile = CFG.resolve_model_profile(settings)
+    assert profile.binding_for("openai") is None, "このプロファイルに openai binding は無い"
+
+    # override が無いうちは、connection_order に openai があっても経路にしない
+    # （既存の意図的な挙動: binding も override も無い経路は同一モデル保証が無い）。
+    assert CFG.ordered_builtin_provider_ids(settings, profile) == ["gemini"]
+
+    # 「モデル一覧を取得」で実在する VLM の ID を選んで保存した状態。
+    CFG.set_model_id_override(settings, "openai", "gpt-5.6-sol",
+                              profile_id="gemma-4-31b-it")
+    order = CFG.ordered_builtin_provider_ids(settings, profile)
+    assert order == ["gemini", "openai"], order
+
+    connections = CFG.build_connection_map(settings, profile)
+    assert connections["builtin-openai"].model_id == "gpt-5.6-sol"
+    assert connections["builtin-openai"].enabled is True
+
+    effective = CFG.profile_with_override_bindings(settings, profile)
+    synthesized = effective.binding_for("openai")
+    assert synthesized is not None
+    assert synthesized.model_id == "gpt-5.6-sol"
+    # UNKNOWN だと select_candidates が identity_unknown で無条件に落とすので DECLARED。
+    assert synthesized.identity_status is M.ModelIdentityStatus.DECLARED
+    # 素のプロファイル側は変えない（設定画面の灰色表示・ツールチップを残すため）。
+    assert profile.binding_for("openai") is None
+
+    ordered_bindings = {pid: effective.bindings[pid]
+                        for pid in order if pid in effective.bindings}
+    runtime_profile = dataclasses.replace(profile, bindings=ordered_bindings)
+    candidates = R.select_candidates(
+        runtime_profile, connections, R.RouterPolicy(),
+        has_auth={cid: True for cid in connections})
+    assert "builtin-openai" in candidates.connection_ids, candidates.connection_ids
+
+    # 「厳格」モードでは DECLARED は候補外だが、黙って消えるのではなく理由が載る。
+    strict = R.select_candidates(
+        runtime_profile, connections, R.RouterPolicy(allow_declared_identity=False),
+        has_auth={cid: True for cid in connections})
+    assert strict.excluded.get("builtin-openai") == "not_verified"
+
+    # 1枚テスト成功などで verified_bindings に載れば、厳格モードでも通る。
+    settings.verified_bindings = "gemma-4-31b-it:openai"
+    promoted = CFG.profile_with_override_bindings(settings, profile)
+    assert promoted.binding_for("openai").identity_status is M.ModelIdentityStatus.VERIFIED
+
+    # 非VLM（既知のテキスト専用）IDの override は合成しない。
+    CFG.set_model_id_override(settings, "openai", "", profile_id="gemma-4-31b-it")
+    CFG.set_model_id_override(settings, "groq", "groq/compound-mini",
+                              profile_id="gemma-4-31b-it")
+    assert CFG.profile_with_override_bindings(
+        settings, profile).binding_for("groq") is None
+    print("  validated override-only route is executable, not just checkable: OK")
 
 
 def test_default_vlm_profile_and_fallback_order():
