@@ -401,8 +401,16 @@ def ordered_builtin_provider_ids(vlm_settings, model_profile=None) -> list[str]:
     プロファイルの binding 順へ切り替える。これにより OpenAI / Claude のように
     既定の無料候補リストに含まれないプロファイルも、選択直後から実行可能になる。
     共通する provider がある場合は、利用者が外した経路を足し戻さない。
-    プロファイルがない／bindingもないときだけ既定のGemini → NVIDIA → OpenRouter
-    → Cloudflare → Groqへ戻す。
+    ただし、このプロファイルに binding が一切無い provider は、たとえ
+    connection_order に残っていても除外する（例: connection_order=[openai,vercel]
+    のままGemmaプロファイルへ切り替えると、vercelはbindingがあり重なりが
+    あるためconnection_order全体を残す判定になるが、openai自体はこの
+    プロファイルにbindingが無いのでチェック済み扱いにしてはいけない。
+    実機で「切り替えたら関係ない接続がチェック済み・グレーアウトのまま残る」
+    という不具合として確認された）。
+    プロファイルがない／bindingもないときだけ既定のGemini → OpenRouter → Cloudflare
+    へ戻す（NVIDIA/Groqは実機検証で無料枠が実用に耐えないと確認できたため、
+    DEFAULT_VLM_CONNECTION_ORDER と同様にここでも既定候補から外している）。
     """
     known = set(KNOWN_BUILTIN_PROVIDERS)
     seen: set[str] = set()
@@ -413,6 +421,8 @@ def ordered_builtin_provider_ids(vlm_settings, model_profile=None) -> list[str]:
             out.append(p)
     if model_profile is not None:
         profile_order = [pid for pid in model_profile.bindings if pid in known]
-        if profile_order and not any(pid in profile_order for pid in out):
-            return profile_order
-    return out or ["gemini", "nvidia", "openrouter", "cloudflare", "groq"]
+        if profile_order:
+            if not any(pid in profile_order for pid in out):
+                return profile_order
+            out = [pid for pid in out if pid in profile_order]
+    return out or ["gemini", "openrouter", "cloudflare"]

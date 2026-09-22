@@ -856,7 +856,12 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
     s.behavior.existing_file_mode = "APPEND"
     s.caption.placement = "APPEND"
 
-    # make all three builtin bindings verified + provide fake auth + mock http
+    # make all three builtin bindings verified + provide fake auth + mock http.
+    # This test relies on gemini failing to parse the OpenAI-shaped mock body
+    # (gemini's real protocol expects a different JSON shape) and falling over to
+    # openrouter, which does parse it - so it needs multiple candidates regardless
+    # of the shipped DEFAULT_VLM_CONNECTION_ORDER (now just "gemini").
+    s.vlm.connection_order = "gemini,openrouter,cloudflare"
     import vlm_models as M, dataclasses, vlm_secrets, vlm_config
     verified = {pid: dataclasses.replace(b, identity_status=M.ModelIdentityStatus.VERIFIED, provider_constraint=None)
                for pid, b in M.GEMMA_4_26B_A4B_IT.bindings.items()}

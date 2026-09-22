@@ -47,6 +47,12 @@ def _setup(tmpdir, existing_mode, placement, monkeypatch, existing_txt=None):
     s = A.load_settings(A.get_default_config())
     s.paths.input_dir = str(tmpdir)
     s.vlm.enabled = True
+    # Several tests using this fixture rely on gemini failing to parse the
+    # OpenAI-shaped mock body below (gemini's real protocol expects a different
+    # JSON shape) and falling over to openrouter, which does parse it - so this
+    # fixture needs multiple candidates regardless of the shipped
+    # DEFAULT_VLM_CONNECTION_ORDER (now just "gemini").
+    s.vlm.connection_order = "gemini,openrouter,cloudflare"
     s.behavior.existing_file_mode = existing_mode
     s.caption.placement = placement
     for i in range(2):
@@ -302,7 +308,10 @@ def test_settings_dialog_rejects_non_vlm_model():
 
         row["model_edit"].setCurrentText("groq/compound-mini")
         dlg._on_model_id_edited("builtin-groq")
-        assert row["model_edit"].currentText() == "qwen3.8-27b"
+        # Reverts to the route's actual bound model_id (fixed 2026-09-22 to
+        # include the required "qwen/" prefix - confirmed live against Groq's
+        # real catalog).
+        assert row["model_edit"].currentText() == "qwen/qwen3.8-27b"
         assert "qwen3.8-27b:groq" not in s.vlm.model_id_override_map()
 
         dlg._on_model_list("builtin-groq", [
@@ -557,6 +566,20 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
         assert row["model_edit"].isEnabled()
         assert row["list_btn"].isEnabled()
         assert row["diag_btn"].isEnabled()
+
+        # A user who manually types/selects a real VLM model id for an unbound
+        # route must be able to check it immediately (not stay stuck grayed out
+        # until the dialog is reopened) - this is what a user reported after using
+        # "Fetch models" on OpenRouter and picking a listed id that stayed
+        # unchecked.
+        row["model_edit"].setCurrentText("qwen/qwen3.8-27b")
+        dlg._on_model_id_edited("builtin-groq")
+        assert row["enabled"].isEnabled()
+        assert row["has_override"] is True
+        # clearing the override back out must re-disable it.
+        row["model_edit"].setCurrentText("")
+        dlg._on_model_id_edited("builtin-groq")
+        assert not row["enabled"].isEnabled()
         for cid, other_provider in (
             ("builtin-nvidia", "nvidia"),
             ("builtin-openai", "openai"),
@@ -621,6 +644,154 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
             dlg.close()
         vlm_config.resolve_model_profile = old_resolver
     print("  unbound route remains available for VLM discovery and diagnosis: OK")
+
+
+def test_routes_recommended_tab_shows_profile_native_provider():
+    """260922_vlm_fallback_ui_candidate_c_plan.md: the "recommended" view must not
+    hard-code Gemini - it shows whatever ordered_builtin_provider_ids() resolves
+    to for the *current* profile, filtered to routes that actually have a
+    binding. For the shipped default profile (gemma-4-31b-it) that is Gemini."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        assert dlg._routes_view_mode == "recommended"
+        assert dlg._visible_route_cids() == ["builtin-gemini"]
+        for cid, r in dlg._route_rows.items():
+            assert r["name"].isHidden() is (cid != "builtin-gemini"), cid
+        # up/down reordering is meaningless with ~1 visible row; hidden in this mode.
+        assert dlg._route_rows["builtin-gemini"]["updown"].isHidden()
+        assert dlg._routes_empty_label.isHidden()
+    finally:
+        dlg.close()
+    print("  recommended tab shows only the default profile's native provider (Gemini): OK")
+
+
+def test_routes_recommended_tab_follows_profile_switch():
+    """Switching the Caption profile combo to a Claude profile must move the
+    recommended tab's visible routes to Anthropic (+ its Vercel alias route),
+    not leave it stuck on Gemini - this reuses the existing
+    ordered_builtin_provider_ids()/_on_profile_changed() wiring, no new
+    per-profile logic. Since connection_order (default: just "gemini") has zero
+    overlap with claude-opus-5's own bindings, the existing fallback in
+    ordered_builtin_provider_ids() switches to *all* of that profile's bound
+    providers (anthropic + vercel), not only the first one - this is pre-existing,
+    intentional behavior (a newly selected profile becomes fully usable right
+    away), not something this UI change introduces."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        idx = dlg.profile_combo.findData("claude-opus-5")
+        assert idx >= 0
+        dlg.profile_combo.setCurrentIndex(idx)
+        assert dlg._visible_route_cids() == ["builtin-anthropic", "builtin-vercel"]
+        assert dlg._route_rows["builtin-anthropic"]["name"].isHidden() is False
+        assert dlg._route_rows["builtin-gemini"]["name"].isHidden() is True
+    finally:
+        dlg.close()
+    print("  recommended tab follows profile switch (Gemini -> Anthropic): OK")
+
+
+def test_routes_recommended_tab_empty_for_bindingless_profile():
+    """A profile with no builtin bindings at all (custom-connection-only) must
+    show the "no built-in connection" message instead of an empty grid or a
+    misleading leftover checked-but-grayed row."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    bindingless = M.VlmModelProfile(
+        profile_id="user-custom-only", display_name="Custom only",
+        canonical_model_id="custom/model")
+    old_resolver = vlm_config.resolve_model_profile
+    vlm_config.resolve_model_profile = lambda v: bindingless
+    dlg = None
+    try:
+        dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+        assert dlg._visible_route_cids() == []
+        assert dlg._routes_empty_label.isHidden() is False
+        assert dlg._routes_empty_label.text() == "Settings_Routes_Recommended_Empty"
+    finally:
+        if dlg is not None:
+            dlg.close()
+        vlm_config.resolve_model_profile = old_resolver
+    print("  recommended tab shows the no-binding message for a bindingless profile: OK")
+
+
+def test_routes_all_tab_shows_every_route():
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.routes_mode_all.setChecked(True)
+        assert dlg._routes_view_mode == "all"
+        assert set(dlg._visible_route_cids()) == set(dlg._route_order)
+        for cid, r in dlg._route_rows.items():
+            assert r["name"].isHidden() is False, cid
+        assert dlg._routes_empty_label.isHidden()
+    finally:
+        dlg.close()
+    print("  'show all' tab shows every builtin route: OK")
+
+
+def test_routes_recommended_tab_updates_when_checkbox_toggled():
+    """Unchecking the sole visible route in the recommended tab must make it
+    disappear from that view immediately (switch to the empty message), not
+    require reopening the dialog or switching tabs."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        assert dlg._visible_route_cids() == ["builtin-gemini"]
+        dlg._route_rows["builtin-gemini"]["enabled"].setChecked(False)
+        assert dlg._visible_route_cids() == []
+        assert dlg._routes_empty_label.isHidden() is False
+    finally:
+        dlg.close()
+    print("  unchecking the only recommended route switches to the empty message live: OK")
+
+
+def test_routes_recommended_tab_shows_checked_override_only_route():
+    """A route with no binding for the current profile but an explicit,
+    user-chosen model id override (set via "Fetch models" + picking an id, see
+    test_settings_dialog_keeps_unbound_route_discoverable) must appear in the
+    recommended tab once checked, not stay invisible forever just because it
+    has no binding. Reported by a user: checking OpenRouter after choosing a
+    model id via "fetch models" never made it show up under "recommended"."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    s.vlm.model_profile_id = "gemma-4-26b-a4b-it"
+    old_resolver = vlm_config.resolve_model_profile
+    vlm_config.resolve_model_profile = lambda v: next(
+        (p for p in vlm_config.all_profiles() if p.profile_id == v.model_profile_id), None)
+    dlg = None
+    try:
+        dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+        row = dlg._route_rows["builtin-groq"]
+        assert not row["has_binding"]
+        row["model_edit"].setCurrentText("qwen/qwen3.8-27b")
+        dlg._on_model_id_edited("builtin-groq")
+        assert row["enabled"].isEnabled()
+        assert "builtin-groq" not in dlg._visible_route_cids()  # not checked yet
+        row["enabled"].setChecked(True)
+        assert "builtin-groq" in dlg._visible_route_cids()
+        assert row["name"].isHidden() is False
+    finally:
+        if dlg is not None:
+            dlg.close()
+        vlm_config.resolve_model_profile = old_resolver
+    print("  recommended tab shows a checked override-only route: OK")
 
 
 def test_settings_transaction_rolls_back_both_files(tmp_path, monkeypatch):

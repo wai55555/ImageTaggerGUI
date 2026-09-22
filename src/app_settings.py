@@ -10,8 +10,15 @@ _get_string: GetString = default_get_string_fallback
 
 # VLM の既定値。新規設定だけでなく、欠落した [Vlm] キーのフォールバックにも
 # 同じ値を使う。既存ユーザーが明示的に選んだモデル／順序は上書きしない。
+# 接続順序は既定プロファイル(gemma-4-31b-it)の本来の1社であるGeminiだけにする。
+# OpenRouter/Cloudflareを既定で並べても、どちらも利用者自身のAPIキー登録が無ければ
+# 認証すら通らず「複数社に自動フォールバックする」という体感上のメリットが無い
+# (実機検証: OpenRouterの無料枠はキー登録前提、Cloudflareも同様)。かつては複数社を
+# 既定で並べていたが、無料枠フォールバックの実態(readme/free_fallback_notes_ja.md)を
+# 踏まえ、初回起動時は単一の実用的な接続だけを見せる方針にした
+# (260922_vlm_fallback_ui_candidate_c_plan.md)。
 DEFAULT_VLM_MODEL_PROFILE_ID = "gemma-4-31b-it"
-DEFAULT_VLM_CONNECTION_ORDER = "gemini,openrouter,cloudflare"
+DEFAULT_VLM_CONNECTION_ORDER = "gemini"
 
 def set_get_string_func(func: GetString):
     global _get_string

@@ -15,9 +15,9 @@ from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, Slot
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QRadioButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
+    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 import vlm_config
@@ -51,6 +51,29 @@ _PROMPT_MODE_KEYS = ["standard", "dataset_long", "short_tags"]
 # フォールバック経路グリッドの列。up/down は1セルに横並びで入れる。
 (_ROUTE_COL_UPDOWN, _ROUTE_COL_ENABLED, _ROUTE_COL_NAME, _ROUTE_COL_MODEL,
  _ROUTE_COL_LIST, _ROUTE_COL_REGISTER, _ROUTE_COL_STATUS, _ROUTE_COL_DIAG) = range(8)
+
+# 「おすすめ / すべて表示」切替ボタンをタブ風に見せるQSS。palette(highlight)/palette(mid)は
+# OSのテーマ(ダーク/ライト)へ自動追従するため、決め打ちの色コードは使わない。
+_ROUTES_MODE_BTN_QSS = """
+QPushButton#routesModeBtn {
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0px;
+    padding: 4px 12px;
+    background: transparent;
+}
+QPushButton#routesModeBtn:checked {
+    border-bottom: 2px solid palette(highlight);
+    font-weight: 600;
+}
+QPushButton#routesModeBtn:hover:!checked {
+    border-bottom: 2px solid palette(mid);
+}
+"""
+
+# 経路グリッドの行間隔(px)。「おすすめ」は1〜2行想定で余白を広めに、
+# 「すべて表示」は10行を詰めて並べるため現行の4pxを維持する。
+_ROUTES_GRID_VSPACING = {"recommended": 10, "all": 4}
 
 _BUILTIN_SECRET_REF = {
     "builtin-gemini": "vlm/gemini/api_key",
@@ -148,10 +171,27 @@ class VlmSettingsDialog(QDialog):
         self._diag_worker: VlmDiagnosticsWorker | None = None
         self._diag_pending_profile_id: str | None = None
         self._pending_done: int | None = None
+        # タブ選択(おすすめ/すべて表示)はconfig.iniへ永続化しない。ダイアログを
+        # 開くたびに常に「おすすめ」から始める(260922_vlm_fallback_ui_candidate_c_plan.md 3節)。
+        self._routes_view_mode: str = "recommended"
         self.setWindowTitle(get_string("Vlm", "Settings_Title"))
         self.setMinimumWidth(520)
         self._build()
         self._load()
+        # スクロール領域は使わない(過去に導入したが、ウィンドウの手動拡縮に内容が
+        # 追従しない・幅も高さも self.sizeHint() が中身の自然なサイズを反映しなく
+        # なる等の表示バグの元だった)。自然なサイズのまま開き、画面より大きい
+        # 場合だけ縮小する(ダイアログ自体はユーザーが手でリサイズ・移動できる)。
+        screen = self.screen() or QApplication.primaryScreen()
+        margin = 80  # タスクバー・ウィンドウ枠等の余白
+        hint = self.sizeHint()
+        if screen:
+            avail = screen.availableGeometry()
+            target_w = min(hint.width(), max(avail.width() - margin, 520))
+            target_h = min(hint.height(), max(avail.height() - margin, 400))
+        else:
+            target_w, target_h = hint.width(), hint.height()
+        self.resize(target_w, target_h)
 
     def _opts(self, prefix: str, keys: list[str]) -> list[tuple[str, str]]:
         """保存値 key と locale から引いた表示ラベルの組にする（[Vlm] <prefix>_<key>）。"""
@@ -200,15 +240,47 @@ class VlmSettingsDialog(QDialog):
         self._route_rows: dict[str, dict] = {}
         # 経路の優先順位はこのリストの順。▲▼ ボタンで並べ替える。
         self._route_order: list[str] = []
+
+        # 「おすすめ / すべて表示」切替(260922_vlm_fallback_ui_candidate_c_plan.md 2.1節)。
+        # 本物のQTabWidgetで行ウィジェットを複製せず、同じ _routes_grid の表示フィルタを
+        # 切り替えるだけにする(状態の二重管理を避けるため、同計画1節)。
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 0, 0)
+        mode_row.setSpacing(4)
+        self.routes_mode_recommended = QPushButton(self._t("Vlm", "Settings_Routes_Mode_Recommended"))
+        self.routes_mode_all = QPushButton(self._t("Vlm", "Settings_Routes_Mode_All"))
+        for b in (self.routes_mode_recommended, self.routes_mode_all):
+            b.setObjectName("routesModeBtn")
+            b.setStyleSheet(_ROUTES_MODE_BTN_QSS)
+            b.setCheckable(True)
+            mode_row.addWidget(b)
+        mode_row.addStretch(1)
+        self.routes_mode_recommended.setChecked(True)
+        self._routes_mode_group = QButtonGroup(self)
+        self._routes_mode_group.setExclusive(True)
+        self._routes_mode_group.addButton(self.routes_mode_recommended)
+        self._routes_mode_group.addButton(self.routes_mode_all)
+        self.routes_mode_recommended.toggled.connect(
+            lambda on: on and self._set_routes_view_mode("recommended"))
+        self.routes_mode_all.toggled.connect(
+            lambda on: on and self._set_routes_view_mode("all"))
+        rv.addLayout(mode_row)
+        rv.addSpacing(6)
+
         # 経路行は QGridLayout で組む。行ごとに別レイアウトにすると、プロバイダー名や
         # モデルID・状態ラベルの文字幅の違いで列がガタガタにずれるため（グリッドなら
         # 各列が全行の最大幅にそろう）。モデルID列だけ伸縮させて余白を吸わせる。
         self._routes_grid = QGridLayout()
         self._routes_grid.setContentsMargins(0, 0, 0, 0)
         self._routes_grid.setHorizontalSpacing(6)
-        self._routes_grid.setVerticalSpacing(4)
+        self._routes_grid.setVerticalSpacing(_ROUTES_GRID_VSPACING[self._routes_view_mode])
         self._routes_grid.setColumnStretch(_ROUTE_COL_MODEL, 1)
         rv.addLayout(self._routes_grid)
+        self._routes_empty_label = QLabel()
+        self._routes_empty_label.setStyleSheet("color: gray;")
+        self._routes_empty_label.setWordWrap(True)
+        self._routes_empty_label.setVisible(False)
+        rv.addWidget(self._routes_empty_label)
         self.profile_combo.currentIndexChanged.connect(self._on_profile_changed)
         self.strict_check = QCheckBox(self._t("Vlm", "Settings_Strict_Identity"))
         self.strict_check.setToolTip(self._t("Vlm", "Settings_Strict_Identity_Tooltip"))
@@ -310,8 +382,11 @@ class VlmSettingsDialog(QDialog):
         register_btn.clicked.connect(lambda _=False, cid=conn.connection_id: self._open_api_key_dialog(cid))
         status = QLabel()
         # 状態文は言語・保存場所・確認済み表示の組み合わせで長さが変わるため、
-        # 列幅を文字列に追従させない。全文はツールチップへ残し、表示は必要なら省略する。
-        status.setFixedWidth(180)
+        # 「すべて表示」(10行)では列幅を文字列に追従させない。全文はツールチップへ残し、
+        # 表示は必要なら省略する。「おすすめ」(1〜2行)では逆に幅を解放し、_relayout_routes()
+        # がモードに応じて最大幅とsizePolicyを切り替える(260922_vlm_fallback_ui_candidate_c_plan.md 2.2節)。
+        status.setMinimumWidth(180)
+        status.setMaximumWidth(180)
         status.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         diag_btn = QPushButton(self._t("Vlm", "Settings_Diagnose"))
@@ -352,20 +427,39 @@ class VlmSettingsDialog(QDialog):
                  if c.kind is ConnectionKind.BUILTIN]
         order = vlm_config.ordered_builtin_provider_ids(self._vlm, profile)
         conns.sort(key=lambda c: order.index(c.provider_id) if c.provider_id in order else 99)
+        overrides = self._vlm.model_id_override_map()
         for conn in conns:
             row = self._make_route_row(conn)
             # このプロファイルに binding が無い経路でも、APIキー登録後に公式のVLM一覧を
             # 探索・診断できるようにする。bindingがない経路は同一モデルの自動フォール
-            # バックには入れないため、実行対象チェックだけ無効化する。
+            # バックには入れないため、実行対象チェックは既定で無効化する。
             has_binding = profile is None or profile.binding_for(conn.provider_id) is not None
+            row["has_binding"] = has_binding
+            # ただし「モデル一覧を取得」で明示的にモデルIDを選び、手動上書きとして
+            # 保存済みの経路は例外。同一モデルの保証は無くなる(=フォールバックの
+            # 自動選定ロジックには乗らない)が、それを承知の上で利用者が能動的に
+            # 選んだ経路なのでチェック自体は押せるようにする(過去にOpenRouter等、
+            # モデル一覧に実在するIDを選んでもグレーアウトのままチェックできない
+            # という報告があった)。
+            has_override = bool(
+                profile is not None
+                and overrides.get(f"{profile.profile_id}:{conn.provider_id}"))
+            row["has_override"] = has_override
             if not has_binding:
                 row["name"].setStyleSheet("color: gray;")
-                row["name"].setToolTip(self._t("Vlm", "Settings_Route_No_Binding"))
-                row["enabled"].setEnabled(False)
+                row["name"].setToolTip(self._t(
+                    "Vlm", "Settings_Route_No_Binding_Override"
+                    if has_override else "Settings_Route_No_Binding"))
+                row["enabled"].setEnabled(has_override)
             self._route_rows[conn.connection_id] = row
             self._route_order.append(conn.connection_id)
-        self._relayout_routes()
         self._apply_route_states()
+        # 「おすすめ」タブ表示中にチェックを外すと、その行は表示条件を満たさなくなり
+        # 消える(空メッセージへ切り替わる)。_apply_route_states() の初期チェック設定が
+        # 終わった後に配線し、初期化中の余分な再レイアウトを避ける。
+        for r in self._route_rows.values():
+            r["enabled"].toggled.connect(lambda _checked: self._relayout_routes())
+        self._relayout_routes()
 
     def _apply_route_states(self) -> None:
         profile = vlm_config.resolve_model_profile(self._vlm)
@@ -492,6 +586,15 @@ class VlmSettingsDialog(QDialog):
                                          profile_id=self._vlm.model_profile_id)
         if text:
             r["conn"].model_id = text   # 診断・キー登録がこの場で新IDを使えるように
+        # bindingが無い経路でも、有効なオーバーライドを設定した直後ならチェックを
+        # 押せるようにする(次にダイアログを開き直すまで待たせない)。
+        if not r.get("has_binding", True):
+            has_override = bool(text)
+            r["has_override"] = has_override
+            r["enabled"].setEnabled(has_override)
+            r["name"].setToolTip(self._t(
+                "Vlm", "Settings_Route_No_Binding_Override"
+                if has_override else "Settings_Route_No_Binding"))
 
     # --- モデル一覧の取得 -------------------------------------------------------
     def _fetch_models(self, cid: str) -> None:
@@ -587,17 +690,89 @@ class VlmSettingsDialog(QDialog):
             rr["list_btn"].setEnabled(True)
         self._finish_pending_done_if_ready()
 
+    def _visible_route_cids(self) -> list[str]:
+        """現在のモードで表示すべき経路のcid一覧(260922_vlm_fallback_ui_candidate_c_plan.md 1節)。
+
+        「すべて表示」は常に全行。「おすすめ」は、現在チェックが入っている行だけ。
+        bindingが無い経路でも、利用者が「モデル一覧を取得」等で明示的にIDを選び
+        override登録済み(has_override)ならチェックを押せる(_on_model_id_edited参照)ので、
+        そのチェックも「おすすめ」に反映する。has_bindingだけを条件にすると、override
+        済みでチェックした経路が「おすすめ」タブに一生出てこず、チェックしたのに反映され
+        ないように見えるバグになる。
+        """
+        if self._routes_view_mode == "all":
+            return list(self._route_order)
+        return [cid for cid in self._route_order
+                if self._route_rows[cid]["enabled"].isChecked()
+                and (self._route_rows[cid].get("has_binding", True)
+                     or self._route_rows[cid].get("has_override", False))]
+
+    def _set_routes_view_mode(self, mode: str) -> None:
+        self._routes_view_mode = mode
+        self._relayout_routes()
+        # 中身はスクロール領域(_build()参照)に入っているため、モード切替で行数が
+        # 変わってもダイアログ自体をリサイズする必要はない(スクロールバーの有無だけが
+        # 変わる)。以前はここでダイアログを手動リサイズしていたが、スクロール領域
+        # 導入後は sizeHint がコンテンツに追従しなくなり不要になった。
+
     def _relayout_routes(self) -> None:
-        # グリッドから全セルを外す（ウィジェットは消さない）。順序を _route_order の
-        # とおりに並べ直す。
-        while self._routes_grid.count():
-            self._routes_grid.takeAt(0)
-        for pos, cid in enumerate(self._route_order):
-            r = self._route_rows[cid]
-            for key, col in self._ROUTE_CELLS:
-                self._routes_grid.addWidget(r[key], pos, col)
-            r["up"].setEnabled(pos > 0)
-            r["down"].setEnabled(pos < len(self._route_order) - 1)
+        # 最大10行分の setVisible/addWidget をまとめて行う間、ダイアログの再描画を止める。
+        # 行ごとに逐次再描画されると、Windows環境で「切替のたびに小さなウィンドウが
+        # 何度もちらつく」ように見える(取り外し→追加を1行ずつ繰り返すため、Qtが
+        # 都度ジオメトリ再計算・再描画を挟みうる)。setUpdatesEnabled(False)で
+        # 一括変更後にまとめて1回だけ描画させる。
+        self.setUpdatesEnabled(False)
+        try:
+            # グリッドから全セルを外す（ウィジェットは消さない）。表示対象だけを
+            # _route_order の順に詰めて並べ直す。
+            while self._routes_grid.count():
+                self._routes_grid.takeAt(0)
+            recommended = self._routes_view_mode == "recommended"
+            self._routes_grid.setVerticalSpacing(_ROUTES_GRID_VSPACING[self._routes_view_mode])
+            # 「おすすめ」は1〜2行想定のため▲▼列を隠し、status列の固定幅も解いて
+            # モデルID・ステータスへ余白を回す(2.2節)。「すべて表示」は現行のまま。
+            self._routes_grid.setColumnStretch(_ROUTE_COL_STATUS, 1 if recommended else 0)
+            visible_cids = self._visible_route_cids()
+            visible_set = set(visible_cids)
+            # 重要: setVisible(True) は必ず addWidget() の後に呼ぶ。行ウィジェットは
+            # _make_route_row() 生成時点では親を持たず、レイアウトに addWidget() されて
+            # 初めて親(routes グループボックス)が付く。もし取り外し直後・再追加前の
+            # まだ親なしの状態で setVisible(True) を呼ぶと、その一瞬だけ「親なし=
+            # トップレベルウィンドウ」としてOSに実ウィンドウが生成されてしまう
+            # (実機のウィンドウ列挙で、"すべて表示"切替のたびにタイトル無しの"python"
+            # ウィンドウが多数生成・破棄されていることを確認して特定した)。
+            #
+            # 手順: 1) 非表示にする行は先に setVisible(False)(親の有無に関係なく安全)。
+            #       2) 表示する行は先に addWidget() で親を確定させてから setVisible(True)。
+            for cid in self._route_order:
+                r = self._route_rows[cid]
+                if cid not in visible_set:
+                    for key, _col in self._ROUTE_CELLS:
+                        r[key].setVisible(False)
+                if recommended:
+                    r["status"].setMaximumWidth(16777215)
+                    r["status"].setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+                else:
+                    r["status"].setMaximumWidth(180)
+                    r["status"].setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+            pos = 0
+            for cid in self._route_order:
+                r = self._route_rows[cid]
+                if cid not in visible_set:
+                    continue
+                for key, col in self._ROUTE_CELLS:
+                    self._routes_grid.addWidget(r[key], pos, col)
+                    r[key].setVisible(False if (key == "updown" and recommended) else True)
+                pos += 1
+            for idx, cid in enumerate(visible_cids):
+                r = self._route_rows[cid]
+                r["up"].setEnabled(idx > 0)
+                r["down"].setEnabled(idx < len(visible_cids) - 1)
+        finally:
+            self.setUpdatesEnabled(True)
+        self._routes_empty_label.setVisible(not visible_cids)
+        if not visible_cids:
+            self._routes_empty_label.setText(self._t("Vlm", "Settings_Routes_Recommended_Empty"))
 
     def _move_route(self, cid: str, delta: int) -> None:
         i = self._route_order.index(cid)

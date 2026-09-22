@@ -633,13 +633,17 @@ def test_multi_provider_profiles():
     assert "pixtral-12b" not in ids
     from vlm_connections import default_builtin_connections
     assert all(c.provider_id != "mistral" for c in default_builtin_connections())
+    # openai-gpt-4o / openai-gpt-4o-mini / grok-4-3 were removed: older models
+    # priced the same as their newer replacements, kept as dead weight in the
+    # profile picker (2026-09-22 user decision).
     assert {"gemma-4-26b-a4b-it", "gemma-4-31b-it", "qwen3.8-27b", "qwen3.6-27b",
-            "openai-gpt-4o", "openai-gpt-4o-mini",
             "openai-gpt-5.6-sol", "openai-gpt-5.6-terra",
             "openai-gpt-5.6-luna", "claude-fable-5-1", "claude-fable-5",
             "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
             "claude-opus-4-6", "claude-opus-4-5", "claude-sonnet-5",
-            "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5"} <= ids
+            "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5",
+            "grok-4-6"} <= ids
+    assert not ({"openai-gpt-4o", "openai-gpt-4o-mini", "grok-4-3"} & ids)
 
     def _s(profile_id):
         s = types.SimpleNamespace(model_profile_id=profile_id,
@@ -662,13 +666,21 @@ def test_multi_provider_profiles():
     prof = CFG.resolve_model_profile(s)
     cm = CFG.build_connection_map(s, prof)
     on = {cid for cid, c in cm.items() if c.enabled and c.kind is C.ConnectionKind.BUILTIN}
-    assert on == {"builtin-openrouter", "builtin-nvidia", "builtin-groq"}, on
+    # qwen3.8-27b's nvidia binding was removed: confirmed live (2026-09-22) that
+    # NVIDIA's real model catalog has no Qwen model at all.
+    assert on == {"builtin-openrouter", "builtin-groq"}, on
     assert cm["builtin-openrouter"].model_id == "qwen/qwen3.8-27b"
     assert "builtin-ovhcloud" not in cm
     assert cm["builtin-gemini"].enabled is False
-    # A profile binding alone must not re-enable a route unchecked in the UI.
-    assert CFG.ordered_builtin_provider_ids(s, prof) == \
-        ["gemini", "openrouter", "cloudflare"]
+    # A profile binding alone must not re-enable a route unchecked in the UI
+    # (nvidia/groq have bindings here but aren't in connection_order, so they
+    # stay out). Conversely, a connection_order entry this profile has no
+    # binding for at all (gemini, cloudflare) must not show as an enabled
+    # route just because *some* other entry (openrouter) overlaps - that was a
+    # real bug: switching to a profile with only a partial connection_order
+    # overlap left completely unrelated, unbound providers checked (and
+    # grayed out, unclickable) in the settings dialog.
+    assert CFG.ordered_builtin_provider_ids(s, prof) == ["openrouter"]
 
     gemma = CFG.resolve_model_profile(_s("gemma-4-26b-a4b-it"))
     gemma_cm = CFG.build_connection_map(_s("gemma-4-26b-a4b-it"), gemma)
@@ -685,11 +697,19 @@ def test_multi_provider_profiles():
     assert gpt_cm["builtin-openai"].model_id == "gpt-5.6-luna"
     assert gpt_cm["builtin-openai"].protocol == "openai_responses"
     assert gpt_cm["builtin-vercel"].model_id == "openai/gpt-5.6-luna"
+    # openai-gpt-5.6-luna now has an openrouter binding too (confirmed live
+    # 2026-09-22: OpenRouter's real catalog has openai/gpt-5.6-luna). _s()'s
+    # synthetic connection_order ["gemini", "openrouter", "cloudflare"] never
+    # included "openai", so once openrouter overlaps, the intersection branch
+    # applies and narrows to just the entries the user already had enabled -
+    # not the fallback-to-all-bindings branch this used to hit before the
+    # binding existed.
     assert CFG.ordered_builtin_provider_ids(_s("openai-gpt-5.6-luna"), gpt) == [
-        "openai", "vercel"]
+        "openrouter"]
     auth = {cid: True for cid in gpt_cm}
     paid_direct = R.select_candidates(gpt, gpt_cm, R.RouterPolicy(), has_auth=auth)
-    assert paid_direct.connection_ids == ["builtin-openai", "builtin-vercel"]
+    assert paid_direct.connection_ids == [
+        "builtin-openai", "builtin-vercel", "builtin-openrouter"]
     claude_settings = _s("claude-haiku-4-5")
     claude_settings.anthropic_workspace_id = "wrkspc_test123"
     claude = CFG.resolve_model_profile(claude_settings)
@@ -729,7 +749,9 @@ def test_multi_provider_profiles():
     CFG.set_model_id_override(s, "nvidia", "", profile_id="qwen3.8-27b")
     assert "qwen3.8-27b:nvidia" not in s.model_id_override_map()
     CFG.set_model_id_override(s, "groq", "groq/compound-mini", profile_id="qwen3.8-27b")
-    assert CFG.build_connection_map(s, prof)["builtin-groq"].model_id == "qwen3.8-27b"
+    # An invalid (non-VLM) override falls back to the route's actual bound
+    # model_id, which now includes the required "qwen/" prefix (2026-09-22).
+    assert CFG.build_connection_map(s, prof)["builtin-groq"].model_id == "qwen/qwen3.8-27b"
     CFG.set_model_id_override(s, "groq", "", profile_id="qwen3.8-27b")
     print("  multi-provider profiles: HF opt-in, OVH disabled, model-id override: OK")
 
@@ -740,8 +762,7 @@ def test_default_vlm_profile_and_fallback_order():
 
     settings = A.load_settings(A.get_default_config())
     assert settings.vlm.model_profile_id == "gemma-4-31b-it"
-    assert settings.vlm.order_list() == [
-        "gemini", "openrouter", "cloudflare"]
+    assert settings.vlm.order_list() == ["gemini"]
     assert CFG.ordered_builtin_provider_ids(settings.vlm) == settings.vlm.order_list()
     profile = CFG.resolve_model_profile(settings.vlm)
     connections = CFG.build_connection_map(settings.vlm, profile)
@@ -751,7 +772,7 @@ def test_default_vlm_profile_and_fallback_order():
         has_auth={cid: True for cid in connections},
     )
     assert candidates.connection_ids[0] == "builtin-gemini"
-    print("  default VLM profile Gemma 4 31B IT; fallback order Gemini -> OpenRouter -> Cloudflare: OK")
+    print("  default VLM profile Gemma 4 31B IT; fallback order Gemini only: OK")
 
 
 def test_model_id_match_against_profile():
@@ -804,15 +825,20 @@ def test_vlm_only_model_guard():
     assert gemma is not None
     assert M.is_known_non_vision_model("groq", "groq/compound-mini") is True
     assert M.is_vlm_model_id(qwen, "groq", "groq/compound-mini") is False
-    # OpenRouter's provider-prefixed alias must not cross into Groq when that
-    # profile already declares a different exact Groq binding.
-    assert M.is_vlm_model_id(qwen, "groq", "qwen/qwen3.8-27b") is False
+    # Groq's own binding is exactly "qwen/qwen3.8-27b" (fixed 2026-09-22: Groq's
+    # real catalog requires the "qwen/" prefix, confirmed live). A listed alias
+    # that is NOT this exact binding (e.g. NVIDIA's "-instruct" suffixed form)
+    # must still be rejected for Groq.
+    assert M.is_vlm_model_id(qwen, "groq", "qwen/qwen3.8-27b") is True
+    assert M.is_vlm_model_id(qwen, "groq", "qwen/qwen3.8-27b-instruct") is False
     assert M.is_vlm_model_id(gemma, "groq", "qwen/qwen3.8-27b") is True
+    # Both the exact binding ("qwen/qwen3.8-27b") and the bare canonical id
+    # ("qwen3.8-27b") are accepted matches.
     assert M.filter_vlm_model_ids(
         qwen, "groq",
         ["groq/compound-mini", "qwen/qwen3.8-27b", "qwen3.8-27b",
          "llama-3.3-70b-versatile"],
-    ) == ["qwen3.8-27b"]
+    ) == ["qwen/qwen3.8-27b", "qwen3.8-27b"]
     for provider, model_ids in {
         "openai": ["gpt-4o", "gpt-4o-mini", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
         "anthropic": [
@@ -879,7 +905,10 @@ def test_catalog_capability_classification_covers_all_builtin_providers():
     expected = {
         "gemini": ["gemini-2.5-pro", "gemini-3.8-flash", "gemma-4-31b-it"],
         "cloudflare": ["@cf/google/gemma-3-12b-it", "@cf/meta/llama-3.2-11b-vision-instruct"],
-        "groq": ["qwen/qwen3.6-27b", "qwen/qwen3.8-27b"],
+        # qwen/qwen3.6-27b and meta-llama/llama-4-scout-17b-16e-instruct were
+        # removed from Groq's known-VLM catalog: confirmed live (2026-09-22)
+        # absent from Groq's real 13-model /models list.
+        "groq": ["qwen/qwen3.8-27b"],
         "nvidia": ["google/gemma-4-26b-it", "google/gemma-4-31b-it",
                     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
                     "nvidia/nemotron-nano-12b-v2-vl"],
@@ -921,7 +950,9 @@ def test_user_defined_profiles():
     old = CFG.VLM_PROFILES_PATH
     CFG.VLM_PROFILES_PATH = Path(tempfile.mkdtemp()) / "vp.json"
     try:
-        assert len(CFG.all_profiles()) == 22 and not CFG.is_user_profile("x")
+        # 22 -> 19 after removing openai-gpt-4o / openai-gpt-4o-mini / grok-4-3
+        # (older models priced the same as their newer replacements, 2026-09-22).
+        assert len(CFG.all_profiles()) == 19 and not CFG.is_user_profile("x")
 
         CFG.save_user_profiles([{
             "profile_id": "user-g3", "display_name": "My Gemma 3 27B",
@@ -973,7 +1004,7 @@ def test_user_defined_profiles():
         ])
         aps = {p.profile_id: p for p in CFG.all_profiles()}
         assert aps["gemma-4-26b-a4b-it"].display_name == "Gemma (mine)"
-        assert len(CFG.all_profiles()) == 23  # 22 shipped (one overridden in place) + user-g3
+        assert len(CFG.all_profiles()) == 20  # 19 shipped (one overridden in place) + user-g3
     finally:
         CFG.VLM_PROFILES_PATH = old
     print("  user-defined profiles: json round-trip, merge, same-id override: OK")
