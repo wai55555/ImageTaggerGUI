@@ -58,6 +58,10 @@ def test_available_language_codes_falls_back_when_nothing_is_listable(tmp_path):
     ("zh-CN", "zh_CN"), ("zh_CN.UTF-8", "zh_CN"), ("zh-SG", "zh_CN"),
     ("zh-Hans", "zh_CN"), ("zh", "zh_CN"),
     ("zh-TW", "zh_TW"), ("zh-HK", "zh_TW"), ("zh-MO", "zh_TW"), ("zh_Hant", "zh_TW"),
+    # 地域が香港/マカオ/台湾以外でも、スクリプト(Hant/Hans)自体で判定できること
+    # （繁体字話者が地域設定を居住国のままにしている構成は実在する。260923指摘）。
+    ("zh-Hant-US", "zh_TW"), ("zh-Hans-US", "zh_CN"),
+    ("zh-Hant-MY", "zh_TW"), ("zh-Hans-MY", "zh_CN"),
     # 地域付きは言語部分へ、codeset / modifier は無視
     ("ja-JP", "ja"), ("ja_JP.UTF-8", "ja"), ("de-AT", "de"), ("fr_CA@euro", "fr"),
     ("ko-KR", "ko"), ("en-GB", "en"),

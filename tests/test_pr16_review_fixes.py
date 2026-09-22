@@ -7,25 +7,37 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-sys.path.insert(0, "/mnt/c/github/PixaiTaggerOnnxGui")
+# pytest 経由では pytest.ini の pythonpath=src で不要(no-op)だが、このファイルは
+# 末尾の __main__ ブロックで直接実行にも対応しており、そちらの経路では機械依存の
+# 絶対パスは他の開発者・CI環境で確実に壊れる(260923 PR#27 レビュー指摘)。他の
+# テストファイルと同じ __file__ 基準の相対パスに揃える。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 def test_utils_lock_timeout():
     import utils
-    utils.get_debug_settings().debug_log_enabled = True
+    # tests/ 収集下では、この行を戻し忘れると同一 pytest プロセス内の後続テスト
+    # 全てで debug_log_enabled が意図せず True のまま残る(260923 PR#27 レビュー
+    # 指摘。pytest.ini の testpaths=tests がこのファイル自体の混入は塞いだが、
+    # tests/ の正式な一員になった今はこの手のグローバル状態リークが実害になる)。
+    debug_settings = utils.get_debug_settings()
+    original = debug_settings.debug_log_enabled
+    debug_settings.debug_log_enabled = True
+    try:
+        # Simulate a thread that died holding _LOG_LOCK (as QThread.terminate() could do).
+        utils._LOG_LOCK.acquire()
+        t0 = time.monotonic()
+        utils.write_debug_log("should not block forever")
+        dt = time.monotonic() - t0
+        assert dt < 2.0, f"write_debug_log blocked for {dt}s while lock held elsewhere"
+        utils._LOG_LOCK.release()
 
-    # Simulate a thread that died holding _LOG_LOCK (as QThread.terminate() could do).
-    utils._LOG_LOCK.acquire()
-    t0 = time.monotonic()
-    utils.write_debug_log("should not block forever")
-    dt = time.monotonic() - t0
-    assert dt < 2.0, f"write_debug_log blocked for {dt}s while lock held elsewhere"
-    utils._LOG_LOCK.release()
-
-    # Normal path still works after.
-    utils.write_debug_log("normal line after lock released")
-    utils._flush_debug_log()
-    print(f"  utils lock-timeout: OK (blocked {dt:.3f}s, then normal write succeeded)")
+        # Normal path still works after.
+        utils.write_debug_log("normal line after lock released")
+        utils._flush_debug_log()
+        print(f"  utils lock-timeout: OK (blocked {dt:.3f}s, then normal write succeeded)")
+    finally:
+        debug_settings.debug_log_enabled = original
 
 
 def test_tagging_core_unreadable_skip():

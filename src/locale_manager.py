@@ -92,6 +92,18 @@ def normalize_language_code(raw: str, available: list[str] | None = None) -> str
     if language in by_lower:
         return by_lower[language]
 
+    # 中国語は「言語部分だけの完全一致」に来る前に、スクリプト（簡体字/繁体字）を
+    # 判定する。`_REGION_ALIASES` は既知の地域の組み合わせ（`zh_hant_tw` 等）しか
+    # 網羅していないため、`zh-Hant-US` のように地域が香港/マカオ/台湾以外だと
+    # そこに当たらず、下の「言語部分だけ」の一段まで落ちて `zh` → `zh_CN` に
+    # 誤判定されていた（繁体字話者が地域設定を居住国のままにしている構成は実在する
+    # ため、これは理論上の話ではない）。260923 PR#27 レビュー指摘。
+    for script in ("zh_hant", "zh_hans"):
+        if lowered == script or lowered.startswith(f"{script}_"):
+            alias = _REGION_ALIASES[script]
+            if alias.lower() in by_lower:
+                return by_lower[alias.lower()]
+
     alias = _REGION_ALIASES.get(language)
     if alias is not None and alias.lower() in by_lower:
         return by_lower[alias.lower()]

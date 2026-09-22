@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pytest
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QCoreApplication, QEvent, QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from PySide6.QtCore import Qt
 
@@ -368,8 +368,15 @@ def test_detached_running_thread_is_deleted_only_after_it_finishes():
 
     thread.quit()
     assert thread.wait(5000)
-    for _ in range(3):
-        _APP.processEvents()
+    _APP.processEvents()
+    # QCoreApplication::processEvents() の公式ドキュメントに明記あり:
+    # 「exec() を一度も呼ばずに processEvents() だけを繰り返すローカルループでは
+    # DeferredDelete イベントは処理されない」。このテストは offscreen headless で
+    # app.exec() を一度も呼ばないため、まさにその条件に当てはまる
+    # （processEvents() を何度繰り返しても理論上は破棄されない可能性が残る、
+    # 260923 PR#27 レビュー指摘）。sendPostedEvents() でこのオブジェクト宛の
+    # DeferredDelete を明示的に配送し、決定的に破棄させる。
+    QCoreApplication.sendPostedEvents(thread, QEvent.Type.DeferredDelete)
     with pytest.raises(RuntimeError):
         thread.isFinished()  # finished 後に初めて破棄される
 

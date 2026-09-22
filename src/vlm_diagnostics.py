@@ -291,9 +291,16 @@ def _cloudflare_token_probe(rep: DiagReport, api_key: str, *, verify_tls: bool =
         if auth_item is not None:
             auth_item.status = DiagStatus.FAIL
             auth_item.detail = msg
-            if not cf_message:
-                auth_item.detail_key = "Diag_D_Token_Rejected"
-                auth_item.detail_args = {"status": raw.status}
+            # cf_message の有無で分岐しない: 分岐していると、Cloudflare が
+            # 具体的な拒否理由を返したときだけ detail_key の更新をスキップして
+            # しまい、診断の早い段階で入った "credential present"（PASS寄りの
+            # 文言）が残ったまま item_detail() が正しく解決してしまう。
+            # ステータスは FAIL なのに表示だけ PASS 寄りのまま、という
+            # 英語detailより始末が悪い状態になっていた（260923 PR#27 レビュー指摘、
+            # 実機で再現確認）。
+            auth_item.detail_key = "Diag_D_Token_Rejected"
+            auth_item.detail_args = {"status": raw.status}
+            auth_item.detail_suffix = cf_message
     elif raw.status == 200 and body.get("success") is True:
         rep.add("HTTP response", DiagStatus.FAIL, f"token is {token_status or 'not active'}",
                 detail_key="Diag_D_Token_Not_Active",
