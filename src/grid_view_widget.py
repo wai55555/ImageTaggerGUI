@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QRect, QObject, QEvent, QTimer
 from PySide6.QtGui import QPixmap, QWheelEvent, QResizeEvent
 
 import tag_utils
+import constants
 from utils import write_debug_log
 from locale_manager import LocaleManager
 from app_settings import AppSettings
@@ -143,7 +144,7 @@ class ImageEditCellWidget(QWidget):
         # so the edit commits and Undo becomes available without waiting for focus-out.
         self._caption_save_timer = QTimer(self)
         self._caption_save_timer.setSingleShot(True)
-        self._caption_save_timer.setInterval(1200)
+        self._caption_save_timer.setInterval(constants.CAPTION_AUTOSAVE_DELAY_MS)
         self._caption_save_timer.timeout.connect(self._save_caption)
         self.caption_edit.textChanged.connect(self._caption_save_timer.start)
 

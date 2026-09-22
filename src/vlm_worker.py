@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+import constants
 from utils import GetString, default_get_string_fallback, write_debug_log
 from tagging_core import (
     ExistingFileMode, FileChange, OverwriteDecision,
@@ -335,7 +336,7 @@ class VlmCaptionWorker(QObject):
             total = len(image_paths)
             mode = parse_existing_file_mode(self._settings.behavior.existing_file_mode, self.get_string)
             placement = self._settings.caption.placement
-            step = max(1, (total + 199) // 200)
+            step = constants.progress_step_for(total)
             n_written = n_skipped = n_errors = n_unchanged = 0
             last_conn = ""
 

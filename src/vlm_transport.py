@@ -18,7 +18,7 @@ from utils import write_debug_log
 from vlm_connections import VlmConnection
 from vlm_errors import VlmAttemptError, VlmErrorClass, VlmErrorReason
 from vlm_image import PreparedImage
-from vlm_profiles import GenerationProfile
+from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS, GenerationProfile
 from vlm_protocols import (
     VlmCallSpec, VlmParseResult, apply_connection_auth, apply_request_body, apply_request_headers,
     default_auth_key, get_protocol,
@@ -36,9 +36,9 @@ class RawHttpResponse:
     text_body: str
 
 
-# 推論系VLM向けに助言する max_output_tokens。GenerationProfile の既定値と揃える
-# （vlm_profiles.GenerationProfile.max_output_tokens）。
-_SUGGESTED_MAX_OUTPUT_TOKENS = 3072
+# 推論系VLM向けに助言する max_output_tokens。GenerationProfile の既定値をそのまま
+# 使う（助言だけ古い値を言い続ける、を防ぐ）。
+_SUGGESTED_MAX_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _output_limit_reason(protocol_name: str, body: Any) -> str:
@@ -86,8 +86,9 @@ def _enrich_parse_failure(parsed: VlmParseResult, *, protocol, body: Any,
         return replace(parsed, error=VlmAttemptError(
             VlmErrorReason.OUTPUT_LIMIT, error.http_status,
             "output limit reached: max_output_tokens={} finish_reason={}; "
-            "the model returned no final text. Increase VLM max tokens to 3072 or higher "
-            "for reasoning VLMs.".format(max_output_tokens, limit_reason),
+            "the model returned no final text. Increase VLM max tokens to {} or higher "
+            "for reasoning VLMs.".format(max_output_tokens, limit_reason,
+                                         _SUGGESTED_MAX_OUTPUT_TOKENS),
             error.provider_code,
             message_key="Advice_Output_Limit",
             message_args={"limit": max_output_tokens, "finish_reason": limit_reason,

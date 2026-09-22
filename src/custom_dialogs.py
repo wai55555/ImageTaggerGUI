@@ -1,6 +1,7 @@
 from enum import IntFlag
 from typing import Any, Callable, Sequence
 
+import constants
 from PySide6.QtCore import (
     Qt, Signal, QPoint, QRect, QEvent, QPointF
 )
@@ -25,9 +26,10 @@ class CategoryTagSettingsDialog(QDialog):
     """
 
     _THRESHOLD_RES = 100  # slider steps per 1.0
-    # Per-category max-tag slider caps. general / character MUST match the main window's
-    # sliders (150 / 10) so the shared value can't display differently in the two places.
-    _LIMIT_CAPS = {"character": 10}
+    # Per-category max-tag slider caps. general / character take the same caps as the
+    # main window's sliders (constants.MAX_TAGS_CAP_*) so the shared value cannot
+    # display differently in the two places.
+    _LIMIT_CAPS = {"character": constants.MAX_TAGS_CAP_CHARACTER}
 
     def __init__(
         self,
@@ -39,7 +41,7 @@ class CategoryTagSettingsDialog(QDialog):
         limits: Any,
         on_changed: Callable[[], None],
         on_reset: Callable[[], None],
-        max_limit: int = 150,
+        max_limit: int = constants.MAX_TAGS_CAP_GENERAL,
     ) -> None:
         super().__init__(parent)
         self._get_string = get_string

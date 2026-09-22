@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, is_dataclass, fields
 from pathlib import Path
 
 from utils import write_debug_log, GetString, default_get_string_fallback
+from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS
 
 _get_string: GetString = default_get_string_fallback
 
@@ -239,7 +240,7 @@ class Vlm:
     markdown: str = "disabled"
     # standard / dataset_long / short_tags
     prompt_mode: str = "standard"
-    max_output_tokens: int = 3072
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     image_max_long_edge: int = 1536
     # 接続確認済みの binding。`<profile_id>:<provider_id>` をカンマ区切りで保持する。
     # キー登録時の軽量モデル一覧GET、接続診断のフルPASS、または1枚テスト成功で追記される。
@@ -306,7 +307,8 @@ def get_default_config() -> configparser.ConfigParser:
             'language': 'en', 'detail_level': 'maximum_detail',
             'sentence_mode': 'automatic_long_detailed', 'character_name_mode': 'explicit_only',
             'markdown': 'disabled', 'prompt_mode': 'standard',
-            'max_output_tokens': '3072', 'image_max_long_edge': '1536',
+            'max_output_tokens': str(DEFAULT_MAX_OUTPUT_TOKENS),
+            'image_max_long_edge': '1536',
             'verified_bindings': '', 'strict_identity': 'False', 'model_id_overrides': '',
         },
         'Debug': {'debug_log': 'False'},

@@ -76,6 +76,12 @@ QPushButton#routesModeBtn:hover:!checked {
 # 「すべて表示」は10行を詰めて並べるため現行の4pxを維持する。
 _ROUTES_GRID_VSPACING = {"recommended": 10, "all": 4}
 
+# カスタム接続リストの各項目に connection_id を持たせるための data role。
+# Qt.ItemDataRole.UserRole は 0x0100(256) で、アプリ独自 role はそこから数える。
+# 生の 1000 を直接渡していたので、Qt の標準 role なのか独自 role なのかコードから
+# 判別できなかった（1000 自体は標準 role とは衝突しないが、名前が無いのが問題）。
+_CUSTOM_CONNECTION_ID_ROLE = Qt.ItemDataRole.UserRole + 1
+
 # ダイアログの下限サイズと、画面に対して残す余白(タスクバー・ウィンドウ枠ぶん)。
 # 初期サイズのクランプ(__init__)と、後から経路欄に合わせて動かす最小幅
 # (_sync_min_width_to_content)の両方で同じ値を使う。片方だけが画面サイズを
@@ -328,7 +334,10 @@ class VlmSettingsDialog(QDialog):
         self.language_combo.setEnabled(len(_LANGUAGE_KEYS) > 1)
         self.language_combo.setToolTip(self._t("Vlm", "Settings_Language_Fixed_Tooltip"))
         self.max_tokens = QSpinBox()
-        self.max_tokens.setRange(16, 32768)
+        # 入力範囲は GenerationProfile.from_mapping() の補正と同じ境界にする
+        # （UIで入れられる値が保存時に黙って丸められる、の逆も起きないように）。
+        self.max_tokens.setRange(vlm_profiles.MIN_MAX_OUTPUT_TOKENS,
+                                 vlm_profiles.MAX_MAX_OUTPUT_TOKENS)
         dfrm.addRow(self._t("Vlm", "Settings_PromptMode"), self.prompt_mode_combo)
         dfrm.addRow(self._t("Vlm", "Settings_Language"), self.language_combo)
         dfrm.addRow(self._t("Vlm", "Settings_DetailLevel"), self.detail_combo)
@@ -999,7 +1008,7 @@ class VlmSettingsDialog(QDialog):
         for c in self._custom_connections:
             label = f'{c.get("display_name", c["connection_id"])}  [{c.get("kind", "?")}]'
             item = QListWidgetItem(label)
-            item.setData(1000, c["connection_id"])
+            item.setData(_CUSTOM_CONNECTION_ID_ROLE, c["connection_id"])
             self.custom_list.addItem(item)
             self.custom_select.addItem(label, c["connection_id"])
         if self._vlm.selected_connection_id:
@@ -1041,7 +1050,7 @@ class VlmSettingsDialog(QDialog):
 
     def _selected_custom_id(self) -> str | None:
         item = self.custom_list.currentItem()
-        return item.data(1000) if item else None
+        return item.data(_CUSTOM_CONNECTION_ID_ROLE) if item else None
 
     def _diagnose_one(self, cid: str) -> None:
         # 通信は UI スレッドで行わない（NFR-002）。ボタンを無効化してワーカーへ。

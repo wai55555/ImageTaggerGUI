@@ -251,7 +251,7 @@ class MainWindow(QMainWindow):
         # edit is persisted and the Undo button lights up without waiting for focus-out.
         self._caption_save_timer = QTimer(self)
         self._caption_save_timer.setSingleShot(True)
-        self._caption_save_timer.setInterval(1200)
+        self._caption_save_timer.setInterval(constants.CAPTION_AUTOSAVE_DELAY_MS)
         self._caption_save_timer.timeout.connect(self._save_current_caption)
         self.loading_timer: QTimer | None = None
         self.loading_state = 0

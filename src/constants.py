@@ -144,10 +144,29 @@ DOWNLOAD_URLS: Mapping[Path, str] = {
 }
 
 # --- Application settings ---
+# 入出力で「画像」として扱う拡張子の唯一の定義。走査側（tagging_core /
+# get_image_paths_recursive）と表示側で同じ集合を使わないと、拡張子を追加した
+# ときに片方だけ対象外になる。
 IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp']
 TAGS_PER_PAGE = 16
 TAGS_PER_PAGE_FOR_IMAGE = 20
 MAX_LOG_LINES = 1000
+
+# 進捗通知（progress_cb / progress_update）をバッチ全体で何回に間引くか。
+# これらはクロススレッドの queued signal なので、毎画像発行するとシグナルの
+# キュー投入コストが積み上がる（PR#16 レビュー指摘）。tagging / captioner / VLM の
+# 3つのループで同じ値を使う必要があるため、ここに1つだけ置く。
+PROGRESS_SIGNAL_BUDGET = 200
+
+# メイン画面とグリッド画面で共有するキャプション自動保存の遅延（ミリ秒）。
+# どちらの画面で編集しても同じ間隔で保存されるよう、値は1箇所に置く。
+CAPTION_AUTOSAVE_DELAY_MS = 1200
+
+# general / character の「最大タグ数」スライダーの上限。メイン画面のスライダーと
+# カテゴリ別「詳細」ダイアログが同じ値を使う必要がある（片方だけ変えると、同じ
+# 保存値が2画面で違う位置に見える）。
+MAX_TAGS_CAP_GENERAL = 150
+MAX_TAGS_CAP_CHARACTER = 10
 # 1バッチで書き換えたファイルがこの数を超えたら Undo スナップショットを作らない
 # （issue #10: 全ファイルの旧内容＋新内容を1つの CompositeUndoAction に抱えるとメモリを圧迫する）。
 UNDO_BATCH_SNAPSHOT_LIMIT = 500
@@ -182,3 +201,15 @@ COLOR_LOG_ERROR_DARK = "#FF6347"  # Tomato
 COLOR_LOG_INFO_DARK = "#ADD8E6"   # Light blue
 COLOR_LOG_WARN_DARK = "#FFD700"   # Gold
 COLOR_LOG_DEFAULT_DARK = "#FFFFFF" # White
+
+
+def progress_step_for(total: int, budget: int = PROGRESS_SIGNAL_BUDGET) -> int:
+    """`total` 枚の処理で、何枚ごとに進捗通知を出すかを返す。
+
+    天井除算にする: `total // budget` だと budget+1〜2*budget-1 枚で 0 になり
+    （max(1, ...) で 1 に戻され）間引きが効かない。最後の1枚は呼び出し側が必ず
+    発行して N/N（完了）に到達させる。
+    """
+    if total <= 0:
+        return 1
+    return max(1, -(-total // max(1, budget)))
