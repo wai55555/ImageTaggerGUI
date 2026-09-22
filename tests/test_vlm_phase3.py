@@ -671,15 +671,16 @@ def test_routes_recommended_tab_shows_profile_native_provider():
 
 def test_routes_recommended_tab_follows_profile_switch():
     """Switching the Caption profile combo to a Claude profile must move the
-    recommended tab's visible routes to Anthropic (+ its Vercel alias route),
-    not leave it stuck on Gemini - this reuses the existing
+    recommended tab's visible routes to Anthropic (+ its OpenRouter and Vercel
+    alias routes), not leave it stuck on Gemini - this reuses the existing
     ordered_builtin_provider_ids()/_on_profile_changed() wiring, no new
     per-profile logic. Since connection_order (default: just "gemini") has zero
     overlap with claude-opus-5's own bindings, the existing fallback in
     ordered_builtin_provider_ids() switches to *all* of that profile's bound
-    providers (anthropic + vercel), not only the first one - this is pre-existing,
-    intentional behavior (a newly selected profile becomes fully usable right
-    away), not something this UI change introduces."""
+    providers, not only the first one - this is pre-existing, intentional
+    behavior (a newly selected profile becomes fully usable right away), not
+    something this UI change introduces. The row order is the binding order:
+    Anthropic itself first, then OpenRouter, then Vercel."""
     import app_settings as A
     from vlm_settings_dialog import VlmSettingsDialog
 
@@ -689,7 +690,8 @@ def test_routes_recommended_tab_follows_profile_switch():
         idx = dlg.profile_combo.findData("claude-opus-5")
         assert idx >= 0
         dlg.profile_combo.setCurrentIndex(idx)
-        assert dlg._visible_route_cids() == ["builtin-anthropic", "builtin-vercel"]
+        assert dlg._visible_route_cids() == [
+            "builtin-anthropic", "builtin-openrouter", "builtin-vercel"]
         assert dlg._route_rows["builtin-anthropic"]["name"].isHidden() is False
         assert dlg._route_rows["builtin-gemini"]["name"].isHidden() is True
     finally:

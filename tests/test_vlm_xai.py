@@ -54,8 +54,10 @@ def test_shipped_grok_profiles() -> None:
     assert g.canonical_model_id == "grok-4.6"
     assert g.binding_for("xai").model_id == "grok-4.6"
     assert g.quantization_is_strict()  # provider_managed
-    # Grok は今のところ xai 直販のみを内蔵経路にする
-    assert set(g.bindings) == {"xai"}
+    # 内蔵経路は xai 直販と OpenRouter。並び順がフォールバックの既定順・経路欄の
+    # 表示順そのものなので、本家の xai が先で OpenRouter が次。
+    assert list(g.bindings) == ["xai", "openrouter"]
+    assert g.binding_for("openrouter").model_id == "x-ai/grok-4.6"
 
 
 def test_grok_capability_classification() -> None:

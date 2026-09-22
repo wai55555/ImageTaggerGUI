@@ -297,9 +297,10 @@ OPENAI_GPT_5_6_SOL = VlmModelProfile(
     aliases=("gpt-5.6", "openai/gpt-5.6-sol"),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-sol", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "openai/gpt-5.6-sol", ModelIdentityStatus.DECLARED),
         # 実機確認(2026-09-22): OpenRouterの実カタログに openai/gpt-5.6-sol が存在する。
+        # 本家の次は、利用者が多いOpenRouterを置く(Vercelより上)。
         "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-sol", ModelIdentityStatus.DECLARED),
+        "vercel": ModelBinding("vercel", "openai/gpt-5.6-sol", ModelIdentityStatus.DECLARED),
     },
 )
 
@@ -314,8 +315,8 @@ OPENAI_GPT_5_6_TERRA = VlmModelProfile(
     aliases=("openai/gpt-5.6-terra",),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-terra", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "openai/gpt-5.6-terra", ModelIdentityStatus.DECLARED),
         "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-terra", ModelIdentityStatus.DECLARED),
+        "vercel": ModelBinding("vercel", "openai/gpt-5.6-terra", ModelIdentityStatus.DECLARED),
     },
 )
 
@@ -330,8 +331,8 @@ OPENAI_GPT_5_6_LUNA = VlmModelProfile(
     aliases=("openai/gpt-5.6-luna",),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-luna", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "openai/gpt-5.6-luna", ModelIdentityStatus.DECLARED),
         "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-luna", ModelIdentityStatus.DECLARED),
+        "vercel": ModelBinding("vercel", "openai/gpt-5.6-luna", ModelIdentityStatus.DECLARED),
     },
 )
 
@@ -339,9 +340,23 @@ OPENAI_GPT_5_6_LUNA = VlmModelProfile(
 def _claude_profile(profile_id: str, display_name: str, model_id: str, *,
                     family: str, revision: str = "provider_managed",
                     aliases: tuple[str, ...] = (),
-                    vercel_model_id: str | None = None) -> VlmModelProfile:
-    """Anthropic の公式モデルIDを、直接APIとVercelの両経路へ束ねる。"""
+                    vercel_model_id: str | None = None,
+                    openrouter_model_id: str | None = None) -> VlmModelProfile:
+    """Anthropic の公式モデルIDを、直接API・OpenRouter・Vercelの各経路へ束ねる。
+
+    binding の並び順がそのままフォールバック経路の既定順・表示順になる
+    （vlm_config.ordered_builtin_provider_ids）。Claude は「本家の
+    Anthropic 直販が最上位、次に利用者が多い OpenRouter、最後に Vercel」
+    の順に固定する。
+
+    OpenRouter の Anthropic モデルIDは Vercel AI Gateway と同じ
+    `anthropic/<ドット表記>` 形式なので、既定では vercel_id を流用する。
+    どちらも DECLARED（推定）であり、実在確定は「モデル一覧を取得」／
+    接続診断／1枚テストの成功時に VERIFIED へ昇格させる。
+    """
     vercel_id = vercel_model_id or f"anthropic/{model_id}"
+    openrouter_id = openrouter_model_id or vercel_id
+    extra_aliases = (vercel_id,) if openrouter_id == vercel_id else (vercel_id, openrouter_id)
     return VlmModelProfile(
         profile_id=profile_id,
         display_name=display_name,
@@ -350,9 +365,11 @@ def _claude_profile(profile_id: str, display_name: str, model_id: str, *,
         base_model=model_id,
         revision=revision,
         quantization="provider_managed",
-        aliases=aliases + (vercel_id,),
+        aliases=aliases + extra_aliases,
         bindings={
             "anthropic": ModelBinding("anthropic", model_id, ModelIdentityStatus.DECLARED),
+            "openrouter": ModelBinding("openrouter", openrouter_id,
+                                       ModelIdentityStatus.DECLARED),
             "vercel": ModelBinding("vercel", vercel_id, ModelIdentityStatus.DECLARED),
         },
     )
@@ -376,22 +393,13 @@ CLAUDE_OPUS_5 = _claude_profile(
     family="Claude Opus 5",
 )
 
-CLAUDE_OPUS_4_8 = VlmModelProfile(
-    profile_id="claude-opus-4-8",
-    display_name="Claude Opus 4.8",
-    canonical_model_id="claude-opus-4-8",
+CLAUDE_OPUS_4_8 = _claude_profile(
+    "claude-opus-4-8", "Claude Opus 4.8", "claude-opus-4-8",
     family="Claude Opus 4.8",
-    base_model="claude-opus-4-8",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-opus-4-8",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-opus-4-8", ModelIdentityStatus.DECLARED),
-        # Vercelは "claude-opus-4.8"(ドット表記)。2026-09-22の実機確認で、
-        # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
-        "vercel": ModelBinding("vercel", "anthropic/claude-opus-4.8",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-opus-4.8"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-opus-4.8",
 )
 
 CLAUDE_OPUS_4_6 = _claude_profile(
@@ -412,40 +420,22 @@ CLAUDE_SONNET_5 = _claude_profile(
     family="Claude Sonnet 5",
 )
 
-CLAUDE_OPUS_4_7 = VlmModelProfile(
-    profile_id="claude-opus-4-7",
-    display_name="Claude Opus 4.7",
-    canonical_model_id="claude-opus-4-7",
+CLAUDE_OPUS_4_7 = _claude_profile(
+    "claude-opus-4-7", "Claude Opus 4.7", "claude-opus-4-7",
     family="Claude Opus 4.7",
-    base_model="claude-opus-4-7",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-opus-4-7",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-opus-4-7", ModelIdentityStatus.DECLARED),
-        # Vercelは "claude-opus-4.7"(ドット表記)。2026-09-22の実機確認で、
-        # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
-        "vercel": ModelBinding("vercel", "anthropic/claude-opus-4.7",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-opus-4.7"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-opus-4.7",
 )
 
-CLAUDE_SONNET_4_6 = VlmModelProfile(
-    profile_id="claude-sonnet-4-6",
-    display_name="Claude Sonnet 4.6",
-    canonical_model_id="claude-sonnet-4-6",
+CLAUDE_SONNET_4_6 = _claude_profile(
+    "claude-sonnet-4-6", "Claude Sonnet 4.6", "claude-sonnet-4-6",
     family="Claude Sonnet 4.6",
-    base_model="claude-sonnet-4-6",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-sonnet-4-6",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-sonnet-4-6", ModelIdentityStatus.DECLARED),
-        # Vercelは "claude-sonnet-4.6"(ドット表記)。2026-09-22の実機確認で、
-        # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
-        "vercel": ModelBinding("vercel", "anthropic/claude-sonnet-4.6",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-sonnet-4.6"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-sonnet-4.6",
 )
 
 CLAUDE_SONNET_4_5 = _claude_profile(
@@ -455,29 +445,22 @@ CLAUDE_SONNET_4_5 = _claude_profile(
     vercel_model_id="anthropic/claude-sonnet-4.5",
 )
 
-CLAUDE_HAIKU_4_5 = VlmModelProfile(
-    profile_id="claude-haiku-4-5",
-    display_name="Claude Haiku 4.5",
-    canonical_model_id="claude-haiku-4-5-20251001",
-    family="Claude Haiku 4.5",
-    base_model="claude-haiku-4-5-20251001",
-    revision="20251001",
-    quantization="provider_managed",
-    aliases=("claude-haiku-4-5", "anthropic/claude-haiku-4.5"),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-haiku-4-5-20251001",
-                                  ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "anthropic/claude-haiku-4.5",
-                                ModelIdentityStatus.DECLARED),
-    },
+CLAUDE_HAIKU_4_5 = _claude_profile(
+    "claude-haiku-4-5", "Claude Haiku 4.5", "claude-haiku-4-5-20251001",
+    family="Claude Haiku 4.5", revision="20251001",
+    aliases=("claude-haiku-4-5",),
+    vercel_model_id="anthropic/claude-haiku-4.5",
 )
 
 def _grok_profile(profile_id: str, display_name: str, model_id: str, *,
                   family: str) -> VlmModelProfile:
-    """xAI Grok の公式モデルIDを、xAI 直接APIの経路へ束ねる。
+    """xAI Grok の公式モデルIDを、xAI 直接APIと OpenRouter の両経路へ束ねる。
 
-    Grok は現在 xAI 直販のみを内蔵経路にする（OpenRouter 等の同一モデル ID は
-    利用者がプロファイルエディタで実在確認のうえ追加できる）。
+    他の内蔵プロファイルと同じく「本家の直販が最上位、次に利用者が多い
+    OpenRouter」の順。OpenRouter 側の ID は `x-ai/<公式ID>` で、状態は
+    DECLARED（推定）。実在確定は「モデル一覧を取得」／接続診断／1枚テストの
+    成功時に VERIFIED へ昇格させる。Vercel AI Gateway は Grok 経路として
+    未検証なので内蔵しない（利用者がプロファイルエディタで追加できる）。
     """
     return VlmModelProfile(
         profile_id=profile_id,
@@ -490,6 +473,8 @@ def _grok_profile(profile_id: str, display_name: str, model_id: str, *,
         aliases=(profile_id, f"x-ai/{model_id}", f"xai/{model_id}"),
         bindings={
             "xai": ModelBinding("xai", model_id, ModelIdentityStatus.DECLARED),
+            "openrouter": ModelBinding("openrouter", f"x-ai/{model_id}",
+                                       ModelIdentityStatus.DECLARED),
         },
     )
 

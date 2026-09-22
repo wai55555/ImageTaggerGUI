@@ -708,8 +708,10 @@ def test_multi_provider_profiles():
         "openrouter"]
     auth = {cid: True for cid in gpt_cm}
     paid_direct = R.select_candidates(gpt, gpt_cm, R.RouterPolicy(), has_auth=auth)
+    # Binding order is the fallback order: the model's own vendor first, then
+    # OpenRouter (the aggregator most users already hold a key for), then Vercel.
     assert paid_direct.connection_ids == [
-        "builtin-openai", "builtin-vercel", "builtin-openrouter"]
+        "builtin-openai", "builtin-openrouter", "builtin-vercel"]
     claude_settings = _s("claude-haiku-4-5")
     claude_settings.anthropic_workspace_id = "wrkspc_test123"
     claude = CFG.resolve_model_profile(claude_settings)
@@ -719,12 +721,21 @@ def test_multi_provider_profiles():
     assert claude_cm["builtin-anthropic"].request_headers == {
         "anthropic-workspace-id": "wrkspc_test123"}
     assert claude_cm["builtin-vercel"].model_id == "anthropic/claude-haiku-4.5"
-    assert CFG.ordered_builtin_provider_ids(claude_settings, claude) == [
-        "anthropic", "vercel"]
+    # OpenRouter serves the Anthropic models under the same "anthropic/<dotted>"
+    # id as the Vercel AI Gateway, so Claude profiles bind it too (it used to be
+    # missing entirely: the route showed up blank and unclickable even though
+    # "get model list" listed the model - reported 2026-09-22).
+    assert claude_cm["builtin-openrouter"].model_id == "anthropic/claude-haiku-4.5"
+    # _s()'s synthetic connection_order ["gemini", "openrouter", "cloudflare"]
+    # now overlaps this profile (via openrouter), so the intersection branch
+    # applies and narrows to the entries the user already had enabled, instead
+    # of the fallback-to-all-bindings branch this hit before the binding existed.
+    assert CFG.ordered_builtin_provider_ids(claude_settings, claude) == ["openrouter"]
     claude_paid = R.select_candidates(
         claude, claude_cm, R.RouterPolicy(),
         has_auth={cid: True for cid in claude_cm})
-    assert claude_paid.connection_ids == ["builtin-anthropic", "builtin-vercel"]
+    assert claude_paid.connection_ids == [
+        "builtin-anthropic", "builtin-openrouter", "builtin-vercel"]
 
     for profile_id, provider, model_id in (
         ("openai-gpt-5.6-sol", "openai", "gpt-5.6-sol"),
@@ -754,6 +765,47 @@ def test_multi_provider_profiles():
     assert CFG.build_connection_map(s, prof)["builtin-groq"].model_id == "qwen/qwen3.8-27b"
     CFG.set_model_id_override(s, "groq", "", profile_id="qwen3.8-27b")
     print("  multi-provider profiles: HF opt-in, OVH disabled, model-id override: OK")
+
+
+def test_builtin_binding_order_puts_vendor_then_openrouter_then_vercel():
+    """binding の並び順がそのままフォールバックの既定順・経路欄の表示順になる
+    (vlm_config.ordered_builtin_provider_ids)。全内蔵プロファイルで
+    「そのモデル本家の直販 → OpenRouter → Vercel」に揃っていることを固定する。
+
+    260922 の報告: Claude プロファイルに openrouter binding が丸ごと無く、
+    OpenRouter のモデル一覧には Claude があるのに経路として選べなかった。
+    また GPT だけ Vercel が OpenRouter より上に並んでいた。
+    """
+    reg = M.default_registry()
+    # 「本家」= そのモデルを出しているベンダー自身の直販API。
+    vendor_by_family = {
+        "claude": "anthropic", "gpt-5.6": "openai", "gemma": "gemini", "grok": "xai",
+    }
+    aggregators = ("openrouter", "vercel")
+    checked_claude = 0
+    for profile in reg.all_profiles():
+        providers = list(profile.bindings)
+        pid = profile.profile_id
+        vendor = next((v for k, v in vendor_by_family.items() if pid.startswith(k)
+                       or profile.family.lower().startswith(k)), None)
+        if vendor is not None and vendor in providers:
+            assert providers[0] == vendor, (pid, providers)
+        # Aggregator 同士の相対順は、利用者が多い OpenRouter を先に置く。
+        present = [p for p in providers if p in aggregators]
+        assert present == [p for p in aggregators if p in providers], (pid, providers)
+        if pid.startswith("claude"):
+            checked_claude += 1
+            # OpenRouter の Anthropic モデルIDは Vercel AI Gateway と同じ
+            # "anthropic/<ドット表記>"。両者が食い違っていたら片方が誤り。
+            assert providers == ["anthropic", "openrouter", "vercel"], (pid, providers)
+            assert (profile.bindings["openrouter"].model_id
+                    == profile.bindings["vercel"].model_id), pid
+            assert profile.bindings["openrouter"].model_id.startswith("anthropic/")
+            # 経路として実際に選べる(=VLM非対応として弾かれない)こと。
+            assert M.is_vlm_model_id(profile, "openrouter",
+                                     profile.bindings["openrouter"].model_id)
+    assert checked_claude == 11, checked_claude
+    print("  builtin binding order: vendor -> OpenRouter -> Vercel, Claude included: OK")
 
 
 def test_default_vlm_profile_and_fallback_order():
