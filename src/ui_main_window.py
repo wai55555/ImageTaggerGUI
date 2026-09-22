@@ -40,7 +40,7 @@ class Ui_MainWindow(object):
         except (ValueError, IndexError):
             main_window.resize(950, 720)
             main_window.move(50, 50)
-        
+
         main_window.setAcceptDrops(True)
 
         # Central stacked widget for view switching
@@ -54,7 +54,14 @@ class Ui_MainWindow(object):
         # Grid View Setup
         main_window.grid_view_widget = GridViewWidget(main_window.settings, main_window.locale_manager)
         main_window.central_widget.addWidget(main_window.grid_view_widget)
-        
+
+        # ここで初めて main_window の全ウィジェット階層が実際に接続された状態になる。
+        # vlm_settings_button等の初期表示/非表示は、親が確定するこの後まで遅らせる
+        # (_create_input_group() 内のコメント参照)。
+        main_window.vlm_settings_button.setVisible(main_window._initial_vlm_visible)  # type: ignore
+        main_window.vlm_single_test_button.setVisible(main_window._initial_vlm_visible)  # type: ignore
+        main_window.use_gpu_check.setVisible(main_window._initial_gpu_visible)  # type: ignore
+
         self._connect_signals(main_window)
         main_window._check_model_status_and_update_ui(auto_start_download=True)  # type: ignore
 
@@ -188,12 +195,21 @@ class Ui_MainWindow(object):
         main_window.vlm_settings_button.clicked.connect(main_window._open_vlm_settings)  # type: ignore
         main_window.vlm_single_test_button.clicked.connect(main_window._run_vlm_single_test)  # type: ignore
         _vlm_on = bool(getattr(main_window.settings.vlm, "enabled", False))
-        main_window.vlm_settings_button.setVisible(_vlm_on)
-        main_window.vlm_single_test_button.setVisible(_vlm_on)
         vlm_row.addWidget(main_window.use_vlm_check)
         vlm_row.addWidget(main_window.vlm_settings_button)
         vlm_row.addWidget(main_window.vlm_single_test_button)
         vlm_row.addStretch(1)
+        # setVisible(True) はここでは呼ばない。addWidget() で vlm_row に入れても、
+        # vlm_row自体・この関数が組み立てているgroup自体が、まだmain_windowの本物の
+        # ウィジェット階層に接続されていない(呼び出し元の_create_main_view()がまだ
+        # main_widgetをどこにも addWidget() していない段階)。この状態でsetVisible(True)
+        # を呼ぶと、一瞬「親を辿った先がどこにも繋がっていない」= 実質トップレベル
+        # ウィンドウとしてOSに実ウィンドウが生成されてしまう(実機のウィンドウ列挙 +
+        # pdbでの実行トレースで確認。vlm_settings_dialog.pyの同種バグと同じ原因だが、
+        # そちらは1階層、こちらはネストが深く addWidget() の後という条件だけでは
+        # 不十分だった)。setup_ui() の最後、main_window への接続が全て終わった後に
+        # まとめて設定する(このため _vlm_on を main_window へ一時保存しておく)。
+        main_window._initial_vlm_visible = _vlm_on  # type: ignore
 
         # GPU/CPU トグル（同じ行の右端）。NVIDIA GPUが実際に使える場合、つまり
         # onnxruntime-gpuビルド（静的な対応可否）かつGPUコンポーネント導入済みの
@@ -211,13 +227,14 @@ class Ui_MainWindow(object):
                               and onnx_providers.gpu_runtime_ready())
         except Exception:
             gpu_usable = False
-        main_window.use_gpu_check.setVisible(gpu_usable)
         # setChecked() before connecting toggled: matches use_vlm_check above -
         # otherwise this fires _on_use_gpu_toggled during construction and can
         # collapse an "auto" onnx_device setting to "cuda"/"cpu" unasked.
         main_window.use_gpu_check.setChecked(main_window.settings.behavior.onnx_device != "cpu")
         main_window.use_gpu_check.toggled.connect(main_window._on_use_gpu_toggled)  # type: ignore
         vlm_row.addWidget(main_window.use_gpu_check)
+        # setVisible(True) はここでは呼ばない(理由は上のvlm_settings_button等と同じ)。
+        main_window._initial_gpu_visible = gpu_usable  # type: ignore
 
         layout.addLayout(vlm_row)
         return group
