@@ -14,6 +14,31 @@ from typing import Protocol
 from utils import write_debug_log
 
 
+def _desc(key: str, **kwargs: object) -> str:
+    """Undo 説明文を lang/*.ini の [MainWindow] から引く。
+
+    UndoAction は main_window / grid_view_widget / 各ワーカーなど多くの場所で
+    生成され、その大半は LocaleManager を持っていない。そのため app_settings が
+    公開している「後から差し込まれる」get_string（MainWindow が起動時に
+    set_get_string_func() で配線する）を遅延インポートで使う
+    ——utils._uncaught_error_strings() と同じやり方で、import 時の循環も避ける。
+
+    description() が呼ばれるのは表示のタイミング（ツールチップ生成時）なので、
+    履歴を積んだ後に言語を切り替えても次の再描画で追従する。ここで文字列を
+    確定させてしまうと、積んだ時点の言語で固定されてしまう。
+
+    配線前（QApplication も LocaleManager も無い単体テスト等）は
+    app_settings._get_string が default_get_string_fallback のままでキーを
+    そのまま返す。表示経路には乗らないので実害は無いが、description() が
+    何も返さないより追跡しやすい。
+    """
+    try:
+        from app_settings import _get_string
+        return _get_string("MainWindow", key, **kwargs)
+    except Exception:  # 配線前・import 失敗時でも description() は失敗させない
+        return key
+
+
 def _long_path_str(path: Path) -> str:
     """Windows の MAX_PATH（260文字）制限を避ける `\\\\?\\` プレフィックス付き絶対パス。
 
@@ -140,13 +165,13 @@ class AddTagsAction(UndoAction):
             return False
     
     def description(self) -> str:
-        """Return a description of this action."""
+        """Return a localized description of this action."""
         if len(self.added_tags) == 1:
-            return f"「{self.added_tags[0]}」の追加"
-        elif len(self.added_tags) <= 3:
-            return f"「{', '.join(self.added_tags)}」の追加"
-        else:
-            return f"「{', '.join(self.added_tags[:3])}...」など{len(self.added_tags)}個のタグの追加"
+            return _desc("Undo_Desc_Add_Tag", tag=self.added_tags[0])
+        if len(self.added_tags) <= 3:
+            return _desc("Undo_Desc_Add_Tags", tags=", ".join(self.added_tags))
+        return _desc("Undo_Desc_Add_Tags_Many",
+                     tags=", ".join(self.added_tags[:3]), count=len(self.added_tags))
 
 
 @dataclass
@@ -216,8 +241,8 @@ class RemoveTagAction(UndoAction):
             return False
     
     def description(self) -> str:
-        """Return a description of this action."""
-        return f"「{self.removed_tag}」の削除"
+        """Return a localized description of this action."""
+        return _desc("Undo_Desc_Remove_Tag", tag=self.removed_tag)
 
 
 @dataclass
@@ -262,7 +287,7 @@ class EditCaptionAction(UndoAction):
         return self._write(self.new_text)
 
     def description(self) -> str:
-        return "キャプションの編集"
+        return _desc("Undo_Desc_Edit_Caption")
 
 
 @dataclass
@@ -316,7 +341,7 @@ class OverwriteFileAction(_FileSnapshotAction):
     """タグ付けバッチによる1ファイルの上書き / 新規作成（spec.md 4.1節）。"""
 
     def description(self) -> str:
-        return f"「{self.file_path.name}」の上書き"
+        return _desc("Undo_Desc_Overwrite_File", name=self.file_path.name)
 
 
 @dataclass
@@ -329,7 +354,8 @@ class AppendTagsActionV2(_FileSnapshotAction):
     added_tags: list[str]
 
     def description(self) -> str:
-        return f"「{self.file_path.name}」へ{len(self.added_tags)}件のタグを追記"
+        return _desc("Undo_Desc_Append_Tags", name=self.file_path.name,
+                     count=len(self.added_tags))
 
 
 @dataclass
@@ -352,9 +378,11 @@ class CompositeUndoAction(UndoAction):
         return any(results)
 
     def description(self) -> str:
+        # label は生成側（main_window）が [MainWindow] Undo_Batch_Tagging から
+        # 翻訳して渡す。空のときだけここで既定の説明文を引く。
         if self.label:
             return self.label
-        return f"タグ付けによる{len(self.actions)}ファイルの変更"
+        return _desc("Undo_Desc_Batch_Change", count=len(self.actions))
 
 
 @dataclass
@@ -440,11 +468,12 @@ class BulkAddTagsAction(UndoAction):
         return success_count > 0
     
     def description(self) -> str:
-        """Return a description of this action."""
+        """Return a localized description of this action."""
         if len(self.added_tags) == 1:
-            return f"「{self.added_tags[0]}」の一括追加（{len(self.file_paths)}ファイル）"
-        else:
-            return f"{len(self.added_tags)}個のタグの一括追加（{len(self.file_paths)}ファイル）"
+            return _desc("Undo_Desc_Bulk_Add_Tag", tag=self.added_tags[0],
+                         count=len(self.file_paths))
+        return _desc("Undo_Desc_Bulk_Add_Tags", tag_count=len(self.added_tags),
+                     count=len(self.file_paths))
 
 
 @dataclass
@@ -520,8 +549,9 @@ class BulkRemoveTagsAction(UndoAction):
         return success_count > 0
     
     def description(self) -> str:
-        """Return a description of this action."""
-        return f"「{self.removed_tag}」の一括削除（{len(self.file_tag_positions)}ファイル）"
+        """Return a localized description of this action."""
+        return _desc("Undo_Desc_Bulk_Remove_Tag", tag=self.removed_tag,
+                     count=len(self.file_tag_positions))
 
 
 class UndoManager:
