@@ -40,7 +40,7 @@ class Ui_MainWindow(object):
         except (ValueError, IndexError):
             main_window.resize(950, 720)
             main_window.move(50, 50)
-        
+
         main_window.setAcceptDrops(True)
 
         # Central stacked widget for view switching
@@ -54,7 +54,14 @@ class Ui_MainWindow(object):
         # Grid View Setup
         main_window.grid_view_widget = GridViewWidget(main_window.settings, main_window.locale_manager)
         main_window.central_widget.addWidget(main_window.grid_view_widget)
-        
+
+        # ここで初めて main_window の全ウィジェット階層が実際に接続された状態になる。
+        # vlm_settings_button等の初期表示/非表示は、親が確定するこの後まで遅らせる
+        # (_create_input_group() 内のコメント参照)。
+        main_window.vlm_settings_button.setVisible(main_window._initial_vlm_visible)  # type: ignore
+        main_window.vlm_single_test_button.setVisible(main_window._initial_vlm_visible)  # type: ignore
+        main_window.use_gpu_check.setVisible(main_window._initial_gpu_visible)  # type: ignore
+
         self._connect_signals(main_window)
         main_window._check_model_status_and_update_ui(auto_start_download=True)  # type: ignore
 
@@ -145,6 +152,9 @@ class Ui_MainWindow(object):
         browse_button = QPushButton(main_window.locale_manager.get_string("MainWindow", "Browse_Button"))
         browse_button.clicked.connect(main_window.browse_folder)
         
+        # 「3x3 edit」はどの言語でも訳さずそのまま出す（"3x3 編集" のように
+        # 半角数字と訳語が混ざると見栄えが悪い、との判断。ツールチップ側は
+        # Switch_To_Grid_View で訳される）。
         main_window.grid_view_button = QPushButton("3x3 edit")
         main_window.grid_view_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Switch_To_Grid_View"))
         main_window.grid_view_button.clicked.connect(main_window._show_grid_view)  # type: ignore
@@ -188,12 +198,21 @@ class Ui_MainWindow(object):
         main_window.vlm_settings_button.clicked.connect(main_window._open_vlm_settings)  # type: ignore
         main_window.vlm_single_test_button.clicked.connect(main_window._run_vlm_single_test)  # type: ignore
         _vlm_on = bool(getattr(main_window.settings.vlm, "enabled", False))
-        main_window.vlm_settings_button.setVisible(_vlm_on)
-        main_window.vlm_single_test_button.setVisible(_vlm_on)
         vlm_row.addWidget(main_window.use_vlm_check)
         vlm_row.addWidget(main_window.vlm_settings_button)
         vlm_row.addWidget(main_window.vlm_single_test_button)
         vlm_row.addStretch(1)
+        # setVisible(True) はここでは呼ばない。addWidget() で vlm_row に入れても、
+        # vlm_row自体・この関数が組み立てているgroup自体が、まだmain_windowの本物の
+        # ウィジェット階層に接続されていない(呼び出し元の_create_main_view()がまだ
+        # main_widgetをどこにも addWidget() していない段階)。この状態でsetVisible(True)
+        # を呼ぶと、一瞬「親を辿った先がどこにも繋がっていない」= 実質トップレベル
+        # ウィンドウとしてOSに実ウィンドウが生成されてしまう(実機のウィンドウ列挙 +
+        # pdbでの実行トレースで確認。vlm_settings_dialog.pyの同種バグと同じ原因だが、
+        # そちらは1階層、こちらはネストが深く addWidget() の後という条件だけでは
+        # 不十分だった)。setup_ui() の最後、main_window への接続が全て終わった後に
+        # まとめて設定する(このため _vlm_on を main_window へ一時保存しておく)。
+        main_window._initial_vlm_visible = _vlm_on  # type: ignore
 
         # GPU/CPU トグル（同じ行の右端）。NVIDIA GPUが実際に使える場合、つまり
         # onnxruntime-gpuビルド（静的な対応可否）かつGPUコンポーネント導入済みの
@@ -211,13 +230,14 @@ class Ui_MainWindow(object):
                               and onnx_providers.gpu_runtime_ready())
         except Exception:
             gpu_usable = False
-        main_window.use_gpu_check.setVisible(gpu_usable)
         # setChecked() before connecting toggled: matches use_vlm_check above -
         # otherwise this fires _on_use_gpu_toggled during construction and can
         # collapse an "auto" onnx_device setting to "cuda"/"cpu" unasked.
         main_window.use_gpu_check.setChecked(main_window.settings.behavior.onnx_device != "cpu")
         main_window.use_gpu_check.toggled.connect(main_window._on_use_gpu_toggled)  # type: ignore
         vlm_row.addWidget(main_window.use_gpu_check)
+        # setVisible(True) はここでは呼ばない(理由は上のvlm_settings_button等と同じ)。
+        main_window._initial_gpu_visible = gpu_usable  # type: ignore
 
         layout.addLayout(vlm_row)
         return group
@@ -253,7 +273,8 @@ class Ui_MainWindow(object):
         header_layout.addStretch(1)
         
         # Undo button
-        main_window.undo_button = QPushButton("↶ Undo")
+        main_window.undo_button = QPushButton(
+            main_window.locale_manager.get_string("MainWindow", "Undo_Button"))
         main_window.undo_button.setEnabled(False)
         main_window.undo_button.setMaximumWidth(80)
         main_window.undo_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Undo_No_Actions"))
@@ -261,7 +282,8 @@ class Ui_MainWindow(object):
         header_layout.addWidget(main_window.undo_button)
         
         # Redo button
-        main_window.redo_button = QPushButton("↷ Redo")
+        main_window.redo_button = QPushButton(
+            main_window.locale_manager.get_string("MainWindow", "Redo_Button"))
         main_window.redo_button.setEnabled(False)
         main_window.redo_button.setMaximumWidth(80)
         main_window.redo_button.setToolTip(main_window.locale_manager.get_string("MainWindow", "Redo_No_Actions"))
@@ -495,8 +517,10 @@ class Ui_MainWindow(object):
         # Minimum is 0, not 1: inference treats a 0 max-tag count as "emit nothing from
         # this category", and the per-category dialog offers 0. With a minimum of 1 the
         # slider silently clamped a stored 0 back up to 1 when the two were synced.
-        main_window.create_slider_group(limit_layout, 'Limits', 0, 150, 1, {'general': 0})
-        main_window.create_slider_group(limit_layout, 'Limits', 0, 10, 1, {'character': 1})
+        main_window.create_slider_group(limit_layout, 'Limits', 0,
+                                        constants.MAX_TAGS_CAP_GENERAL, 1, {'general': 0})
+        main_window.create_slider_group(limit_layout, 'Limits', 0,
+                                        constants.MAX_TAGS_CAP_CHARACTER, 1, {'character': 1})
 
         # Opens the per-category (rating / copyright / artist / meta ...) threshold &
         # max-tag dialog. Per user request (2026-08-31, after several layout attempts):

@@ -54,6 +54,49 @@ def _patch(monkey):
     return old
 
 
+def test_retry_policy_default_read_timeout_is_60s():
+    """Pinned so nobody silently raises this back toward the old 120s default -
+    with retry_same_max=1 and multiple candidate connections it multiplies into
+    several minutes of a silent, apparently-frozen UI per image."""
+    from vlm_connections import RetryPolicy
+    assert RetryPolicy().read_timeout_s == 60.0
+
+
+def test_adaptive_read_timeout_scales_with_max_output_tokens():
+    """A real 11-image GUI batch with the default maximum_detail profile
+    (max_output_tokens=3072) showed legitimate Gemini generations taking
+    40-70s, some tripping the flat 60s timeout and wasting ~2min/image on a
+    pointless retry+failover before an also-rate-limited fallback failed
+    instantly. The timeout must scale up for large output budgets, but stay
+    capped so a genuinely dead connection (the original NVIDIA problem) still
+    fails in bounded time."""
+    from vlm_transport import adaptive_read_timeout
+    assert adaptive_read_timeout(60.0, 3072) == 90.0          # default profile: capped at 1.5x
+    assert adaptive_read_timeout(60.0, 2048) == 60.0           # baseline: no change
+    assert adaptive_read_timeout(60.0, 512) == 60.0            # small budget: never shrinks below base
+    assert adaptive_read_timeout(60.0, 8192) == 90.0           # very large budget: still capped at 1.5x
+    assert adaptive_read_timeout(60.0, 0) == 60.0              # no tokens configured: unchanged
+
+
+def test_executor_passes_adaptive_timeout_to_execute_http():
+    seen = {}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        seen["read_timeout"] = read_timeout
+        return RawHttpResponse(200, {}, _ok_body(), "")
+
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor({"a": _conn("a")}, lambda ref: None)
+        spec = _spec()
+        spec["profile"] = GenerationProfile(max_output_tokens=3072)
+        res = ex.caption_one(spec, ["a"])
+        assert res.ok
+        assert seen["read_timeout"] == 90.0
+    finally:
+        T.execute_http = old
+
+
 def test_success_first_connection():
     conns = {"a": _conn("a"), "b": _conn("b")}
     r = _Responder({"x/v1": [RawHttpResponse(200, {}, _ok_body("first"), "")]})
@@ -155,6 +198,113 @@ def test_timeout_retry_then_failover():
     finally:
         T.execute_http = old
     print("  timeout -> retry_same once -> failover: OK")
+
+
+def test_chronically_timing_out_connection_gets_excluded_after_two_images():
+    """A connection that times out on EVERY attempt across two whole images
+    (2 x (initial + retry_same_max retries)) must be excluded for the rest of
+    the session - but not after just one bad image, since a real connection
+    (Gemini) was observed timing out on one image and then succeeding
+    normally on the next (2026-09 VLM debugging, real 11-image batch). A
+    too-eager 1-image threshold caused that still-working connection to be
+    excluded, which combined with another connection's rate-limit cooldown
+    left zero live candidates and silently abandoned 7 of 11 images."""
+    conns = {"a": _conn("a"), "b": _conn("b")}
+    # Both connections share a base_url in this test helper, so the responder
+    # can't tell "a" from "b" by request content - script by call index
+    # instead, matching the exact expected sequence: image1 tries a twice
+    # (timeout, timeout) then falls over to b (success); image2 repeats that
+    # on a (now excluded) then succeeds on b; image3 only ever reaches b.
+    script = [
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 1"),   # image1: a attempt 1
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 2"),   # image1: a attempt 2 (retry)
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image1: b
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 3"),   # image2: a attempt 1
+        VlmAttemptError(VlmErrorReason.TIMEOUT, None, "timeout 4"),   # image2: a attempt 2 (retry)
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image2: b
+        RawHttpResponse(200, {}, _ok_body("b ok"), ""),                # image3: b only (a excluded)
+    ]
+    calls = {"n": 0}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        result = script[calls["n"]]
+        calls["n"] += 1
+        return result
+
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor(conns, lambda ref: None)
+
+        # Image 1: "a" times out on both attempts, but that is only one
+        # image's worth (consecutive_timeouts=2 < threshold 4) - failover to
+        # "b", and "a" must remain a live candidate for the next image.
+        res1 = ex.caption_one(_spec(), ["a", "b"])
+        assert res1.ok and res1.connection_id == "b"
+        assert calls["n"] == 3
+        assert not ex.runtime("a").is_excluded, \
+            "a must NOT be excluded after just one bad image - it may just be having a rough moment"
+        assert ex.live_candidates(["a", "b"]) == ["a", "b"]
+
+        # Image 2: "a" times out on both attempts again - now two whole
+        # images' worth of all-timeout attempts (consecutive_timeouts=4) -
+        # this time it gets excluded.
+        res2 = ex.caption_one(_spec(), ex.live_candidates(["a", "b"]))
+        assert res2.ok and res2.connection_id == "b"
+        assert calls["n"] == 6
+        assert ex.runtime("a").is_excluded, "a must be excluded after two whole images of all-timeout attempts"
+        assert ex.runtime("a").excluded_reason == "timeout"
+
+        # Image 3: "a" must no longer even be attempted.
+        live = ex.live_candidates(["a", "b"])
+        assert live == ["b"]
+        res3 = ex.caption_one(_spec(), live)
+        assert res3.ok and res3.connection_id == "b"
+        assert calls["n"] == 7, "excluded connection must not be retried on later images"
+    finally:
+        T.execute_http = old
+    print("  chronic timeout across 2 images -> excluded, not retried later; 1 bad image alone is not enough: OK")
+
+
+def test_on_attempt_start_fires_before_each_http_call():
+    """`on_attempt_start` must fire once per HTTP attempt, in order, with the
+    connection object and a 1-based same-connection attempt counter - this is
+    what lets the UI show "requesting X..." while a request (up to
+    read_timeout_s, default 60s) is still in flight instead of going silent."""
+    conns = {"a": _conn("a"), "b": _conn("b")}
+
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+        if responder.n < 2:
+            responder.n += 1
+            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, f"timeout {responder.n}")
+        return RawHttpResponse(200, {}, _ok_body("b ok"), "")
+    responder.n = 0
+    old = _patch(responder)
+    calls = []
+    try:
+        ex = VlmExecutor(conns, lambda ref: None,
+                         on_attempt_start=lambda conn, attempt: calls.append((conn.connection_id, attempt)))
+        res = ex.caption_one(_spec(), ["a", "b"])
+        assert res.ok and res.connection_id == "b"
+        assert calls == [("a", 1), ("a", 2), ("b", 1)]
+    finally:
+        T.execute_http = old
+    print("  on_attempt_start fires per attempt with connection + attempt number: OK")
+
+
+def test_on_attempt_start_exception_does_not_break_the_request():
+    """A broken callback (UI-side bug) must not prevent the actual HTTP attempt
+    from happening - it is a notification hook, not part of the request logic."""
+    conn = _conn("a")
+    responder = _Responder({"x/v1": [RawHttpResponse(200, {}, _ok_body("still works"), "")]})
+    old = _patch(responder)
+    try:
+        ex = VlmExecutor({"a": conn}, lambda ref: None,
+                         on_attempt_start=lambda conn, attempt: (_ for _ in ()).throw(RuntimeError("boom")))
+        res = ex.caption_one(_spec(), ["a"])
+        assert res.ok and res.text == "still works"
+    finally:
+        T.execute_http = old
+    print("  on_attempt_start callback failure does not break the request: OK")
 
 
 def test_auth_error_excludes_connection():
@@ -420,11 +570,11 @@ def test_diagnostics_live_extraction_branches():
     def _cls(body, text="{}"):
         return D._classify_extraction(RawHttpResponse(200, {}, body, text), proto)
 
-    st, _ = _cls({"candidates": [{"content": {"parts": [{"text": "a cat"}]}, "finishReason": "STOP"}]})
+    st, *_ = _cls({"candidates": [{"content": {"parts": [{"text": "a cat"}]}, "finishReason": "STOP"}]})
     assert st is D.DiagStatus.PASS
 
     # low token cap -> no parts, finishReason MAX_TOKENS: endpoint is fine -> WARN not FAIL
-    st, _ = _cls({"candidates": [{"finishReason": "MAX_TOKENS"}], "usageMetadata": {}})
+    st, *_ = _cls({"candidates": [{"finishReason": "MAX_TOKENS"}], "usageMetadata": {}})
     assert st is D.DiagStatus.WARN
 
     cf_error = RawHttpResponse(403, {}, {
@@ -439,28 +589,31 @@ def test_diagnostics_live_extraction_branches():
     assert not D.is_billing_or_credit_block("Invalid API key")
 
     # genuinely wrong shape -> FAIL with a body preview
-    st, detail = _cls({"unexpected": "shape"}, '{"unexpected": "shape"}')
+    st, detail, key, _args, preview = _cls({"unexpected": "shape"}, '{"unexpected": "shape"}')
     assert st is D.DiagStatus.FAIL and "unexpected" in detail
+    # 表示用は翻訳キー + 素のレスポンス本文プレビュー（本文は訳さない）。
+    assert key == "Diag_D_Extract_Path_Mismatch"
+    assert "unexpected" in preview
 
     # non-200 -> SKIP (nothing to extract)
-    st, _ = D._classify_extraction(RawHttpResponse(500, {}, {}, "boom"), proto)
+    st, *_ = D._classify_extraction(RawHttpResponse(500, {}, {}, "boom"), proto)
     assert st is D.DiagStatus.SKIP
 
     responses = get_protocol("openai_responses")
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"},
         "output": []}, "{}"), responses)
     assert st is D.DiagStatus.WARN
 
     anthropic = get_protocol("anthropic_messages")
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "content": [], "stop_reason": "max_tokens"}, "{}"), anthropic)
     assert st is D.DiagStatus.WARN
 
     # A custom extraction path must not bypass protocol-level safety signals.
     custom_gemini = get_protocol("gemini_generate_content")
     custom_gemini.default_text_path = "custom.caption"
-    st, _ = D._classify_extraction(RawHttpResponse(200, {}, {
+    st, *_ = D._classify_extraction(RawHttpResponse(200, {}, {
         "promptFeedback": {"blockReason": "SAFETY"},
         "custom": {"caption": "misleading text"},
     }, "{}"), custom_gemini, "custom.caption")
@@ -706,7 +859,12 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
     s.behavior.existing_file_mode = "APPEND"
     s.caption.placement = "APPEND"
 
-    # make all three builtin bindings verified + provide fake auth + mock http
+    # make all three builtin bindings verified + provide fake auth + mock http.
+    # This test relies on gemini failing to parse the OpenAI-shaped mock body
+    # (gemini's real protocol expects a different JSON shape) and falling over to
+    # openrouter, which does parse it - so it needs multiple candidates regardless
+    # of the shipped DEFAULT_VLM_CONNECTION_ORDER (now just "gemini").
+    s.vlm.connection_order = "gemini,openrouter,cloudflare"
     import vlm_models as M, dataclasses, vlm_secrets, vlm_config
     verified = {pid: dataclasses.replace(b, identity_status=M.ModelIdentityStatus.VERIFIED, provider_constraint=None)
                for pid, b in M.GEMMA_4_26B_A4B_IT.bindings.items()}
@@ -715,10 +873,13 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
         lambda v: dataclasses.replace(M.GEMMA_4_26B_A4B_IT, bindings=verified))
     monkeypatch.setattr(vlm_secrets, "get_secret", lambda ref: "FAKEKEY")
 
-    monkeypatch.setattr(
-        T, "execute_http",
-        lambda req, **kw: RawHttpResponse(
-            200, {}, _ok_body("a detailed natural language description of the scene"), ""))
+    http_calls = []
+
+    def fake_http(req, **kw):
+        http_calls.append(req.url)
+        return RawHttpResponse(
+            200, {}, _ok_body("a detailed natural language description of the scene"), "")
+    monkeypatch.setattr(T, "execute_http", fake_http)
 
     from vlm_worker import VlmCaptionWorker
     logs = []
@@ -736,6 +897,14 @@ def test_worker_batch_with_mock(tmp_path, monkeypatch):
     assert txt1.startswith("1girl, solo\n") and "natural language description" in txt1
     assert batch["v"] is not None and len(batch["v"]) == 3
     assert prog and prog[-1] == (3, 3)
+    # VlmExecutor.on_attempt_start must be wired to log_message: exactly one
+    # "requesting/retrying X..." notification per actual HTTP attempt (some
+    # bindings here parse-fail and fail over before one finally succeeds, so
+    # this isn't simply 3 - it must track the real attempt count 1:1, which is
+    # what lets the UI show something is happening for every attempt that can
+    # take up to read_timeout_s, not just the first one per image).
+    attempt_notifications = sum(1 for m, _ in logs if m in ("Attempt_Start", "Attempt_Retry"))
+    assert attempt_notifications == len(http_calls) > 0
     print(f"  worker batch (mock http): OK  ({len(batch['v'])} files written, {len(prog)} progress)")
 
 

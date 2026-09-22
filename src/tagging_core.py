@@ -12,6 +12,7 @@ from enum import Enum, IntEnum, auto
 from typing import Mapping, Sequence, Any, Callable, TYPE_CHECKING
 from time import perf_counter
 
+import constants
 from constants import BASE_DIR
 
 if TYPE_CHECKING:
@@ -37,6 +38,13 @@ CONFIG_PATH = BASE_DIR / "config.ini"
 from utils import config_mapping, log_dbg, GetString
 from app_settings import AppSettings, load_settings
 from onnx_providers import make_session
+
+
+# カテゴリ別の最大タグ数が1つも指定されていない場合に適用する出力上限。
+# 呼び出し側（GUI）は必ず設定値を渡すので、これが効くのは max_tags を省略して
+# predict() を直接呼んだとき（単体テスト・スクリプト利用）だけ。出力仕様に影響
+# するため、無名の 100 ではなく根拠付きの定数として置く。
+DEFAULT_TAG_OUTPUT_CAP = 100
 
 
 _get_string: GetString = lambda section, key, **kwargs: str(key)
@@ -570,7 +578,8 @@ class OnnxTagger:
 
         if not self.tags:
              return [TagResult() for _ in scores_batch]
-        hard_cap = sum(cat_limits.values()) if cat_limits else 100
+        hard_cap = (sum(cat_limits.values()) if cat_limits
+                    else DEFAULT_TAG_OUTPUT_CAP)
         score_floor = 1e-4
         for scores in scores_batch:
             raw_predictions: list[TagPrediction] = []
@@ -611,9 +620,10 @@ class OnnxTagger:
         return self.infer_batch_prepared(batch, extra_inputs, thresholds=thresholds, max_tags=max_tags)
 
 def get_image_paths_recursive(base_dir: Path) -> list[Path]:
-    IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
+    # 拡張子の定義は constants.IMAGE_EXTENSIONS が唯一。ここでローカルに
+    # 再定義すると、対応拡張子を増やしたときに走査側だけ取り残される。
     image_paths: list[Path] = []
-    for ext in IMAGE_EXTENSIONS:
+    for ext in constants.IMAGE_EXTENSIONS:
         image_paths.extend(base_dir.rglob(f"*{ext}"))
     return sorted(image_paths)
 
@@ -786,7 +796,8 @@ def process_image_loop(
     戻り値: 実際に書き換えたファイルの FileChange リスト。呼び出し側はこれを1つの
     Undo エントリ（CompositeUndoAction）にまとめる（design.md 4.4節）。
 
-    `progress_cb(done, total)` は全体で最大 ~200 回＋最後の N/N（完了）だけ呼ぶ。
+    `progress_cb(done, total)` は全体で最大 constants.PROGRESS_SIGNAL_BUDGET 回
+    ＋最後の N/N（完了）だけ呼ぶ。
     issue #10: 1画像=1〜2回の GUI ログ発行だと高速ループ（SKIP など）で Qt イベント
     キューが飽和して固まるため、ルーチンの「処理中／出力成功」ログは GUI へ出さず、
     間引いた progress_cb へ回す（progress_cb 自体もクロススレッドの queued signal なので
@@ -808,11 +819,10 @@ def process_image_loop(
     n_errors = 0
     n_unchanged = 0
     failed_seen = set(failed_paths or ())
-    # progress_cb 自体もクロススレッドの queued signal なので、毎画像発行すると
-    # シグナルのキュー投入コストが積み上がる（PR#16 レビュー指摘）。全体で ~200 回に
-    # 間引く。最後の1枚は必ず発行して N/N（完了）に到達させる。
-    # 天井除算にする: total//200 だと 201〜399 枚で step=1 になり間引きが効かない。
-    progress_step = max(1, (total + 199) // 200)
+    # 全体で PROGRESS_SIGNAL_BUDGET 回に間引く（理由と天井除算の根拠は
+    # constants.progress_step_for() を参照）。最後の1枚は必ず発行して
+    # N/N（完了）に到達させる。
+    progress_step = constants.progress_step_for(total)
 
     def mark_failed(path: Path) -> None:
         if failed_paths is not None and path not in failed_seen:

@@ -16,7 +16,32 @@ try:  # keyring はオプション依存。無い環境ではセッション保�
 except Exception:  # pragma: no cover - 環境依存
     keyring = None  # type: ignore
 
-_SERVICE = "PixaiTaggerOnnxGui.VLM"
+_SERVICE = "ImageTaggerGUI.VLM"              # 2026-09 改名後の保存先（新規 ref はこちら）
+_LEGACY_SERVICE = "PixaiTaggerOnnxGui.VLM"   # 改名前。既存エントリはここに残したまま使い続ける
+
+
+def _service_for(secret_ref: str) -> str:
+    """この ref を書き込む先。既に値がある方（新を優先）、どちらにも無ければ新。
+
+    default は _SERVICE でなければならない（過去の CodeRabbit 指摘を却下した理由）:
+    ここは「新規作成 or 既存更新のどちらか」を決める場であり、既存が無ければ新に
+    作るのが目的。default を _LEGACY_SERVICE にすると _SERVICE への初回書き込み
+    経路が無くなり（_SERVICE を返すには既に _SERVICE にある必要がある、という循環）、
+    改名後もずっと新規接続が旧サービス名に書かれ続ける。
+
+    チェック順は get_secret() と揃える（260922 PR#27 レビュー指摘）。両サービスに
+    同じ ref の値があるとき旧を返すと、保存は旧へ行くのに get_secret() は新を先に
+    読むため、保存した値が以後一切読まれない（古い新サービス値が返り続ける）。
+    default を _SERVICE に保つ限り、順序を揃えても上記の初回書き込み経路は壊れない。
+    """
+    if keyring is not None:
+        for service in (_SERVICE, _LEGACY_SERVICE):
+            try:
+                if keyring.get_password(service, secret_ref):
+                    return service
+            except Exception:
+                pass
+    return _SERVICE
 
 
 def _load_dotenv() -> None:
@@ -104,6 +129,12 @@ def get_secret(secret_ref: str) -> str | None:
                 return v
         except Exception as e:  # backend 無し等
             write_debug_log(f"vlm_secrets: keyring get failed for a ref: {type(e).__name__}")
+        try:
+            v = keyring.get_password(_LEGACY_SERVICE, secret_ref)
+            if v:
+                return v
+        except Exception as e:
+            write_debug_log(f"vlm_secrets: keyring get (legacy) failed for a ref: {type(e).__name__}")
     # 2. 環境変数
     for name in _env_candidates(secret_ref):
         v = os.environ.get(name)
@@ -122,7 +153,7 @@ def set_secret(secret_ref: str, value: str, *, persist: bool) -> bool:
         return False
     if persist and keyring is not None:
         try:
-            keyring.set_password(_SERVICE, secret_ref, value)
+            keyring.set_password(_service_for(secret_ref), secret_ref, value)
             with _lock:
                 _session_store.pop(secret_ref, None)
             return True
@@ -143,15 +174,18 @@ def delete_secret(secret_ref: str) -> bool:
         return True
     removed = True
     if keyring is not None:
-        try:
-            keyring.delete_password(_SERVICE, secret_ref)
-        except Exception as e:  # backend 無し / エントリ未登録など
-            write_debug_log(f"vlm_secrets: keyring delete failed for a ref: {type(e).__name__}")
-        # 実際に消えたかを確認する（未登録なら例外でも結果的に None で OK）。
-        try:
-            removed = not keyring.get_password(_SERVICE, secret_ref)
-        except Exception:
-            removed = False
+        for service in (_SERVICE, _LEGACY_SERVICE):
+            try:
+                keyring.delete_password(service, secret_ref)
+            except Exception as e:  # backend 無し / エントリ未登録など
+                write_debug_log(f"vlm_secrets: keyring delete failed for a ref: {type(e).__name__}")
+        # 実際に消えたかを両サービス名で確認する（未登録なら例外でも結果的に None で OK）。
+        for service in (_SERVICE, _LEGACY_SERVICE):
+            try:
+                if keyring.get_password(service, secret_ref):
+                    removed = False
+            except Exception:
+                removed = False
     with _lock:
         _session_store.pop(secret_ref, None)
     return removed
@@ -165,11 +199,12 @@ def secret_status(secret_ref: str) -> str:
         if secret_ref in _session_store and _session_store[secret_ref]:
             return "session"
     if keyring is not None:
-        try:
-            if keyring.get_password(_SERVICE, secret_ref):
-                return "keyring"
-        except Exception:
-            pass
+        for service in (_SERVICE, _LEGACY_SERVICE):
+            try:
+                if keyring.get_password(service, secret_ref):
+                    return "keyring"
+            except Exception:
+                pass
     for name in _env_candidates(secret_ref):
         if os.environ.get(name):
             return "env"

@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 import vlm_secrets
-from vlm_diagnostics import DiagStatus, is_billing_or_credit_block
+from vlm_diagnostics import DiagStatus, is_billing_or_credit_block, item_detail
 from vlm_worker import VlmDiagnosticsWorker
 
 GetString = Callable[..., str]
@@ -30,7 +30,6 @@ class ApiKeyDialog(QDialog):
                  on_cloudflare_verified: Callable[[str], None] | None = None,
                  anthropic_workspace_id: str = "",
                  on_anthropic_workspace_saved: Callable[[str], None] | None = None,
-                 on_binding_confirmed: Callable[[str], None] | None = None,
                  parent: QWidget | None = None):
         super().__init__(parent)
         self._t = get_string
@@ -44,7 +43,6 @@ class ApiKeyDialog(QDialog):
         self._on_cloudflare_verified = on_cloudflare_verified
         self._anthropic_workspace_id = anthropic_workspace_id
         self._on_anthropic_workspace_saved = on_anthropic_workspace_saved
-        self._on_binding_confirmed = on_binding_confirmed
         self._saved = False
         self._cancel_requested = False
         self._pending_done_result: int | None = None
@@ -200,6 +198,16 @@ class ApiKeyDialog(QDialog):
         self._check_thread.finished.connect(self._on_check_thread_done)
         self._check_thread.start()
 
+    def _diag_detail(self, item) -> str:
+        """診断項目の詳細を、利用者へ見せる言語で返す。
+
+        DiagItem.detail は英語のまま保つ（is_billing_or_credit_block() 等の
+        文字列判定とデバッグログがそれに依存している）。画面へ出す直前に訳す。
+        """
+        if item is None:
+            return ""
+        return item_detail(item, self._t)
+
     def _on_report(self, report) -> None:
         """キーが使えるかの判定。サーバーが 401/403 で弾いた＝キー不正。到達不能／
         DNS・TLS 失敗＝未成立で保存しない。それ以外はサーバーが応答している＝キーは
@@ -208,7 +216,6 @@ class ApiKeyDialog(QDialog):
         self._verify_failed = ""
         self._model_warning = ""
         self._service_warning = ""
-        self._binding_confirmed = bool(getattr(report, "can_mark_binding_verified", False))
         items = {i.name: i for i in report.items}
         auth = items.get("Auth")
         http = items.get("HTTP response")
@@ -217,13 +224,13 @@ class ApiKeyDialog(QDialog):
         # 潰さず表示する。Cloudflareは成功条件が厳しいため、このフォールバックがないと
         # 「キーが受け付けられませんでした」だけになり原因を判別できない。
         first_failure = next(
-            (i.detail for i in report.items
+            (self._diag_detail(i) for i in report.items
              if i.status is DiagStatus.FAIL and getattr(i, "detail", "")), "")
 
         if self._is_anthropic and http is not None and http.status is not DiagStatus.PASS:
             low = (http.detail or "").lower()
             if "anthropic-workspace-id" in low or "workspace" in low:
-                self._verify_failed = http.detail or first_failure \
+                self._verify_failed = self._diag_detail(http) or first_failure \
                     or self._t("Vlm", "ApiKey_Failed_Generic")
                 return
 
@@ -237,9 +244,11 @@ class ApiKeyDialog(QDialog):
                     and extraction is not None and extraction.status is DiagStatus.PASS):
                 return
             self._verify_failed = (
-                (http.detail if http is not None and http.status is not DiagStatus.PASS else "")
-                or (extraction.detail if extraction is not None else "")
-                or (auth.detail if auth is not None and auth.status is DiagStatus.FAIL else "")
+                (self._diag_detail(http)
+                 if http is not None and http.status is not DiagStatus.PASS else "")
+                or self._diag_detail(extraction)
+                or (self._diag_detail(auth)
+                    if auth is not None and auth.status is DiagStatus.FAIL else "")
                 or first_failure
                 or self._t("Vlm", "ApiKey_Failed_Generic")
             )
@@ -250,24 +259,25 @@ class ApiKeyDialog(QDialog):
         if http is not None and is_billing_or_credit_block(http.detail):
             # Vercelのカード未登録やOpenAIの残高不足など。キー自体は受理されているので
             # 保存し、モデルID不正とは別の請求・利用枠警告を表示する。
-            self._service_warning = http.detail
+            self._service_warning = self._diag_detail(http)
             return
         if (auth is not None and auth.status is DiagStatus.FAIL) or report.http_status in (401, 403):
-            self._verify_failed = ((http.detail if http is not None else None)
-                                   or (auth.detail if auth is not None else None)
+            self._verify_failed = (self._diag_detail(http)
+                                   or self._diag_detail(auth)
                                    or self._t("Vlm", "ApiKey_Failed_Generic"))
             return
         if report.http_status is not None:
             # サーバーが 401/403 以外で応答した＝キーは認証を通っている。
             # 200 でない理由（モデル ID 違い等）は警告どまりで、キーは保存する。
-            self._model_warning = ((http.detail if http is not None else None)
+            self._model_warning = (self._diag_detail(http)
                                    or f"HTTP {report.http_status}")
             return
         # 実応答まで到達しなかった（DNS/TLS 失敗・到達不能）→ 保存しない
         for name in ("TLS", "DNS / TCP", "Request build"):
             it = items.get(name)
             if it is not None and it.status is DiagStatus.FAIL:
-                self._verify_failed = it.detail or self._t("Vlm", "ApiKey_Failed_Generic")
+                self._verify_failed = (self._diag_detail(it)
+                                       or self._t("Vlm", "ApiKey_Failed_Generic"))
                 return
         self._verify_failed = self._t("Vlm", "ApiKey_Not_Reached")
 
@@ -303,10 +313,6 @@ class ApiKeyDialog(QDialog):
             self._on_cloudflare_verified(self._pending_account_id)
         if self._is_anthropic and self._on_anthropic_workspace_saved is not None:
             self._on_anthropic_workspace_saved(getattr(self, "_pending_workspace_id", ""))
-        if self._binding_confirmed and self._on_binding_confirmed is not None:
-            provider_id = getattr(self._conn, "provider_id", "")
-            if provider_id:
-                self._on_binding_confirmed(provider_id)
         self._saved = True
         service_warn = getattr(self, "_service_warning", "")
         model_warn = getattr(self, "_model_warning", "")

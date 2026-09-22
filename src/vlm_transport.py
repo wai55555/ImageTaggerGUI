@@ -18,7 +18,7 @@ from utils import write_debug_log
 from vlm_connections import VlmConnection
 from vlm_errors import VlmAttemptError, VlmErrorClass, VlmErrorReason
 from vlm_image import PreparedImage
-from vlm_profiles import GenerationProfile
+from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS, GenerationProfile
 from vlm_protocols import (
     VlmCallSpec, VlmParseResult, apply_connection_auth, apply_request_body, apply_request_headers,
     default_auth_key, get_protocol,
@@ -34,6 +34,11 @@ class RawHttpResponse:
     headers: dict[str, str]
     json_body: Any
     text_body: str
+
+
+# 推論系VLM向けに助言する max_output_tokens。GenerationProfile の既定値をそのまま
+# 使う（助言だけ古い値を言い続ける、を防ぐ）。
+_SUGGESTED_MAX_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
 
 
 def _output_limit_reason(protocol_name: str, body: Any) -> str:
@@ -81,32 +86,48 @@ def _enrich_parse_failure(parsed: VlmParseResult, *, protocol, body: Any,
         return replace(parsed, error=VlmAttemptError(
             VlmErrorReason.OUTPUT_LIMIT, error.http_status,
             "output limit reached: max_output_tokens={} finish_reason={}; "
-            "the model returned no final text. Increase VLM max tokens to 3072 or higher "
-            "for reasoning VLMs.".format(max_output_tokens, limit_reason),
-            error.provider_code))
+            "the model returned no final text. Increase VLM max tokens to {} or higher "
+            "for reasoning VLMs.".format(max_output_tokens, limit_reason,
+                                         _SUGGESTED_MAX_OUTPUT_TOKENS),
+            error.provider_code,
+            message_key="Advice_Output_Limit",
+            message_args={"limit": max_output_tokens, "finish_reason": limit_reason,
+                          "suggested": _SUGGESTED_MAX_OUTPUT_TOKENS}))
 
+    # 対処案は英語の message へ足したまま（デバッグログ用）にし、表示用には
+    # 翻訳キーを別に持たせる。以前は英語の対処案がそのまま翻訳済みメッセージの
+    # {reason} へ差し込まれ、どの言語でも助言だけ英語になっていた。
     hints = {
-        VlmErrorReason.EMPTY_RESPONSE:
+        VlmErrorReason.EMPTY_RESPONSE: (
             "no text at response path {!r}; verify API protocol and custom response extraction path".format(path),
-        VlmErrorReason.BAD_RESPONSE:
+            "Advice_Empty_Response", {"path": path}),
+        VlmErrorReason.BAD_RESPONSE: (
             "verify API protocol, model ID, request format, and response path {!r}".format(path),
-        VlmErrorReason.AUTH_ERROR:
+            "Advice_Bad_Response", {"path": path}),
+        VlmErrorReason.AUTH_ERROR: (
             "verify API key, authentication type, header name, and query parameter",
-        VlmErrorReason.MODEL_UNSUPPORTED:
+            "Advice_Auth_Error", {}),
+        VlmErrorReason.MODEL_UNSUPPORTED: (
             "verify the model ID and select a model supported by this endpoint",
-        VlmErrorReason.PROMPT_FORMAT_ERROR:
+            "Advice_Model_Unsupported", {}),
+        VlmErrorReason.PROMPT_FORMAT_ERROR: (
             "verify API protocol and image/message format for this endpoint",
-        VlmErrorReason.TIMEOUT:
+            "Advice_Prompt_Format_Error", {}),
+        VlmErrorReason.TIMEOUT: (
             "verify the server is running and increase connect/read timeout if needed",
-        VlmErrorReason.NETWORK:
+            "Advice_Timeout", {}),
+        VlmErrorReason.NETWORK: (
             "verify base URL, host/port, TLS settings, and server availability",
+            "Advice_Network", {}),
     }
-    hint = hints.get(error.reason)
-    if not hint:
+    entry = hints.get(error.reason)
+    if entry is None:
         return parsed
+    hint, hint_key, hint_args = entry
     detail = (error.message or "").strip()
     message = f"{detail}; {hint}" if detail else hint
-    return replace(parsed, error=replace(error, message=message[:800]))
+    return replace(parsed, error=replace(error, message=message[:800],
+                                         message_key=hint_key, message_args=hint_args))
 
 
 # URL トークン（絶対 URL でも `url: /rel/path?...` の相対形でも）のクエリ文字列を丸ごと伏せる。
@@ -139,6 +160,24 @@ def _scrub_exc(exc: Exception) -> str:
     text = _BEARER_RE.sub(r"\1<redacted>", text)
     text = _AUTH_HEADER_RE.sub(r"\1\2<redacted>", text)
     return text[:300]
+
+
+def adaptive_read_timeout(base_read_timeout_s: float, max_output_tokens: int) -> float:
+    """max_output_tokens に応じて読み取りタイムアウトを引き上げる。
+
+    既定プロファイル(maximum_detail, max_output_tokens=3072)の実機11枚バッチ検証で、
+    正常に生成できている呼び出しが40〜70秒かかり、一部が既定の60秒タイムアウトに
+    引っかかって不要な再試行・フェイルオーバー・失敗を引き起こしていた（デバッグログ上
+    "timeout (http=None)" が繰り返し記録され、その後の再試行/フェイルオーバー先も
+    無料枠のレート制限で即失敗し、画像1枚あたり約2分を浪費）。
+    max_output_tokens=2048 を基準点とし、それ以上は最大1.5倍まで線形に引き上げる。
+    上限を1.5倍に留めているのは、NVIDIA のように本当に壊れた接続を掴んだ場合の
+    無駄待ちを際限なく増やさないため（元の問題は1接続あたり最大120秒の浪費だった）。
+    """
+    if max_output_tokens <= 0:
+        return base_read_timeout_s
+    ratio = min(1.5, max(1.0, max_output_tokens / 2048.0))
+    return base_read_timeout_s * ratio
 
 
 def execute_http(req, *, connect_timeout: float, read_timeout: float,
@@ -227,11 +266,18 @@ class VlmExecutor:
 
     def __init__(self, connections: dict[str, VlmConnection],
                  secret_resolver: Callable[[str], str | None],
-                 *, stop_checker: StopChecker | None = None):
+                 *, stop_checker: StopChecker | None = None,
+                 on_attempt_start: Callable[[VlmConnection, int], None] | None = None):
         self._connections = connections
         self._resolve_secret = secret_resolver
         self._stop = stop_checker or (lambda: False)
         self._runtime: dict[str, ConnectionRuntime] = {}
+        # UI 側で「今どの接続に問い合わせているか」を示すための通知フック。1リクエストが
+        # 最大 read_timeout_s（既定60秒）かかりうる上、失敗時は同一接続で再試行もするため、
+        # これが無いと成功/失敗が返るまで画面が完全に無反応に見える。呼び出し側
+        # （_try_connection）はこのコールバック自体の失敗で実行ループを止めないよう
+        # try/except で囲んで呼ぶ。
+        self._on_attempt_start = on_attempt_start
 
     def runtime(self, cid: str) -> ConnectionRuntime:
         return self._runtime.setdefault(cid, ConnectionRuntime())
@@ -315,13 +361,19 @@ class VlmExecutor:
             if self._stop():
                 return "stopped"
             same_conn_attempts += 1
+            if self._on_attempt_start is not None:
+                try:
+                    self._on_attempt_start(conn, same_conn_attempts)
+                except Exception:
+                    pass
             req = protocol.build_request(conn.base_url, default_key, call)
             apply_connection_auth(req, conn.auth.type, api_key,
                                   conn.auth.header_name, conn.auth.query_param)
             apply_request_headers(req, conn.request_headers)
             apply_request_body(req, conn.request_body)
             raw = execute_http(req, connect_timeout=conn.retry.connect_timeout_s,
-                               read_timeout=conn.retry.read_timeout_s,
+                               read_timeout=adaptive_read_timeout(
+                                   conn.retry.read_timeout_s, profile.max_output_tokens),
                                verify_tls=conn.verify_tls)
             if isinstance(raw, VlmAttemptError):
                 parsed = VlmParseResult(error=raw)

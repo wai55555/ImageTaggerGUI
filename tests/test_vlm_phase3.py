@@ -47,6 +47,12 @@ def _setup(tmpdir, existing_mode, placement, monkeypatch, existing_txt=None):
     s = A.load_settings(A.get_default_config())
     s.paths.input_dir = str(tmpdir)
     s.vlm.enabled = True
+    # Several tests using this fixture rely on gemini failing to parse the
+    # OpenAI-shaped mock body below (gemini's real protocol expects a different
+    # JSON shape) and falling over to openrouter, which does parse it - so this
+    # fixture needs multiple candidates regardless of the shipped
+    # DEFAULT_VLM_CONNECTION_ORDER (now just "gemini").
+    s.vlm.connection_order = "gemini,openrouter,cloudflare"
     s.behavior.existing_file_mode = existing_mode
     s.caption.placement = placement
     for i in range(2):
@@ -156,8 +162,11 @@ def test_skip_mode_leaves_existing(monkeypatch):
     print("  SKIP mode leaves existing .txt untouched: OK")
 
 
-def test_all_connections_excluded_breaks_once(monkeypatch):
-    """Every connection returns 401 -> excluded -> batch stops with a single message, not per-image."""
+def test_all_connections_excluded_logs_exhaustion_once(monkeypatch):
+    """Every connection returns 401 -> excluded -> the batch keeps going (each
+    remaining image gets a fresh live_candidates() check, in case a temporary
+    rate-limit cooldown elsewhere clears later - 2026-09 VLM debugging), but
+    the exhaustion message is logged only once, not once per remaining image."""
     app = _APP
     d = Path(tempfile.mkdtemp())
     for i in range(2, 30):
@@ -167,12 +176,19 @@ def test_all_connections_excluded_breaks_once(monkeypatch):
     T.execute_http = lambda req, **kw: RawHttpResponse(401, {}, {"error": {"message": "bad"}}, "unauthorized")
     try:
         from vlm_worker import VlmCaptionWorker
-        logs = _run(VlmCaptionWorker(s, get_string=lambda *a, **k: (a[-1] if a else "")))
+        worker = VlmCaptionWorker(s, get_string=lambda *a, **k: (a[-1] if a else ""))
+        failed_paths = []
+        worker.batch_failed.connect(failed_paths.extend)
+        logs = _run(worker)
     finally:
         T.execute_http = old
     exhausted = [m for m, c in logs if "All_Connections_Exhausted" in m]
     image_failed = [m for m, c in logs if "Image_Failed" in m]
-    assert exhausted, "expected an exhaustion message"
+    assert len(exhausted) == 1, f"exhaustion message must be logged exactly once, got {len(exhausted)}"
+    # every image must still end up recorded as failed (not silently dropped) even though
+    # the batch keeps looping past the first exhaustion instead of stopping outright.
+    # _setup() seeds i0/i1 itself, plus this test's own i2..i29 = 30 images total.
+    assert len(failed_paths) == 30, f"all 30 images must be marked failed, got {len(failed_paths)}"
     # first image triggers 3x 401 -> all excluded; subsequent images short-circuit (no per-image error spam)
     assert len(image_failed) <= 1, f"too many per-image error lines: {len(image_failed)}"
     print(f"  all-excluded -> single exhaustion message (image_failed lines: {len(image_failed)}): OK")
@@ -188,7 +204,7 @@ def test_settings_dialog_roundtrip(monkeypatch):
     dlg = VlmSettingsDialog(s, T2)
     assert dlg.profile_combo.currentData() == "gemma-4-31b-it"
     assert [dlg._route_rows[cid]["conn"].provider_id for cid in dlg._route_order[:5]] == [
-        "gemini", "nvidia", "openrouter", "cloudflare", "groq"]
+        "gemini", "openrouter", "cloudflare", "groq", "nvidia"]
     assert dlg._route_rows["builtin-cloudflare"]["name"].text() == "Cloudflare"
     for row in dlg._route_rows.values():
         assert row["status"].width() == 180
@@ -216,7 +232,9 @@ def test_settings_dialog_roundtrip(monkeypatch):
     assert s.vlm.max_output_tokens == 1500
     assert not hasattr(s.vlm, "free_only")
     assert s.vlm.cloudflare_account_id == "fedcba9876543210fedcba9876543210"
-    assert "gemma-4-31b-it:cloudflare" in s.vlm.verified_set()
+    # Account-id confirmation is a models-list GET only, never a request to the
+    # profile's actual bound model - it must not mark that binding verified.
+    assert "gemma-4-31b-it:cloudflare" not in s.vlm.verified_set()
     assert s.vlm.language == "en"
     assert s.vlm.strict_identity is True
     dlg._on_anthropic_workspace_saved("wrkspc_test123")
@@ -290,7 +308,10 @@ def test_settings_dialog_rejects_non_vlm_model():
 
         row["model_edit"].setCurrentText("groq/compound-mini")
         dlg._on_model_id_edited("builtin-groq")
-        assert row["model_edit"].currentText() == "qwen3.8-27b"
+        # Reverts to the route's actual bound model_id (fixed 2026-09-22 to
+        # include the required "qwen/" prefix - confirmed live against Groq's
+        # real catalog).
+        assert row["model_edit"].currentText() == "qwen/qwen3.8-27b"
         assert "qwen3.8-27b:groq" not in s.vlm.model_id_override_map()
 
         dlg._on_model_list("builtin-groq", [
@@ -503,19 +524,29 @@ def test_custom_connection_model_list_keeps_only_vlm_models():
     print("  custom connection model list filters non-VLM entries: OK")
 
 
-def test_lightweight_confirmation_is_persisted_for_next_dialog():
+def test_lightweight_confirmation_does_not_mark_binding_verified():
+    """A lightweight API-key check only does a models-list GET - it never sends a
+    request to the profile's actual bound model_id, so it cannot prove that model
+    works. Registering a key must not silently promote the currently-selected
+    profile's binding to VERIFIED on that basis alone (this is exactly the shape
+    of bug that hid a broken gemma-4-31b-it -> cloudflare binding: the account's
+    key was valid, so the unrelated model binding got marked verified even
+    though the model itself did not exist for this account). Only a full
+    connection diagnostic that reaches the actual model, or a real successful
+    generation, may promote a binding to verified."""
     import app_settings as A
     from vlm_settings_dialog import VlmSettingsDialog
 
     settings = A.load_settings(A.get_default_config())
     dialog = VlmSettingsDialog(settings, lambda sec, key, **kw: key)
     try:
-        dialog._on_api_key_binding_confirmed("gemini")
-        reloaded = A.load_settings(A.load_config())
-        assert "gemma-4-31b-it:gemini" in reloaded.vlm.verified_set()
+        assert not hasattr(dialog, "_on_api_key_binding_confirmed")
+        dialog._on_cloudflare_verified("acct123")
+        assert "gemma-4-31b-it:cloudflare" not in settings.vlm.verified_set()
+        assert settings.vlm.cloudflare_account_id == "acct123"
     finally:
         dialog.close()
-    print("  lightweight route confirmation is written to config and restored on reload: OK")
+    print("  lightweight/account-id confirmation alone does not mark a binding verified: OK")
 
 
 def test_settings_dialog_keeps_unbound_route_discoverable():
@@ -535,6 +566,20 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
         assert row["model_edit"].isEnabled()
         assert row["list_btn"].isEnabled()
         assert row["diag_btn"].isEnabled()
+
+        # A user who manually types/selects a real VLM model id for an unbound
+        # route must be able to check it immediately (not stay stuck grayed out
+        # until the dialog is reopened) - this is what a user reported after using
+        # "Fetch models" on OpenRouter and picking a listed id that stayed
+        # unchecked.
+        row["model_edit"].setCurrentText("qwen/qwen3.8-27b")
+        dlg._on_model_id_edited("builtin-groq")
+        assert row["enabled"].isEnabled()
+        assert row["has_override"] is True
+        # clearing the override back out must re-disable it.
+        row["model_edit"].setCurrentText("")
+        dlg._on_model_id_edited("builtin-groq")
+        assert not row["enabled"].isEnabled()
         for cid, other_provider in (
             ("builtin-nvidia", "nvidia"),
             ("builtin-openai", "openai"),
@@ -552,12 +597,19 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
             "groq/compound-mini", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile",
         ])
         assert row["model_ids"] == ["qwen/qwen3.8-27b"]
+        # qwen/qwen3.8-27b is already a shipped binding for this provider -> no
+        # "new model detected" notice should appear.
+        assert "Settings_Route_NewModelsDetected" not in row["status"].toolTip()
         from vlm_model_list import ModelCatalogEntry
         dlg._on_model_list("builtin-groq", [
             ModelCatalogEntry("provider/new-vision", True, True, "live metadata"),
             ModelCatalogEntry("provider/text-only", False, True, "live metadata"),
         ])
         assert row["model_ids"] == ["provider/new-vision"]
+        # "provider/new-vision" is not in the shipped catalog for groq -> flagged,
+        # but not auto-selected/added (the combo selection assertions below still
+        # require an explicit setCurrentText further down).
+        assert "Settings_Route_NewModelsDetected" in row["status"].toolTip()
         row["model_edit"].setCurrentText("provider/new-vision")
         dlg._on_model_id_edited("builtin-groq")
         assert vlm_config.build_connection_map(
@@ -594,6 +646,238 @@ def test_settings_dialog_keeps_unbound_route_discoverable():
     print("  unbound route remains available for VLM discovery and diagnosis: OK")
 
 
+def test_routes_recommended_tab_shows_profile_native_provider():
+    """260922_vlm_fallback_ui_candidate_c_plan.md: the "recommended" view must not
+    hard-code Gemini - it shows whatever ordered_builtin_provider_ids() resolves
+    to for the *current* profile, filtered to routes that actually have a
+    binding. For the shipped default profile (gemma-4-31b-it) that is Gemini."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        assert dlg._routes_view_mode == "recommended"
+        assert dlg._visible_route_cids() == ["builtin-gemini"]
+        for cid, r in dlg._route_rows.items():
+            assert r["name"].isHidden() is (cid != "builtin-gemini"), cid
+        # up/down reordering is meaningless with ~1 visible row; hidden in this mode.
+        assert dlg._route_rows["builtin-gemini"]["updown"].isHidden()
+        assert dlg._routes_empty_label.isHidden()
+    finally:
+        dlg.close()
+    print("  recommended tab shows only the default profile's native provider (Gemini): OK")
+
+
+def test_routes_recommended_tab_follows_profile_switch():
+    """Switching the Caption profile combo to a Claude profile must move the
+    recommended tab's visible routes to Anthropic (+ its OpenRouter and Vercel
+    alias routes), not leave it stuck on Gemini - this reuses the existing
+    ordered_builtin_provider_ids()/_on_profile_changed() wiring, no new
+    per-profile logic. Since connection_order (default: just "gemini") has zero
+    overlap with claude-opus-5's own bindings, the existing fallback in
+    ordered_builtin_provider_ids() switches to *all* of that profile's bound
+    providers, not only the first one - this is pre-existing, intentional
+    behavior (a newly selected profile becomes fully usable right away), not
+    something this UI change introduces. The row order is the binding order:
+    Anthropic itself first, then OpenRouter, then Vercel."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        idx = dlg.profile_combo.findData("claude-opus-5")
+        assert idx >= 0
+        dlg.profile_combo.setCurrentIndex(idx)
+        assert dlg._visible_route_cids() == [
+            "builtin-anthropic", "builtin-openrouter", "builtin-vercel"]
+        assert dlg._route_rows["builtin-anthropic"]["name"].isHidden() is False
+        assert dlg._route_rows["builtin-gemini"]["name"].isHidden() is True
+    finally:
+        dlg.close()
+    print("  recommended tab follows profile switch (Gemini -> Anthropic): OK")
+
+
+def test_routes_recommended_tab_empty_for_bindingless_profile():
+    """A profile with no builtin bindings at all (custom-connection-only) must
+    show the "no built-in connection" message instead of an empty grid or a
+    misleading leftover checked-but-grayed row."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    bindingless = M.VlmModelProfile(
+        profile_id="user-custom-only", display_name="Custom only",
+        canonical_model_id="custom/model")
+    old_resolver = vlm_config.resolve_model_profile
+    vlm_config.resolve_model_profile = lambda v: bindingless
+    dlg = None
+    try:
+        dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+        assert dlg._visible_route_cids() == []
+        assert dlg._routes_empty_label.isHidden() is False
+        assert dlg._routes_empty_label.text() == "Settings_Routes_Recommended_Empty"
+    finally:
+        if dlg is not None:
+            dlg.close()
+        vlm_config.resolve_model_profile = old_resolver
+    print("  recommended tab shows the no-binding message for a bindingless profile: OK")
+
+
+def test_routes_all_tab_shows_every_route():
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.routes_mode_all.setChecked(True)
+        assert dlg._routes_view_mode == "all"
+        assert set(dlg._visible_route_cids()) == set(dlg._route_order)
+        for cid, r in dlg._route_rows.items():
+            assert r["name"].isHidden() is False, cid
+        assert dlg._routes_empty_label.isHidden()
+    finally:
+        dlg.close()
+    print("  'show all' tab shows every builtin route: OK")
+
+
+def test_routes_all_tab_caps_scroll_height_to_about_four_rows():
+    """"すべて表示"(最大10行)がダイアログ全体を長くしすぎないよう、経路欄
+    だけを約4行分の高さに固定してスクロールさせる(260922のフィードバック:
+    「すべて表示の時に縦の長さが長すぎる」)。ダイアログ本体の実際の高さが
+    モード切替で伸びるとしても、それは経路欄が(1〜2行想定の「おすすめ」から)
+    最大4行分に広がった差分だけで、10行分の高さまでは絶対に伸びない。"""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.show()
+        QApplication.instance().processEvents()
+        dialog_height_before = dlg.height()
+        recommended_scroll_height = dlg._routes_scroll.height()
+
+        dlg.routes_mode_all.setChecked(True)
+        QApplication.instance().processEvents()
+        all_scroll_height = dlg._routes_scroll.height()
+        # 全10行がそのまま並んだ高さより明確に小さい(スクロールが必要になる)。
+        full_grid_height = dlg._routes_grid.sizeHint().height()
+        assert all_scroll_height < full_grid_height
+        # おおむね4行分程度(1行あたりの高さ*4 + 余白)に収まっている。
+        per_row = full_grid_height / len(dlg._route_order)
+        assert all_scroll_height <= per_row * 4 + 16
+        # ダイアログ本体が伸びるとしても、経路欄の伸び幅(おすすめ→すべて表示)を
+        # 超えては伸びない(=10行分の高さまで際限なく伸びるバグの再発防止)。
+        scroll_height_delta = all_scroll_height - recommended_scroll_height
+        assert dlg.height() <= dialog_height_before + scroll_height_delta + 16
+        assert all_scroll_height >= recommended_scroll_height
+    finally:
+        dlg.close()
+    print("  'show all' tab caps the routes area to ~4 rows with its own scrollbar"
+          " instead of growing the whole dialog: OK")
+
+
+def test_routes_width_stays_within_the_screen_and_scrolls_horizontally():
+    """経路欄の自然幅がダイアログの縮小下限になって画面を超えないこと。
+
+    260922 PR#27 レビュー指摘: _sync_min_width_to_content() が
+    setMinimumWidth(minimumSizeHint().width()) としていたため、経路欄が必要とする
+    幅（実測で「すべて表示」時 1700px超）がそのまま縮小下限になっていた。__init__ の
+    初期クランプは resize() にしか効かず最小幅には勝てないので、狭い画面では
+    「画面幅を超えたまま縮小もできず、右端の『診断』列に手が届かない」状態になる。
+    画面に収まる分で打ち切り、切り詰めた時だけ横スクロールで到達させる。
+    """
+    import app_settings as A
+    from PySide6.QtCore import Qt
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    app = QApplication.instance()
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        dlg.show()
+        app.processEvents()
+        dlg.routes_mode_all.setChecked(True)
+        app.processEvents()
+        width_cap = dlg._width_cap()
+        assert width_cap is not None, "テスト環境に画面が無い"
+        natural = dlg._routes_grid.sizeHint().width()
+        # 経路欄は画面に収まる幅を超えない。
+        assert dlg._routes_scroll.minimumWidth() <= width_cap
+        # ダイアログの縮小下限も画面に収まる。
+        assert dlg.minimumWidth() <= width_cap
+        # 切り詰めたぶんは横スクロールで到達できる（切り詰めていなければ出さない）。
+        capped = dlg._routes_scroll.minimumWidth() < natural
+        assert dlg._routes_scroll.horizontalScrollBarPolicy() is (
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOn if capped
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 画面より狭い幅を要求したら、少なくとも上限までは縮む
+        # （最小幅が自然幅に張り付いて一切縮まない、という退行の再発防止）。
+        dlg.resize(dlg.minimumWidth() // 2, dlg.height())
+        app.processEvents()
+        assert dlg.width() <= width_cap
+    finally:
+        dlg.close()
+    print("  routes area is capped to the screen and scrolls horizontally instead"
+          " of pinning the dialog wider than the display: OK")
+
+
+def test_routes_recommended_tab_updates_when_checkbox_toggled():
+    """Unchecking the sole visible route in the recommended tab must make it
+    disappear from that view immediately (switch to the empty message), not
+    require reopening the dialog or switching tabs."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+    try:
+        assert dlg._visible_route_cids() == ["builtin-gemini"]
+        dlg._route_rows["builtin-gemini"]["enabled"].setChecked(False)
+        assert dlg._visible_route_cids() == []
+        assert dlg._routes_empty_label.isHidden() is False
+    finally:
+        dlg.close()
+    print("  unchecking the only recommended route switches to the empty message live: OK")
+
+
+def test_routes_recommended_tab_shows_checked_override_only_route():
+    """A route with no binding for the current profile but an explicit,
+    user-chosen model id override (set via "Fetch models" + picking an id, see
+    test_settings_dialog_keeps_unbound_route_discoverable) must appear in the
+    recommended tab once checked, not stay invisible forever just because it
+    has no binding. Reported by a user: checking OpenRouter after choosing a
+    model id via "fetch models" never made it show up under "recommended"."""
+    import app_settings as A
+    from vlm_settings_dialog import VlmSettingsDialog
+
+    s = A.load_settings(A.get_default_config())
+    s.vlm.model_profile_id = "gemma-4-26b-a4b-it"
+    old_resolver = vlm_config.resolve_model_profile
+    vlm_config.resolve_model_profile = lambda v: next(
+        (p for p in vlm_config.all_profiles() if p.profile_id == v.model_profile_id), None)
+    dlg = None
+    try:
+        dlg = VlmSettingsDialog(s, lambda sec, key, **kw: key)
+        row = dlg._route_rows["builtin-groq"]
+        assert not row["has_binding"]
+        row["model_edit"].setCurrentText("qwen/qwen3.8-27b")
+        dlg._on_model_id_edited("builtin-groq")
+        assert row["enabled"].isEnabled()
+        assert "builtin-groq" not in dlg._visible_route_cids()  # not checked yet
+        row["enabled"].setChecked(True)
+        assert "builtin-groq" in dlg._visible_route_cids()
+        assert row["name"].isHidden() is False
+    finally:
+        if dlg is not None:
+            dlg.close()
+        vlm_config.resolve_model_profile = old_resolver
+    print("  recommended tab shows a checked override-only route: OK")
+
+
 def test_settings_transaction_rolls_back_both_files(tmp_path, monkeypatch):
     connections_path = tmp_path / "vlm_connections.json"
     config_path = tmp_path / "config.ini"
@@ -623,14 +907,18 @@ def test_cancel_repersists_regular_fields_after_immediate_confirmation(tmp_path,
     try:
         assert settings.vlm.strict_identity is False
         settings.vlm.strict_identity = True  # representative unsaved regular edit
-        dialog._on_api_key_binding_confirmed("gemini")
+        # _on_cloudflare_verified persists immediately (account id), same as the
+        # old binding-confirmation path used to - a convenient trigger for
+        # "an immediate write already happened" independent of the regular edit above.
+        dialog._on_cloudflare_verified("acct123")
         assert A.load_settings(A.load_config()).vlm.strict_identity is True
+        assert A.load_settings(A.load_config()).vlm.cloudflare_account_id == "acct123"
 
         dialog._restore_unsaved_vlm()
         reloaded = A.load_settings(A.load_config()).vlm
         assert settings.vlm.strict_identity is False
         assert reloaded.strict_identity is False
-        assert "gemma-4-31b-it:gemini" in reloaded.verified_set()
+        assert reloaded.cloudflare_account_id == "acct123"
     finally:
         dialog.close()
 

@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import pytest
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QCoreApplication, QEvent, QThread
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 from PySide6.QtCore import Qt
 
@@ -337,3 +337,70 @@ def test_gpu_checkbox_construction_does_not_overwrite_auto(monkeypatch):
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_detached_running_thread_is_deleted_only_after_it_finishes():
+    """停止要求に応じなかったスレッドを、稼働中に破棄しないこと。
+
+    260922 PR#27 レビュー指摘: _cleanup_tagger_thread() はタイムアウト後に
+    deleteLater() を呼んでいたが、DeferredDelete は QThread *オブジェクト* の所属
+    スレッド（=生成元のメインスレッド）へ post されるため、ワーカーの終了を待たず
+    次のイベントループ巡目で破棄され、Qt の言う
+    "Deleting a running QThread will probably result in a program crash" に当たる。
+    当時のコメントは「deleteLater は稼働中でも安全」と逆のことを書いていた。
+    """
+    import main_window as MW
+    from main_window import MainWindow
+
+    MW._detached_threads.clear()
+    thread = QThread()
+    # self からはモジュール変数しか触らないので、MainWindow を丸ごと作らずに済む。
+    MainWindow._detach_running_thread(None, thread, None)
+    assert thread in MW._detached_threads
+    assert MW.detached_thread_count() == 1
+
+    thread.start()
+    assert thread.isRunning()
+    for _ in range(3):
+        _APP.processEvents()
+    # ここで破棄されていると、以降の属性アクセスが RuntimeError になる。
+    assert thread.isRunning(), "稼働中のスレッドを破棄してはいけない"
+
+    thread.quit()
+    assert thread.wait(5000)
+    _APP.processEvents()
+    # QCoreApplication::processEvents() の公式ドキュメントに明記あり:
+    # 「exec() を一度も呼ばずに processEvents() だけを繰り返すローカルループでは
+    # DeferredDelete イベントは処理されない」。このテストは offscreen headless で
+    # app.exec() を一度も呼ばないため、まさにその条件に当てはまる
+    # （processEvents() を何度繰り返しても理論上は破棄されない可能性が残る、
+    # 260923 PR#27 レビュー指摘）。sendPostedEvents() でこのオブジェクト宛の
+    # DeferredDelete を明示的に配送し、決定的に破棄させる。
+    QCoreApplication.sendPostedEvents(thread, QEvent.Type.DeferredDelete)
+    with pytest.raises(RuntimeError):
+        thread.isFinished()  # finished 後に初めて破棄される
+
+
+def test_detach_prunes_already_finished_threads():
+    """detach 置き場が溜まり続けないこと（次の detach 時に掃除される）。"""
+    import main_window as MW
+    from main_window import MainWindow
+
+    MW._detached_threads.clear()
+    first = QThread()
+    MainWindow._detach_running_thread(None, first, None)
+    first.start()
+    first.quit()
+    assert first.wait(5000)
+    for _ in range(3):
+        _APP.processEvents()
+
+    second = QThread()
+    MainWindow._detach_running_thread(None, second, None)
+    assert MW._detached_threads == [second]
+    second.start()
+    second.quit()
+    assert second.wait(5000)
+    for _ in range(3):
+        _APP.processEvents()
+    MW._detached_threads.clear()

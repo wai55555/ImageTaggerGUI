@@ -198,15 +198,28 @@ GEMMA_4_31B_IT = VlmModelProfile(
     family="Gemma 4",
     base_model="gemma-4-31b-it",
     quantization="provider_managed",
-    aliases=("google/gemma-4-31b-it", "google/gemma-4-31b-it:free", "@cf/google/gemma-4-31b-it"),
+    aliases=("google/gemma-4-31b-it", "google/gemma-4-31b-it:free"),
     bindings={
         "gemini": ModelBinding("gemini", "gemma-4-31b-it", ModelIdentityStatus.DECLARED),
         "openrouter": ModelBinding("openrouter", "google/gemma-4-31b-it:free",
                                    ModelIdentityStatus.DECLARED),
-        "cloudflare": ModelBinding("cloudflare", "@cf/google/gemma-4-31b-it",
-                                   ModelIdentityStatus.DECLARED),
+        # Cloudflare does not currently host @cf/google/gemma-4-31b-it (confirmed
+        # live: absent from a real /ai/models/search listing of 65 models; a real
+        # generation request gets 403 "This account is not allowed to access
+        # @cf/google/gemma-4-31b-it" - worded like a permissions error but it is
+        # actually an unknown-model error, since the account's API key passed a
+        # lightweight auth-only check against the same endpoint). Cloudflare does
+        # host @cf/google/gemma-4-26b-a4b-it, but that is a different-sized model
+        # already correctly bound to GEMMA_4_26B_A4B_IT below, not a substitute
+        # for this one (see looks_same_family()'s "different size -> different
+        # model" rule). No cloudflare binding here until Cloudflare ships this
+        # exact model.
         "nvidia": ModelBinding("nvidia", "google/gemma-4-31b-it", ModelIdentityStatus.DECLARED),
-        "groq": ModelBinding("groq", "gemma-4-31b-it", ModelIdentityStatus.DECLARED),
+        # Groq does not host any Gemma vision model (confirmed live: "model
+        # gemma-4-31b-it does not exist" from Groq's API, and it is absent
+        # from _KNOWN_VISION_MODEL_IDS["groq"] below, which only lists
+        # llama-4-scout and qwen3.x). GEMMA_4_26B_A4B_IT correctly has no groq
+        # binding either - this one was a stale/incorrect copy-paste.
         "huggingface": ModelBinding("huggingface", "google/gemma-4-31B-it",
                                      ModelIdentityStatus.DECLARED),
         "vercel": ModelBinding("vercel", "google/gemma-4-31b-it",
@@ -224,8 +237,12 @@ QWEN3_8_27B = VlmModelProfile(
     aliases=("qwen/qwen3.8-27b", "qwen/qwen3.8-27b-instruct", "qwen3.8-27b-instruct"),
     bindings={
         "openrouter": ModelBinding("openrouter", "qwen/qwen3.8-27b", ModelIdentityStatus.UNKNOWN),
-        "nvidia": ModelBinding("nvidia", "qwen/qwen3.8-27b-instruct", ModelIdentityStatus.UNKNOWN),
-        "groq": ModelBinding("groq", "qwen3.8-27b", ModelIdentityStatus.UNKNOWN),
+        # NVIDIA binding removed: confirmed live (2026-09-22) that NVIDIA's real
+        # /v1/models catalog (82 entries) has no Qwen model of any kind, so
+        # "qwen/qwen3.8-27b-instruct" never existed there.
+        # Groq requires the "qwen/" vendor prefix - confirmed live the real
+        # catalog (13 entries) lists it as "qwen/qwen3.8-27b", not "qwen3.8-27b".
+        "groq": ModelBinding("groq", "qwen/qwen3.8-27b", ModelIdentityStatus.UNKNOWN),
         # "ovhcloud": ModelBinding("ovhcloud", "Qwen3.8-27B",
         #                            ModelIdentityStatus.UNKNOWN),
     },
@@ -241,8 +258,10 @@ QWEN3_6_27B = VlmModelProfile(
     aliases=("qwen/qwen3.6-27b", "qwen/qwen3.6-27b-instruct", "qwen3.6-27b-instruct"),
     bindings={
         "openrouter": ModelBinding("openrouter", "qwen/qwen3.6-27b", ModelIdentityStatus.UNKNOWN),
-        "nvidia": ModelBinding("nvidia", "qwen/qwen3.6-27b-instruct", ModelIdentityStatus.UNKNOWN),
-        "groq": ModelBinding("groq", "qwen3.6-27b", ModelIdentityStatus.UNKNOWN),
+        # NVIDIA and Groq bindings removed: confirmed live (2026-09-22) that
+        # neither provider's real model catalog has any qwen3.6-27b model
+        # (NVIDIA has no Qwen model at all; Groq's 13-entry catalog only has
+        # qwen/qwen3.8-27b, not the 3.6 variant).
         # "ovhcloud": ModelBinding("ovhcloud", "Qwen3.6-27B",
         #                            ModelIdentityStatus.UNKNOWN),
     },
@@ -267,36 +286,6 @@ QWEN3_6_27B = VlmModelProfile(
 #     },
 # )
 
-OPENAI_GPT_4O = VlmModelProfile(
-    profile_id="openai-gpt-4o",
-    display_name="OpenAI GPT-4o",
-    canonical_model_id="gpt-4o",
-    family="GPT-4o",
-    base_model="gpt-4o",
-    revision="provider_managed",
-    quantization="provider_managed",
-    aliases=("openai/gpt-4o",),
-    bindings={
-        "openai": ModelBinding("openai", "gpt-4o", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "openai/gpt-4o", ModelIdentityStatus.DECLARED),
-    },
-)
-
-OPENAI_GPT_4O_MINI = VlmModelProfile(
-    profile_id="openai-gpt-4o-mini",
-    display_name="OpenAI GPT-4o mini",
-    canonical_model_id="gpt-4o-mini",
-    family="GPT-4o mini",
-    base_model="gpt-4o-mini",
-    revision="provider_managed",
-    quantization="provider_managed",
-    aliases=("openai/gpt-4o-mini",),
-    bindings={
-        "openai": ModelBinding("openai", "gpt-4o-mini", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "openai/gpt-4o-mini", ModelIdentityStatus.DECLARED),
-    },
-)
-
 OPENAI_GPT_5_6_SOL = VlmModelProfile(
     profile_id="openai-gpt-5.6-sol",
     display_name="OpenAI GPT-5.6 Sol",
@@ -308,6 +297,9 @@ OPENAI_GPT_5_6_SOL = VlmModelProfile(
     aliases=("gpt-5.6", "openai/gpt-5.6-sol"),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-sol", ModelIdentityStatus.DECLARED),
+        # 実機確認(2026-09-22): OpenRouterの実カタログに openai/gpt-5.6-sol が存在する。
+        # 本家の次は、利用者が多いOpenRouterを置く(Vercelより上)。
+        "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-sol", ModelIdentityStatus.DECLARED),
         "vercel": ModelBinding("vercel", "openai/gpt-5.6-sol", ModelIdentityStatus.DECLARED),
     },
 )
@@ -323,6 +315,7 @@ OPENAI_GPT_5_6_TERRA = VlmModelProfile(
     aliases=("openai/gpt-5.6-terra",),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-terra", ModelIdentityStatus.DECLARED),
+        "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-terra", ModelIdentityStatus.DECLARED),
         "vercel": ModelBinding("vercel", "openai/gpt-5.6-terra", ModelIdentityStatus.DECLARED),
     },
 )
@@ -338,6 +331,7 @@ OPENAI_GPT_5_6_LUNA = VlmModelProfile(
     aliases=("openai/gpt-5.6-luna",),
     bindings={
         "openai": ModelBinding("openai", "gpt-5.6-luna", ModelIdentityStatus.DECLARED),
+        "openrouter": ModelBinding("openrouter", "openai/gpt-5.6-luna", ModelIdentityStatus.DECLARED),
         "vercel": ModelBinding("vercel", "openai/gpt-5.6-luna", ModelIdentityStatus.DECLARED),
     },
 )
@@ -346,9 +340,23 @@ OPENAI_GPT_5_6_LUNA = VlmModelProfile(
 def _claude_profile(profile_id: str, display_name: str, model_id: str, *,
                     family: str, revision: str = "provider_managed",
                     aliases: tuple[str, ...] = (),
-                    vercel_model_id: str | None = None) -> VlmModelProfile:
-    """Anthropic の公式モデルIDを、直接APIとVercelの両経路へ束ねる。"""
+                    vercel_model_id: str | None = None,
+                    openrouter_model_id: str | None = None) -> VlmModelProfile:
+    """Anthropic の公式モデルIDを、直接API・OpenRouter・Vercelの各経路へ束ねる。
+
+    binding の並び順がそのままフォールバック経路の既定順・表示順になる
+    （vlm_config.ordered_builtin_provider_ids）。Claude は「本家の
+    Anthropic 直販が最上位、次に利用者が多い OpenRouter、最後に Vercel」
+    の順に固定する。
+
+    OpenRouter の Anthropic モデルIDは Vercel AI Gateway と同じ
+    `anthropic/<ドット表記>` 形式なので、既定では vercel_id を流用する。
+    どちらも DECLARED（推定）であり、実在確定は「モデル一覧を取得」／
+    接続診断／1枚テストの成功時に VERIFIED へ昇格させる。
+    """
     vercel_id = vercel_model_id or f"anthropic/{model_id}"
+    openrouter_id = openrouter_model_id or vercel_id
+    extra_aliases = (vercel_id,) if openrouter_id == vercel_id else (vercel_id, openrouter_id)
     return VlmModelProfile(
         profile_id=profile_id,
         display_name=display_name,
@@ -357,9 +365,11 @@ def _claude_profile(profile_id: str, display_name: str, model_id: str, *,
         base_model=model_id,
         revision=revision,
         quantization="provider_managed",
-        aliases=aliases + (vercel_id,),
+        aliases=aliases + extra_aliases,
         bindings={
             "anthropic": ModelBinding("anthropic", model_id, ModelIdentityStatus.DECLARED),
+            "openrouter": ModelBinding("openrouter", openrouter_id,
+                                       ModelIdentityStatus.DECLARED),
             "vercel": ModelBinding("vercel", vercel_id, ModelIdentityStatus.DECLARED),
         },
     )
@@ -368,6 +378,9 @@ def _claude_profile(profile_id: str, display_name: str, model_id: str, *,
 CLAUDE_FABLE_5_1 = _claude_profile(
     "claude-fable-5-1", "Claude Fable 5.1", "claude-fable-5-1",
     family="Claude Fable 5.1",
+    # Vercel AI Gatewayは "claude-fable-5.1"(ドット表記)。ヘルパーの既定
+    # (anthropicのダッシュ表記をそのまま流用)は2026-09-22の実機確認で誤りと判明。
+    vercel_model_id="anthropic/claude-fable-5.1",
 )
 
 CLAUDE_FABLE_5 = _claude_profile(
@@ -380,25 +393,19 @@ CLAUDE_OPUS_5 = _claude_profile(
     family="Claude Opus 5",
 )
 
-CLAUDE_OPUS_4_8 = VlmModelProfile(
-    profile_id="claude-opus-4-8",
-    display_name="Claude Opus 4.8",
-    canonical_model_id="claude-opus-4-8",
+CLAUDE_OPUS_4_8 = _claude_profile(
+    "claude-opus-4-8", "Claude Opus 4.8", "claude-opus-4-8",
     family="Claude Opus 4.8",
-    base_model="claude-opus-4-8",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-opus-4-8",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-opus-4-8", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "anthropic/claude-opus-4-8",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-opus-4.8"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-opus-4.8",
 )
 
 CLAUDE_OPUS_4_6 = _claude_profile(
     "claude-opus-4-6", "Claude Opus 4.6", "claude-opus-4-6",
     family="Claude Opus 4.6",
+    vercel_model_id="anthropic/claude-opus-4.6",
 )
 
 CLAUDE_OPUS_4_5 = _claude_profile(
@@ -413,36 +420,22 @@ CLAUDE_SONNET_5 = _claude_profile(
     family="Claude Sonnet 5",
 )
 
-CLAUDE_OPUS_4_7 = VlmModelProfile(
-    profile_id="claude-opus-4-7",
-    display_name="Claude Opus 4.7",
-    canonical_model_id="claude-opus-4-7",
+CLAUDE_OPUS_4_7 = _claude_profile(
+    "claude-opus-4-7", "Claude Opus 4.7", "claude-opus-4-7",
     family="Claude Opus 4.7",
-    base_model="claude-opus-4-7",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-opus-4-7",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-opus-4-7", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "anthropic/claude-opus-4-7",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-opus-4.7"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-opus-4.7",
 )
 
-CLAUDE_SONNET_4_6 = VlmModelProfile(
-    profile_id="claude-sonnet-4-6",
-    display_name="Claude Sonnet 4.6",
-    canonical_model_id="claude-sonnet-4-6",
+CLAUDE_SONNET_4_6 = _claude_profile(
+    "claude-sonnet-4-6", "Claude Sonnet 4.6", "claude-sonnet-4-6",
     family="Claude Sonnet 4.6",
-    base_model="claude-sonnet-4-6",
-    revision="provider_managed",
-    quantization="provider_managed",
     aliases=("anthropic/claude-sonnet-4-6",),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-sonnet-4-6", ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "anthropic/claude-sonnet-4-6",
-                                ModelIdentityStatus.DECLARED),
-    },
+    # Vercel/OpenRouterは "claude-sonnet-4.6"(ドット表記)。2026-09-22の実機確認で、
+    # anthropicのダッシュ表記をそのまま使っていたのは誤りと判明。
+    vercel_model_id="anthropic/claude-sonnet-4.6",
 )
 
 CLAUDE_SONNET_4_5 = _claude_profile(
@@ -452,29 +445,22 @@ CLAUDE_SONNET_4_5 = _claude_profile(
     vercel_model_id="anthropic/claude-sonnet-4.5",
 )
 
-CLAUDE_HAIKU_4_5 = VlmModelProfile(
-    profile_id="claude-haiku-4-5",
-    display_name="Claude Haiku 4.5",
-    canonical_model_id="claude-haiku-4-5-20251001",
-    family="Claude 4.5",
-    base_model="claude-haiku-4-5-20251001",
-    revision="20251001",
-    quantization="provider_managed",
-    aliases=("claude-haiku-4-5", "anthropic/claude-haiku-4.5"),
-    bindings={
-        "anthropic": ModelBinding("anthropic", "claude-haiku-4-5-20251001",
-                                  ModelIdentityStatus.DECLARED),
-        "vercel": ModelBinding("vercel", "anthropic/claude-haiku-4.5",
-                                ModelIdentityStatus.DECLARED),
-    },
+CLAUDE_HAIKU_4_5 = _claude_profile(
+    "claude-haiku-4-5", "Claude Haiku 4.5", "claude-haiku-4-5-20251001",
+    family="Claude Haiku 4.5", revision="20251001",
+    aliases=("claude-haiku-4-5",),
+    vercel_model_id="anthropic/claude-haiku-4.5",
 )
 
 def _grok_profile(profile_id: str, display_name: str, model_id: str, *,
                   family: str) -> VlmModelProfile:
-    """xAI Grok の公式モデルIDを、xAI 直接APIの経路へ束ねる。
+    """xAI Grok の公式モデルIDを、xAI 直接APIと OpenRouter の両経路へ束ねる。
 
-    Grok は現在 xAI 直販のみを内蔵経路にする（OpenRouter 等の同一モデル ID は
-    利用者がプロファイルエディタで実在確認のうえ追加できる）。
+    他の内蔵プロファイルと同じく「本家の直販が最上位、次に利用者が多い
+    OpenRouter」の順。OpenRouter 側の ID は `x-ai/<公式ID>` で、状態は
+    DECLARED（推定）。実在確定は「モデル一覧を取得」／接続診断／1枚テストの
+    成功時に VERIFIED へ昇格させる。Vercel AI Gateway は Grok 経路として
+    未検証なので内蔵しない（利用者がプロファイルエディタで追加できる）。
     """
     return VlmModelProfile(
         profile_id=profile_id,
@@ -487,21 +473,21 @@ def _grok_profile(profile_id: str, display_name: str, model_id: str, *,
         aliases=(profile_id, f"x-ai/{model_id}", f"xai/{model_id}"),
         bindings={
             "xai": ModelBinding("xai", model_id, ModelIdentityStatus.DECLARED),
+            "openrouter": ModelBinding("openrouter", f"x-ai/{model_id}",
+                                       ModelIdentityStatus.DECLARED),
         },
     )
 
 
 GROK_4_6 = _grok_profile("grok-4-6", "Grok 4.6", "grok-4.6", family="Grok 4.6")
-GROK_4_3 = _grok_profile("grok-4-3", "Grok 4.3", "grok-4.3", family="Grok 4.3")
 
 _ALL_PROFILES = [
     GEMMA_4_26B_A4B_IT, GEMMA_4_31B_IT, QWEN3_8_27B, QWEN3_6_27B,
-    OPENAI_GPT_4O, OPENAI_GPT_4O_MINI,
     OPENAI_GPT_5_6_SOL, OPENAI_GPT_5_6_TERRA, OPENAI_GPT_5_6_LUNA,
     CLAUDE_FABLE_5_1, CLAUDE_FABLE_5, CLAUDE_OPUS_5,
     CLAUDE_OPUS_4_8, CLAUDE_OPUS_4_7, CLAUDE_OPUS_4_6, CLAUDE_OPUS_4_5,
     CLAUDE_SONNET_5, CLAUDE_SONNET_4_6, CLAUDE_SONNET_4_5, CLAUDE_HAIKU_4_5,
-    GROK_4_6, GROK_4_3,
+    GROK_4_6,
 ]
 
 
@@ -618,9 +604,9 @@ _KNOWN_VISION_MODEL_IDS = {
         "gemini-2.5-pro-preview",
     }),
     "groq": frozenset({
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "qwen/qwen3.6-27b",
         "qwen/qwen3.8-27b",
+        # "meta-llama/llama-4-scout-17b-16e-instruct" と "qwen/qwen3.6-27b" は
+        # 2026-09-22の実機 /models 一覧(13件)に無かったため削除。
     }),
     "openai": frozenset({
         "gpt-4o",
@@ -666,17 +652,23 @@ _KNOWN_VISION_MODEL_IDS = {
         "claude-haiku-4-5-20251001",
     }),
     "cloudflare": frozenset({
-        "@cf/google/gemma-3-12b-it",
         "@cf/google/gemma-4-26b-a4b-it",
-        "@cf/google/gemma-4-31b-it",
+        # "@cf/google/gemma-4-31b-it" removed: confirmed live absent from a real
+        # /ai/models/search listing, and a real generation request gets 403
+        # "This account is not allowed to access @cf/google/gemma-4-31b-it"
+        # (worded like a permissions error but is actually unknown-model - the
+        # same account's key passes a lightweight auth-only check against the
+        # same endpoint). See GEMMA_4_31B_IT's binding comment above.
         "@cf/meta/llama-3.2-11b-vision-instruct",
         "@cf/meta/llama-4-scout-17b-16e-instruct",
         # "@cf/mistral/mistral-small-3.1-24b-instruct",  # Mistral系VLMは一時停止
-        "@cf/moonshotai/kimi-k2.5",
         "@cf/moonshotai/kimi-k2.6",
         "@cf/moonshotai/kimi-k2.7-code",
-        "@cf/moondream/moondream3.1-9b-a2b",
-        "@cf/uform/uform-gen2-qwen-500m",
+        # 以下4件は2026-09-22の実機 /ai/models/search 一覧(65件)に無かったため削除:
+        # "@cf/google/gemma-3-12b-it", "@cf/moonshotai/kimi-k2.5",
+        # "@cf/moondream/moondream3.1-9b-a2b", "@cf/uform/uform-gen2-qwen-500m"。
+        # いずれも実プロファイルのbindingには使われていない(静的カタログの
+        # 未対応経路向け許可リストのみ)ため、削除の実害は無い。
     }),
     "nvidia": frozenset({
         "adept/fuyu-8b",
@@ -991,6 +983,20 @@ def is_vlm_model_id(profile: VlmModelProfile | None, provider_id: str,
         if known_profile is not None and known_profile.profile_id != profile.profile_id:
             return False
         return looks_same_family(profile, model_id)
+    # No binding for this provider on the current profile: any known-good VLM id
+    # for the provider is normally an acceptable manual choice (a Gemma profile
+    # picking a Claude model via a manual override is a deliberate, unambiguous
+    # cross-vendor choice). But a same-family sibling profile's id (e.g.
+    # gemma-4-31b-it accepting gemma-4-26b-a4b-it's cloudflare id) looks like it
+    # could be "this same model, just this provider's exact ID" and would get
+    # silently accepted, wired in, and shown as an enabled/verified route -
+    # while actually running a different-sized model under the current
+    # profile's name. Reject that specific case; a genuinely different family
+    # from another profile is still fine (see is_vlm_model_id's docstring).
+    if (profile is not None and known_profile is not None
+            and known_profile.profile_id != profile.profile_id
+            and known_profile.family == profile.family):
+        return False
     low = _base_catalog_model_id(model_id)
     static_capability, _ = classify_model_capability(provider_id, model_id)
     return (low in _known_vision_model_ids(provider_id)
@@ -1008,6 +1014,26 @@ def filter_vlm_model_ids(profile: VlmModelProfile | None, provider_id: str,
         if model_id and model_id not in seen and is_vlm_model_id(profile, provider_id, model_id):
             seen.add(model_id)
             out.append(model_id)
+    return out
+
+
+def new_vlm_model_ids(provider_id: str, candidate_ids: list[str]) -> list[str]:
+    """VLM対応が確認できた一覧のうち、出荷カタログに未登録のIDだけを返す。
+
+    _ALL_PROFILES のbinding にも _KNOWN_VISION_MODEL_IDS にも無いIDを、
+    プロバイダーが新しく公開した可能性のあるモデルとして検出する（自動で
+    プロファイルへ追加はしない。UI側で「新モデルを検出」の通知材料として使う）。
+    """
+    known = _known_vision_model_ids(provider_id)
+    out: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidate_ids:
+        model_id = str(candidate or "").strip()
+        low = _base_catalog_model_id(model_id)
+        if not low or low in known or low in seen:
+            continue
+        seen.add(low)
+        out.append(model_id)
     return out
 
 

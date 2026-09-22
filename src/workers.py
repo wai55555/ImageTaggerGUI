@@ -418,9 +418,21 @@ class GpuRuntimeDownloadWorker(QObject):
         else:
             self.progress_update.emit(0, done / 1024 / 1024, 0.0)
 
-    def _on_log(self, message: str, level: str = "info") -> None:
+    def _on_log(self, message: str, level: str = "info", *,
+                key: str = "", args: dict | None = None) -> None:
+        """gpu_runtime からの進捗ログを、利用者の言語でログ欄へ出す。
+
+        `message` は英語のまま（デバッグログはこちらを残す）。`key` を伴う通知は
+        [Gpu] セクションから訳して表示する。gpu_runtime 側は LocaleManager を
+        持たない純粋なモジュールなので、翻訳はここで行う。
+        """
         write_debug_log(f"GpuRuntimeDownloadWorker: {message}")
-        self.log_message.emit(message, self._LEVEL_COLOR.get(level, "black"))
+        shown = message
+        if key:
+            translated = self.get_string("Gpu", key, **(args or {}))
+            if translated and translated != key:
+                shown = translated
+        self.log_message.emit(shown, self._LEVEL_COLOR.get(level, "black"))
 
     @Slot()
     def run_download(self):

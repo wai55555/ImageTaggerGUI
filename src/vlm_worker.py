@@ -13,6 +13,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+import constants
 from utils import GetString, default_get_string_fallback, write_debug_log
 from tagging_core import (
     ExistingFileMode, FileChange, OverwriteDecision,
@@ -25,7 +26,10 @@ import vlm_secrets
 from vlm_errors import VlmAttemptError, VlmErrorReason
 from vlm_image import ImagePreprocessConfig, prepare_image
 from vlm_profiles import build_system_prompt, build_user_prompt
-from vlm_router import ExecutionMode, explain_candidate_failure, select_candidates
+from vlm_router import (
+    ExecutionMode, explain_candidate_failure, localized_candidate_failure,
+    select_candidates,
+)
 from vlm_transport import VlmExecutor
 
 
@@ -156,8 +160,12 @@ class VlmCaptionWorker(QObject):
         # connection_order から外された provider は候補から完全に除外する（足し戻さない）。
         if policy.execution_mode is ExecutionMode.BUILTIN_FALLBACK:
             order = vlm_config.ordered_builtin_provider_ids(vlm, model_profile)
-            ordered_bindings = {pid: model_profile.bindings[pid]
-                                for pid in order if pid in model_profile.bindings}
+            # 設定画面でチェックできた「binding は無いが検証済み override がある」
+            # 経路も候補に含める。素の binding だけで絞ると、利用者がモデル一覧から
+            # 実在IDを選んでチェックした経路が一度も試されない（260922 PR#27）。
+            effective = vlm_config.profile_with_override_bindings(vlm, model_profile)
+            ordered_bindings = {pid: effective.bindings[pid]
+                                for pid in order if pid in effective.bindings}
             model_profile = dataclasses.replace(model_profile, bindings=ordered_bindings)
 
         has_auth = {}
@@ -168,7 +176,8 @@ class VlmCaptionWorker(QObject):
 
         candidates = select_candidates(model_profile, connections, policy,
                                        has_auth=has_auth, supports_image=supports_image)
-        executor = VlmExecutor(connections, vlm_secrets.get_secret, stop_checker=self.is_stopped)
+        executor = VlmExecutor(connections, vlm_secrets.get_secret, stop_checker=self.is_stopped,
+                               on_attempt_start=self._on_attempt_start)
         image_cfg = ImagePreprocessConfig(
             max_long_edge=gen_profile.image_max_long_edge,
             fmt=gen_profile.image_format, jpeg_quality=gen_profile.image_jpeg_quality)
@@ -184,6 +193,21 @@ class VlmCaptionWorker(QObject):
             "user_prompt": build_user_prompt(gen_profile),
             "image_cfg": image_cfg,
         }
+
+    def _on_attempt_start(self, conn, attempt: int) -> None:
+        """VlmExecutor が接続を試行する直前に呼ぶ通知。UI へ「今何をしているか」を出す。
+
+        write_debug_log() は [Debug] debug_log がオフだと何も残さないので、これは
+        （Debug 設定に関係なく常に見える）log_message 経由にする。1リクエストが
+        最大 read_timeout_s（既定60秒）かかる上、同一接続で再試行もするため、これが
+        無いと成功/失敗が返るまで画面が完全に無反応に見える。
+        """
+        if attempt > 1:
+            self.log_message.emit(self.get_string(
+                "Vlm", "Attempt_Retry", connection=conn.display_name, attempt=attempt), "blue")
+        else:
+            self.log_message.emit(self.get_string(
+                "Vlm", "Attempt_Start", connection=conn.display_name), "blue")
 
     def _spec_base_for(self, image_path: Path, rt) -> dict | None:
         try:
@@ -208,10 +232,14 @@ class VlmCaptionWorker(QObject):
             if rt is None:
                 return
             if not rt["candidates"].has_candidates:
+                # 画面へは訳した理由を出し、英語の原文はデバッグログへ残す。
+                write_debug_log("vlm: " + explain_candidate_failure(
+                    rt["candidates"].rejected_reason, rt["candidates"].excluded))
                 self.log_message.emit(self.get_string("Vlm", "Error_No_Candidate",
-                                                      reason=explain_candidate_failure(
+                                                      reason=localized_candidate_failure(
                                                           rt["candidates"].rejected_reason,
-                                                          rt["candidates"].excluded)), "red")
+                                                          rt["candidates"].excluded,
+                                                          self.get_string)), "red")
                 return
             image_path = self._selected_file_path
             if image_path is None or not Path(image_path).is_file():
@@ -286,10 +314,13 @@ class VlmCaptionWorker(QObject):
                 return
             candidates = rt["candidates"]
             if not candidates.has_candidates:
+                write_debug_log("vlm: " + explain_candidate_failure(
+                    candidates.rejected_reason, candidates.excluded))
                 self.log_message.emit(self.get_string("Vlm", "Error_No_Candidate",
-                                                      reason=explain_candidate_failure(
+                                                      reason=localized_candidate_failure(
                                                           candidates.rejected_reason,
-                                                          candidates.excluded)), "red")
+                                                          candidates.excluded,
+                                                          self.get_string)), "red")
                 for cid, why in candidates.excluded.items():
                     write_debug_log(f"vlm: candidate excluded {cid}: {why}")
                 return
@@ -305,7 +336,7 @@ class VlmCaptionWorker(QObject):
             total = len(image_paths)
             mode = parse_existing_file_mode(self._settings.behavior.existing_file_mode, self.get_string)
             placement = self._settings.caption.placement
-            step = max(1, (total + 199) // 200)
+            step = constants.progress_step_for(total)
             n_written = n_skipped = n_errors = n_unchanged = 0
             last_conn = ""
 
@@ -319,6 +350,7 @@ class VlmCaptionWorker(QObject):
                     return [p for p in pending if not p.with_suffix(".txt").is_file()]
                 return list(pending)
 
+            exhausted_logged = False
             for i, image_path in enumerate(image_paths):
                 if self.is_stopped():
                     self.log_message.emit(self.get_string("Vlm", "Stopped_By_User"), "orange")
@@ -336,9 +368,22 @@ class VlmCaptionWorker(QObject):
                 # 既存出力をSKIPする画像は、接続が尽きていても失敗では
                 # ない。それを解決した後、実際に生成が必要な画像でだけ打ち切る。
                 if not executor.live_candidates(candidates.connection_ids):
-                    self.log_message.emit(self.get_string("Vlm", "All_Connections_Exhausted"), "red")
-                    failed.extend(remaining_failures(i))
-                    break
+                    # break で残り全部を一括で見捨てない: ここでの「候補が尽きた」は
+                    # 恒久的な EXCLUDE だけでなく、レート制限のような時間で解ける
+                    # cooldown が原因のこともある。この画像だけ失敗にして次へ進めば、
+                    # 後続画像の処理に要する実時間の分だけ cooldown が明けている
+                    # 可能性があり、バッチ全体を無駄に早期終了させずに済む
+                    # （2026-09 VLM デバッグ: 実機11枚バッチで、レート制限中の接続と
+                    # 誤って除外された接続が重なり、break のせいで4枚目以降7枚が
+                    # 一度も試行されずに打ち切られたのを確認）。ただしメッセージは
+                    # 大量画像で毎回スパムしないよう、バッチにつき1回だけ出す
+                    # （PR時からの既存仕様: image_failed の乱発を避ける）。
+                    n_errors += 1
+                    failed.append(image_path)
+                    if not exhausted_logged:
+                        self.log_message.emit(self.get_string("Vlm", "All_Connections_Exhausted"), "red")
+                        exhausted_logged = True
+                    continue
                 eff_placement = "OVERWRITE" if decision is OverwriteDecision.OVERWRITE else placement
                 # 「常に追記」を選んでいるのに placement が既定の OVERWRITE のままだと
                 # 既存キャプションを丸ごと捨ててしまう（PR#16 の caption_core 修正と同方針）。

@@ -1,7 +1,7 @@
 """xAI Grok 内蔵 VLM 経路のオフラインテスト。
 
 - 内蔵接続テンプレート（Responses API / bearer / api.x.ai）
-- 出荷プロファイル（grok-4-6 / grok-4-3）と xai binding
+- 出荷プロファイル（grok-4-6）と xai binding
 - モデル能力判定（grok-4 系は VLM、grok-3 / grok-2 素体・code/build は非 VLM）
 - /v1/language-models の {"models":[{id,input_modalities}]} 解析
 - build_connection_map で Grok プロファイル選択時に xai 経路が有効化される
@@ -46,13 +46,18 @@ def test_builtin_xai_connection_template() -> None:
 
 def test_shipped_grok_profiles() -> None:
     profiles = {p.profile_id: p for p in vlm_models.default_registry().all_profiles()}
-    assert "grok-4-6" in profiles and "grok-4-3" in profiles
+    # grok-4-3 was removed: an older model priced the same as grok-4-6
+    # (2026-09-22 user decision).
+    assert "grok-4-6" in profiles
+    assert "grok-4-3" not in profiles
     g = profiles["grok-4-6"]
     assert g.canonical_model_id == "grok-4.6"
     assert g.binding_for("xai").model_id == "grok-4.6"
     assert g.quantization_is_strict()  # provider_managed
-    # Grok は今のところ xai 直販のみを内蔵経路にする
-    assert set(g.bindings) == {"xai"}
+    # 内蔵経路は xai 直販と OpenRouter。並び順がフォールバックの既定順・経路欄の
+    # 表示順そのものなので、本家の xai が先で OpenRouter が次。
+    assert list(g.bindings) == ["xai", "openrouter"]
+    assert g.binding_for("openrouter").model_id == "x-ai/grok-4.6"
 
 
 def test_grok_capability_classification() -> None:

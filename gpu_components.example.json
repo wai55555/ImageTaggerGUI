@@ -2,7 +2,7 @@
   "//": "SCHEMA REFERENCE - not read by the app. A real gpu_components.json is",
   "//1": "generated at release time by `python tools/gen_gpu_components.py` (run it",
   "//2": "from anywhere - it pulls the Windows wheels straight from PyPI, no build",
-  "//3": "venv needed) and placed at the repo root; pixai_tagger_gui.spec bundles it",
+  "//3": "venv needed) and placed at the repo root; ImageTaggerGUI.spec bundles it",
   "//4": "into _internal/. Do NOT commit the generated file (keep it release-local).",
   "//5": "Nothing is self-hosted: the CUDA provider DLL comes from the onnxruntime-gpu",
   "//6": "wheel itself (as a member, location=capi), matching the generator's actual",

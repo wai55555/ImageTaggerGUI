@@ -1,14 +1,16 @@
-# PixAI Tagger ONNX GUI
+# ImageTaggerGUI（原名 PixAI Tagger ONNX GUI）
 此應用程式是一個GUI工具，用於為本地的大量圖像自動產生快速準確的標籤和描述文字。透過直觀的操作，它極大地簡化了資料集的組織和管理。除了多種本地標籤和描述模型外，還支援 Gemini、OpenAI、Claude、Groq、本地 VLM 以及其他相容服務。
 
-|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/PixaiTaggerOnnxGui/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
 
 ## 概述 (Overview)
 
-**PixAI Tagger ONNX GUI** 使用多種本地模型（包括 [PixAI](https://pixai.art/) 開發的圖像標註模型的 [ONNX 版本](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)）以及可選的網路 VLM，為圖像產生標籤和描述文字。
+**ImageTaggerGUI** 使用多種本地模型（包括 [PixAI](https://pixai.art/) 開發的圖像標註模型的 [ONNX 版本](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)）以及可選的網路 VLM，為圖像產生標籤和描述文字。
+
+本專案最初是 PixAI Tagger 的 GUI（原名 PixAI Tagger ONNX GUI），現已支援多種本地模型和網路 VLM。
 
 原始的 PixAI Tagger 支援超過 13,000 個豐富的標籤，與常見的標註模型（例如 wd-tagger 的約 10,000 個標籤）相比具有優勢。此工具旨在最大限度地發揮其性能並支持您的圖像管理。
 
@@ -16,9 +18,10 @@
 
 ## 安裝與使用 (Installation & Usage)
 
-1.  從發布頁面下載最新的 `PixaiTaggerOnnxGui-vX.X.X.zip`。
+1.  從發布頁面下載最新的 `ImageTaggerGUI-vX.X.X.zip`。
 2.  將 zip 文件解壓縮到您喜歡的位置。
-3.  運行其中的 `pixai_tagger_gui.exe`。
+3.  運行其中的 `ImageTaggerGUI.exe`。
+4.  如果您從 v1.7.0 或更早版本更新：將檔案解壓縮到同一資料夾即可，`config.ini`、模型、GPU 元件和已儲存的 API 金鑰都會保留。舊的 `pixai_tagger_gui.exe` 可以刪除。
 
 ## 如何使用 (How to Use)
 雙擊圖像並使用滾輪或拖動來移動它。可以進行直觀的操作。
@@ -82,6 +85,6 @@
 
 ## 致謝 (Acknowledgements)
 
-- 此工具利用了 [PixAI](https://pixai.art/) 訓練的優秀標註模型。如果沒有 Pixai Tagger 的公開發布，此應用程式將無法誕生。衷心感謝。
+- 此工具利用了 [PixAI](https://pixai.art/) 訓練的優秀標註模型。如果沒有 Pixai Tagger 的公開發布，此應用程式將無法誕生。衷心感謝。本專案最初是 PixAI Tagger 的 GUI（PixAI Tagger ONNX GUI）。隨著支援的模型增多，改名為 ImageTaggerGUI，但 PixAI Tagger 始終是這一切的起點。
 - 使用的 ONNX 模型由 [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) 在 Hugging Face 上公開。謝謝。
 - 同樣感謝公開了其他已支援模型及其 ONNX 版本的作者們 — [SmilingWolf](https://huggingface.co/SmilingWolf)（WD tagger 系列）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary 的 ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle），以及公開 Florence-2（Microsoft）ONNX 全套檔案的 [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft)。各模型均遵循其上游授權條款。

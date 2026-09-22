@@ -2,13 +2,11 @@
 #
 # onnxruntime-gpu (not the CPU 'onnxruntime') so the build's core matches the
 # CUDA provider. The large onnxruntime_providers_cuda.dll is stripped from the
-# distributed zip in pixai_tagger_gui.spec and downloaded at runtime into
+# distributed zip in ImageTaggerGUI.spec and downloaded at runtime into
 # gpu_runtime/ only when the user opts into GPU. NVIDIA runtime wheels
 # (nvidia-cudnn-cu12 etc.) are NOT installed here - they are fetched at runtime
 # too. Keep the version aligned with the CUDA/cuDNN baseline: 1.23.x == CUDA 12.x
-# + cuDNN 9.  See docs/260910_gpu_acceleration_impl_plan.md.
-#
-# For WSL / CI without an NVIDIA stack, use requirements-dev-cpu.txt instead.
+# + cuDNN 9.  
 #
 # NB: onnxruntime-gpu has no 1.23.1 on PyPI (it goes 1.23.0 -> 1.23.2); the CPU
 # 'onnxruntime' does have 1.23.1. Keep this pin to a version that ACTUALLY exists

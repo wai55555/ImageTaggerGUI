@@ -43,6 +43,21 @@ class PromptMode(str, Enum):
     SHORT_TAGS = "short_tags"
 
 
+# VLM の出力トークン上限。既定値・設定ファイルの初期値・UIの入力範囲・エラー時の
+# 助言がバラバラに固定されていると、既定や最大を変えたときに保存値の補正・UI・
+# 文言が食い違う。ここを唯一の定義にして app_settings / vlm_settings_dialog /
+# vlm_transport から参照する。
+#
+# 既定 3072: 推論系VLMは最終キャプションを出す前に補完枠をかなり消費する。3072 は
+# その余地を残しつつ、通常の画像プロンプト分を差し引いても 4096 コンテキストの
+# ローカルサーバーに収まる。
+DEFAULT_MAX_OUTPUT_TOKENS = 3072
+# 下限 16: これ未満だと最終テキストが1文も出ない。上限 32768: プロバイダー側の
+# 上限より大きく設定しても意味がないため、入力の暴走を止めるためだけの値。
+MIN_MAX_OUTPUT_TOKENS = 16
+MAX_MAX_OUTPUT_TOKENS = 32768
+
+
 def _parse_enum(enum_cls, raw: object, default):
     try:
         return enum_cls(str(raw).strip().lower())
@@ -63,10 +78,8 @@ class GenerationProfile:
     # provider 既定に任せる場合は None。
     temperature: float | None = None
     top_p: float | None = None
-    # Reasoning VLMs can consume a substantial part of the completion budget before
-    # emitting the final caption. 3072 leaves room for that while fitting a 4096-context
-    # local server after the usual image prompt overhead.
-    max_output_tokens: int = 3072
+    # 既定値の根拠は DEFAULT_MAX_OUTPUT_TOKENS のコメントを参照。
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     # 上級者向け: これが空でなければ system プロンプトを完全に置き換える（spec 4.6節）。
     custom_system_prompt: str = ""
     # 画像前処理の設定（vlm_image.ImagePreprocessConfig をそのまま持たせず、値だけ）。
@@ -89,7 +102,8 @@ class GenerationProfile:
             prompt_mode=_parse_enum(PromptMode, data.get("prompt_mode"), base.prompt_mode),
             temperature=_opt_float(data.get("temperature")),
             top_p=_opt_float(data.get("top_p")),
-            max_output_tokens=_clamp_int(data.get("max_output_tokens"), base.max_output_tokens, lo=16, hi=32768),
+            max_output_tokens=_clamp_int(data.get("max_output_tokens"), base.max_output_tokens,
+                                         lo=MIN_MAX_OUTPUT_TOKENS, hi=MAX_MAX_OUTPUT_TOKENS),
             custom_system_prompt=str(data.get("custom_system_prompt", "") or ""),
             image_max_long_edge=_clamp_int(data.get("image_max_long_edge"), base.image_max_long_edge, lo=256, hi=8192),
             image_format=_norm_image_format(data.get("image_format", base.image_format)),

@@ -37,20 +37,71 @@ _REJECTION_HINTS = {
     "no_verified_candidate": "no eligible VLM route is available; check model IDs, API keys, identity, and enabled routes",
 }
 
+# 拒否理由コード → 表示用の翻訳キー（[Vlm] セクション）。理由コード自体は
+# 保存・判定に使う安定IDなので英語のまま、画面へ出すときだけ訳す。
+REJECTION_REASON_KEYS = {
+    "custom_connection_not_found": "Reject_Custom_Connection_Not_Found",
+    "selected_connection_is_not_custom": "Reject_Selected_Connection_Is_Not_Custom",
+    "custom_connection_disabled": "Reject_Custom_Connection_Disabled",
+    "custom_connection_no_auth": "Reject_Custom_Connection_No_Auth",
+    "no_verified_candidate": "Reject_No_Verified_Candidate",
+}
+_REJECTION_FALLBACK_KEY = "Reject_Unknown"
+
+# CandidateSet.excluded に入る除外理由コード → 表示用の翻訳キー。
+EXCLUSION_REASON_KEYS = {
+    "disabled": "Exclude_Disabled",
+    "not_verified": "Exclude_Not_Verified",
+    "identity_unknown": "Exclude_Identity_Unknown",
+    "quantization_unknown": "Exclude_Quantization_Unknown",
+    "no_auth": "Exclude_No_Auth",
+    "no_image_support": "Exclude_No_Image_Support",
+    "cooldown": "Exclude_Cooldown",
+}
+
 
 def explain_rejected_reason(reason: str) -> str:
-    """候補選択で停止した理由へ、確認すべき設定を付ける。"""
+    """候補選択で停止した理由へ、確認すべき設定を付ける（英語・ログ用）。"""
     raw = str(reason or "unknown")
     return f"{raw}: {_REJECTION_HINTS.get(raw, 'check VLM route settings and connection availability')}"
 
 
 def explain_candidate_failure(reason: str, excluded: dict[str, str] | None = None) -> str:
-    """候補が空になった理由と、接続ごとの除外理由をまとめて返す。"""
+    """候補が空になった理由と、接続ごとの除外理由をまとめて返す（英語・ログ用）。"""
     message = explain_rejected_reason(reason)
     if not excluded:
         return message
     details = ", ".join(f"{connection_id}={why}" for connection_id, why in excluded.items())
     return f"{message}; excluded candidates: {details}"
+
+
+def _translated(get_string, key: str, fallback: str) -> str:
+    text = get_string("Vlm", key)
+    return fallback if not text or text == key else text
+
+
+def localized_candidate_failure(reason: str, excluded: dict[str, str] | None,
+                                get_string) -> str:
+    """候補が空になった理由を、利用者の言語で1行にまとめる。
+
+    従来は explain_candidate_failure() の英語をそのまま翻訳済みメッセージの
+    `{reason}` へ差し込んでいたため、どの言語でも理由と対処案だけ英語だった。
+    理由コード・除外理由コードは安定IDのまま保ち、ここで表示用に訳す
+    （コード自体も併記する: 実機での問い合わせ時に言語を跨いで照合できる）。
+    """
+    raw = str(reason or "unknown")
+    key = REJECTION_REASON_KEYS.get(raw, _REJECTION_FALLBACK_KEY)
+    fallback = _REJECTION_HINTS.get(
+        raw, "check VLM route settings and connection availability")
+    message = f"{raw}: {_translated(get_string, key, fallback)}"
+    if not excluded:
+        return message
+    details = ", ".join(
+        f"{connection_id}="
+        f"{_translated(get_string, EXCLUSION_REASON_KEYS.get(why, ''), why) if why in EXCLUSION_REASON_KEYS else why}"
+        for connection_id, why in excluded.items())
+    joined = _translated(get_string, "Exclude_List_Prefix", "excluded candidates")
+    return f"{message}; {joined}: {details}"
 
 
 @dataclass

@@ -29,16 +29,17 @@ _PROTOCOLS = [
     ("anthropic_messages", "Anthropic Messages API"),
     ("gemini_generate_content", "Google Gemini generateContent"),
 ]
+# (保存値, 表示ラベルの翻訳キー)。保存値は内部IDのまま固定し、表示だけ訳す。
 _AUTH_TYPES = [
-    ("none", "None"),
-    ("bearer", "Bearer token"),
-    ("header_key", "API key in header"),
-    ("query_key", "API key in query"),
+    ("none", "Custom_Auth_None"),
+    ("bearer", "Custom_Auth_Bearer"),
+    ("header_key", "Custom_Auth_Header_Key"),
+    ("query_key", "Custom_Auth_Query_Key"),
 ]
 _LOCALITY = [
-    (ConnectionLocality.AUTO, "Auto"),
-    (ConnectionLocality.LOCAL, "Local"),
-    (ConnectionLocality.EXTERNAL, "External"),
+    (ConnectionLocality.AUTO, "Custom_Locality_Auto"),
+    (ConnectionLocality.LOCAL, "Custom_Locality_Local"),
+    (ConnectionLocality.EXTERNAL, "Custom_Locality_External"),
 ]
 
 
@@ -66,7 +67,7 @@ class CustomConnectionDialog(QDialog):
         basic = QGroupBox(self._t("Vlm", "Custom_Section_Basic"))
         bf = QFormLayout(basic)
         self.name_edit = QLineEdit()
-        self.locality_combo = _combo(_LOCALITY)
+        self.locality_combo = _combo(_LOCALITY, self._t)
         self.protocol_combo = _combo(_PROTOCOLS)
         self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText("http://127.0.0.1:1234/v1")
@@ -95,7 +96,7 @@ class CustomConnectionDialog(QDialog):
 
         auth = QGroupBox(self._t("Vlm", "Custom_Section_Auth"))
         af = QFormLayout(auth)
-        self.auth_type_combo = _combo(_AUTH_TYPES)
+        self.auth_type_combo = _combo(_AUTH_TYPES, self._t)
         self.auth_header_edit = QLineEdit("Authorization")
         self.auth_query_edit = QLineEdit("key")
         self.api_key_edit = QLineEdit()
@@ -390,10 +391,21 @@ class CustomConnectionDialog(QDialog):
         super().closeEvent(event)
 
 
-def _combo(pairs) -> QComboBox:
+def _combo(pairs, translate=None) -> QComboBox:
+    """(保存値, ラベル) の並びからコンボを作る。
+
+    `translate` を渡すと、ラベルを [Vlm] の翻訳キーとして解決する（引けなければ
+    キーをそのまま表示しないよう、素のラベルへ落とす）。プロトコル名のような
+    製品名は訳さないので translate を渡さない。
+    """
     c = QComboBox()
     for value, label in pairs:
-        c.addItem(label, value)
+        text = label
+        if translate is not None:
+            resolved = translate("Vlm", label)
+            if resolved and resolved != label:
+                text = resolved
+        c.addItem(text, value)
     return c
 
 

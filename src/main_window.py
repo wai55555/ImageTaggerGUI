@@ -25,6 +25,7 @@ from PySide6.QtGui import (
 
 from utils import write_debug_log
 import constants
+import vlm_config
 import app_settings # Added import
 from app_settings import load_config, load_settings, save_config # Updated import
 from custom_widgets import PathLineEdit, TagListWidget
@@ -35,7 +36,7 @@ from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSetting
 from grid_view_widget import GridViewWidget
 from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker, UpdateCheckWorker
 from vlm_worker import VlmCaptionWorker
-from locale_manager import LocaleManager
+from locale_manager import LocaleManager, available_language_codes, normalize_language_code
 from ui_main_window import Ui_MainWindow
 from undo_manager import (
     UndoManager, AddTagsAction, RemoveTagAction, BulkAddTagsAction, BulkRemoveTagsAction,
@@ -44,36 +45,126 @@ from undo_manager import (
 from model_registry import ModelEntry, config_mapping, discover_models, get_model_entry
 from model_mode_controller import ModelModeController
 
-def get_os_language() -> str:
-    """
-    Gets the OS's UI language in a robust, cross-platform way.
-    Uses ctypes for Windows, QLocale for macOS/Linux, and falls back to locale.
-    """
-    try:
-        if sys.platform == "win32":
-            # Windows: Use ctypes to call Windows API for the most reliable result.
-            import ctypes
-            windll = ctypes.windll.kernel32
-            # GetUserDefaultUILanguage returns a LANGID, e.g., 0x0411 for ja-JP
-            lang_id = windll.GetUserDefaultUILanguage()
-            # Primary language ID is in the lower 10 bits
-            primary_lang_id = lang_id & 0x3FF
-            # A map for common primary language IDs to ISO 639-1 codes
-            lang_map = {0x09: "en", 0x11: "ja", 0x07: "de", 0x0c: "fr", 0x12: "ko", 0x04: "zh"}
-            return lang_map.get(primary_lang_id, "en")
-    except Exception as e:
-        write_debug_log(f"Failed to get OS language via ctypes: {e}")
+# GetUserDefaultUILanguage() の primary language ID → 言語コード。
+# LCIDToLocaleName() が使えなかったときだけ使う保険なので、同梱している9言語ぶん。
+_WIN_PRIMARY_LANGID_TO_CODE = {
+    0x09: "en", 0x11: "ja", 0x07: "de", 0x0c: "fr",
+    0x12: "ko", 0x0a: "es", 0x19: "ru", 0x04: "zh",
+}
+# 中国語だけは primary language ID では簡体字／繁体字が決まらないので
+# sublanguage ID（上位ビット）で分ける。1=TW, 2=CN, 3=HK, 4=SG, 5=MO。
+_WIN_CHINESE_SUBLANG_TO_CODE = {
+    0x01: "zh_TW", 0x02: "zh_CN", 0x03: "zh_TW", 0x04: "zh_CN", 0x05: "zh_TW",
+}
 
-    # Fallback for non-Windows (macOS, Linux) or if ctypes fails.
+
+def _os_language_raw() -> str:
+    """OS の UI 言語を、正規化前の生のタグ（`ja-JP` / `zh_TW` 等）で返す。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            # GetUserDefaultUILanguage returns a LANGID, e.g. 0x0411 for ja-JP.
+            lang_id = kernel32.GetUserDefaultUILanguage()
+            # LCIDToLocaleName は "ja-JP" / "zh-TW" のような BCP-47 名を返す。
+            # 自前の LANGID 表では地域が落ちるため、中国語の簡体字／繁体字を
+            # 区別できない（zh.ini は存在しない）。まずこちらを使う。
+            buffer = ctypes.create_unicode_buffer(85)  # LOCALE_NAME_MAX_LENGTH
+            if kernel32.LCIDToLocaleName(lang_id, buffer, len(buffer), 0) and buffer.value:
+                return buffer.value
+            primary = lang_id & 0x3FF
+            if primary == 0x04:
+                return _WIN_CHINESE_SUBLANG_TO_CODE.get(lang_id >> 10, "zh")
+            return _WIN_PRIMARY_LANGID_TO_CODE.get(primary, "")
+        except Exception as e:
+            write_debug_log(f"Failed to get OS language via ctypes: {e}")
+
+    # Non-Windows (macOS, Linux), or Windows if ctypes failed.
     # locale.getdefaultlocale() is more reliable in bundled apps than QLocale
     # as it doesn't depend on the QApplication instance's state.
+    # 地域まで含めた値をそのまま返す（以前はここで '_' の前だけを取っており、
+    # zh_CN / zh_TW が存在しない "zh" に潰れていた）。
     try:
         import locale
         lang_code, _ = locale.getdefaultlocale()
-        return lang_code.split('_')[0] if lang_code else "en"
+        return lang_code or ""
     except (ImportError, ValueError, IndexError) as e:
         write_debug_log(f"Failed to get OS language via locale: {e}")
-        return "en"
+        return ""
+
+
+# 停止要求に応じなかったスレッドを、実際に終了するまで保持する置き場。通常は空。
+#
+# MainWindow のインスタンス属性ではなく**モジュール変数**に置くのが要点。
+# ウィンドウが破棄されるとインスタンス属性のリストも一緒に消え、稼働中の QThread に
+# 対する最後の Python 参照が失われる。PySide6 は親を持たない QThread を Python 側の
+# 所有物として扱うため、そこで C++ オブジェクトが破棄され、Qt の
+# 「Deleting a running QThread」経路でプロセスが fail-fast する
+# （最小再現で終了コード 0xC0000409 を確認、260922 レビュー指摘）。
+# `finished → deleteLater` の配線だけでは、finished より前に参照が消えるこの経路を
+# 防げない。
+_detached_threads: list[QThread] = []
+
+
+def detached_thread_count() -> int:
+    """まだ終了していない退避済みスレッドの数（テスト・終了処理用）。"""
+    _prune_detached_threads()
+    return len(_detached_threads)
+
+
+def _prune_detached_threads() -> None:
+    """終了済み／既に破棄済みのぶんをリストから外す。"""
+    global _detached_threads
+    alive: list[QThread] = []
+    for thread in _detached_threads:
+        try:
+            if not thread.isFinished():
+                alive.append(thread)
+        except RuntimeError:  # 既に C++ 側が破棄済み
+            pass
+    _detached_threads = alive
+
+
+def wait_for_detached_threads(timeout_ms: int = 5000) -> bool:
+    """退避済みスレッドの終了を待つ。全て終了できたら True。
+
+    終了処理から呼ぶ。待ちきれなくても強制破棄はしない（稼働中の QThread を
+    破棄する方がクラッシュとして重い）。プロセス終了まで参照を持ち続けるため、
+    ここで False を返してもリストからは外さない。
+    """
+    _prune_detached_threads()
+    if not _detached_threads:
+        return True
+    deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
+    for thread in list(_detached_threads):
+        try:
+            if thread.isFinished():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.quit()
+            thread.wait(int(remaining * 1000))
+        except RuntimeError:
+            continue
+    _prune_detached_threads()
+    if _detached_threads:
+        write_debug_log(
+            f"{len(_detached_threads)} detached thread(s) still running at shutdown; "
+            "keeping the references alive instead of destroying them")
+    return not _detached_threads
+
+
+def get_os_language() -> str:
+    """OS の UI 言語を、実在する翻訳ファイルの言語コードへ正規化して返す。
+
+    戻り値は必ず `lang/<code>.ini` が存在するコード（見つからなければ "en"）。
+    この値は初回起動時に config.ini へ保存され、以後の起動でも使われるため、
+    存在しないコードを返すと利用者はずっと英語表示のままになる。
+    """
+    raw = _os_language_raw()
+    codes = available_language_codes(constants.LANG_DIR, constants.LANG_RESOURCE_DIR)
+    normalized = normalize_language_code(raw, codes)
+    write_debug_log(f"OS language '{raw}' resolved to '{normalized}'")
+    return normalized
 
 class StoppableWorker(Protocol): # type: ignore
     """A protocol for worker objects that have a thread-safe stop() method."""
@@ -161,6 +252,11 @@ class MainWindow(QMainWindow):
             self.settings.language_code = os_lang
             save_config(self.settings)
 
+        # 保存済みの「ライブ一覧で確認したVLMモデルID」をプロセス内カタログへ戻す。
+        # is_vlm_model_id() の判定が再起動を跨いで一致し、明示的に選んだ経路が
+        # 黙って別経路へ差し替わらないようにする（260922 レビュー指摘）。
+        vlm_config.restore_discovered_vlm_ids(self.settings.vlm)
+
         self.locale_manager = LocaleManager(self.settings.language_code, constants.LANG_DIR, constants.LANG_RESOURCE_DIR)
         app_settings.set_get_string_func(self.locale_manager.get_string) # Add this line
         write_debug_log(self.locale_manager.get_string("MainWindow", "Application_Startup"))
@@ -217,7 +313,7 @@ class MainWindow(QMainWindow):
         # edit is persisted and the Undo button lights up without waiting for focus-out.
         self._caption_save_timer = QTimer(self)
         self._caption_save_timer.setSingleShot(True)
-        self._caption_save_timer.setInterval(1200)
+        self._caption_save_timer.setInterval(constants.CAPTION_AUTOSAVE_DELAY_MS)
         self._caption_save_timer.timeout.connect(self._save_current_caption)
         self.loading_timer: QTimer | None = None
         self.loading_state = 0
@@ -606,8 +702,12 @@ class MainWindow(QMainWindow):
         
         if selected_item:
             self.image_list.setCurrentItem(selected_item)
-            # Schedule the image loading to ensure the widget is sized correctly
-            QTimer.singleShot(100, lambda: self._load_and_fit_image(selected_item))
+            # Schedule the image loading to ensure the widget is sized correctly.
+            # Re-fetch the current item at fire time instead of capturing selected_item
+            # in the closure: if reload_image_list() runs again before this timer fires
+            # (e.g. a fast-failing tagging run completes within 100ms), image_list.clear()
+            # deletes the underlying C++ object and the captured reference goes dangling.
+            QTimer.singleShot(100, lambda: self._load_and_fit_image(self.image_list.currentItem()))
         else:
             self._clear_image_display()
 
@@ -966,7 +1066,6 @@ class MainWindow(QMainWindow):
     def _on_vlm_binding_verified(self, provider_id: str, profile_id: str):
         """実出力を確認できた内蔵 binding を `[Vlm] verified_bindings` に永続化する
         （次回以降 VERIFIED 扱い。UI スレッドで config を書く）。"""
-        import vlm_config
         if vlm_config.mark_binding_verified(self.settings.vlm, provider_id, profile_id=profile_id):
             self.save_current_config()
             self.update_log(self.locale_manager.get_string(
@@ -1266,6 +1365,16 @@ class MainWindow(QMainWindow):
                 else:
                     write_debug_log(f"DEBUG: closeEvent: Thread {thread} finished gracefully.")
 
+        # 退避済みスレッド（_cleanup_tagger_thread が5秒待っても終わらず手放した分）も
+        # ここで待つ。closeEvent が列挙していなかったため、稼働中のまま破棄されて
+        # プロセスがクラッシュしうる状態だった（260922 レビュー指摘）。
+        # 待ちきれなくても terminate はしない: 参照はモジュール変数が持ち続けるので、
+        # 破棄されてクラッシュすることはない。
+        if not wait_for_detached_threads(5000):
+            write_debug_log(
+                "DEBUG: closeEvent: detached thread(s) outlived the wait; "
+                "references are kept for the remaining process lifetime")
+
         write_debug_log("DEBUG: closeEvent: Proceeding with application close.")
         super().closeEvent(event)
 
@@ -1368,7 +1477,8 @@ class MainWindow(QMainWindow):
             self._handle_folder_drop(folder_path, None)
         else:
             # Using a hardcoded string for now. Should be added to locale.
-            self.update_log(f"無効なフォルダパスです: {folder_path}", "red")
+            self.update_log(self.locale_manager.get_string(
+                "MainWindow", "Error_Invalid_Folder_Path", folder_path=folder_path), "red")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         write_debug_log(f"DEBUG: dragEnterEvent - hasUrls: {event.mimeData().hasUrls()}")
@@ -1731,22 +1841,76 @@ class MainWindow(QMainWindow):
         """Safely cleans up the existing tagger thread and worker."""
         if self._tagger_thread:
             if self._tagger_thread.isRunning():
-                # 通常は worker.finished -> thread.quit で既に終了処理へ入っている。
-                # ここに到達するのは停止や異常経路だけなので、ユーザー向けの通常ログ
-                # へ「残存スレッド」を出さず、詳細はデバッグログへ残す。
+                # worker.finished は _on_tagger_finished（これがこの cleanup を呼ぶ）と
+                # thread.quit の両方に connect されており（この順）、この cleanup 自体が
+                # その1本目の帰結として、2本目の thread.quit がまだ処理される前に走る
+                # ことがある——「異常経路だけ」という想定は正確ではなく、正常完了でも
+                # 普通に起こりうる経路。
                 write_debug_log("tagger thread still running during cleanup; waiting")
                 self._tagger_thread.quit()
-                if not self._tagger_thread.wait(5000):
-                    write_debug_log("tagger thread did not finish within cleanup timeout")
+                # 素朴な wait(5000) はメインスレッドのイベントループを丸ごと止めてしまい、
+                # 同じ finished シグナルから2本目に繋がっている thread.quit（まだキューに
+                # 残っている可能性がある）や、ワーカースレッド側の後始末が必要とする
+                # メインスレッドとのやり取りが処理される機会を奪う。ここで小刻みに
+                # processEvents() を挟みながら待つことで、その機会を与えつつ、合計の
+                # 待ち時間の上限（5秒）は変えない。
+                deadline = time.monotonic() + 5.0
+                while self._tagger_thread.isRunning() and time.monotonic() < deadline:
+                    QApplication.processEvents()
+                    self._tagger_thread.wait(50)
+                if self._tagger_thread.isRunning():
+                    write_debug_log("tagger thread did not finish within cleanup timeout; "
+                                     "detaching without terminate()")
                     self.update_log(self.locale_manager.get_string(
-                        "MainWindow", "Thread_Shutdown_Failed"), "red")
-                    self._tagger_thread.terminate()
-                    self._tagger_thread.wait(1000)
+                        "MainWindow", "Thread_Shutdown_Slow"), "orange")
+                    # QThread.terminate()（Windows では TerminateThread 相当）は危険:
+                    # HTTPS ソケット処理などネイティブコードの最中に強制終了すると、
+                    # ヒープ/ローダーロックを保持したまま死に、以後プロセス全体が
+                    # ハングしうることを実機（オフスクリーン一括テスト）で確認した
+                    # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
+                    # スレッド自身は自分のイベントループが処理される限り、いずれ
+                    # 自然に終了する。
+                    self._detach_running_thread(self._tagger_thread, self._tagger_worker)
+                    self._tagger_thread = None
+                    self._tagger_worker = None
+                    return
             self._tagger_thread.deleteLater()
             self._tagger_thread = None
         if self._tagger_worker:
             self._tagger_worker.deleteLater()
             self._tagger_worker = None
+
+    def _detach_running_thread(self, thread: QThread, worker) -> None:
+        """終了しなかったスレッドを、実際に終了した後で破棄するよう繋いで手放す。
+
+        ここで直接 deleteLater() してはいけない。deleteLater() の DeferredDelete は
+        「その QObject が所属するスレッド」へ post されるが、QThread *オブジェクト* の
+        所属は管理対象のワーカースレッドではなく生成元（メインスレッド）なので、
+        次にメインのイベントループが回った時点で——ワーカーの終了を待たずに——破棄
+        される。Qt のドキュメントどおり、稼働中の QThread を破棄すると
+        "Deleting a running QThread will probably result in a program crash"。
+        以前ここには「deleteLater は稼働中でも安全（破棄は終了後まで遅延される）」
+        というコメントがあったが、これは誤りだった（260922 PR#27 レビュー指摘）。
+
+        代わりに Qt 公式の後始末イディオム（finished → deleteLater）を使う。
+        QThreadPrivate::finish() は running=false / finished=true を立ててから
+        finished を emit するので、メインのイベントループが DeferredDelete を
+        処理する時点では確実に停止済みになる。
+
+        参照はモジュール変数 `_detached_threads` が持つ。MainWindow の属性に置くと、
+        ウィンドウ破棄時にリストごと最後の参照が消えて、まさに避けたかった
+        「稼働中の QThread の破棄」が起きる（closeEvent は退避済みスレッドを
+        列挙していなかった）。終了処理は wait_for_detached_threads() で待つ。
+
+        スレッドが永久に終わらない場合はプロセス終了まで参照が残る（リークだが、
+        クラッシュより望ましい）。
+        """
+        # 既に終了・破棄済みのぶんを掃除する。detach 自体が稀なのでここで十分。
+        _prune_detached_threads()
+        _detached_threads.append(thread)
+        if worker is not None:
+            thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
 
     def _stop_tagging_thread(self):
         """Requests the tagging thread to stop."""
@@ -1833,8 +1997,15 @@ class MainWindow(QMainWindow):
         self.reload_tags_only()
 
         self._update_ui_for_processing(False, 'tagging')
-        
-        self._cleanup_tagger_thread()
+
+        # worker.finished は _on_tagger_finished（ここ）と thread.quit の両方に
+        # connect されている（この順）。ここで即座に _cleanup_tagger_thread() を
+        # 呼ぶと、まだキューに残っている thread.quit がこのイベントループの
+        # ターンでは処理されておらず、cleanup 側の isRunning() チェックが
+        # 「まだ動いている」と見えて無駄な wait/強制終了に倒れうる。
+        # QTimer.singleShot(0, ...) で次のイベントループターンへ回すことで、
+        # 先に thread.quit が処理される順序を保証する。
+        QTimer.singleShot(0, self._cleanup_tagger_thread)
 
     @Slot(bool)
     def _on_download_finished(self, success: bool):
@@ -2047,6 +2218,10 @@ class MainWindow(QMainWindow):
         for key, row_index in keys.items():
             is_float = step < 1
             label_suffix = self.locale_manager.get_string("MainWindow", "Threshold_Suffix") if section == 'Thresholds' else self.locale_manager.get_string("MainWindow", "Max_Count_Suffix")
+            # [CategoryDialog] Category_<key> は「詳細」ダイアログ向けに
+            # "General（一般）" のような訳語併記になっているため、しきい値ラベルの
+            # 頭に付けると "General（一般） しきい値:" と冗長になる。ここは
+            # 短いカテゴリ名のまま出す。
             label = QLabel(f"{key.capitalize()} {label_suffix}:")
             
             settings_section = getattr(self.settings, section.lower())
@@ -2388,7 +2563,8 @@ class MainWindow(QMainWindow):
             return
 
         self.central_widget.setCurrentWidget(self.grid_view_widget)
-        self.setWindowTitle(f"{constants.MSG_WINDOW_TITLE} - Grid View")
+        self.setWindowTitle(f"{constants.MSG_WINDOW_TITLE} - "
+                            + self.locale_manager.get_string("GridView", "Window_Title"))
         self.grid_view_widget.set_caption_mode(self._is_text_output_mode())
         self.grid_view_widget.load_images(image_paths, self._tag_cache, Path(self.settings.paths.input_dir))
         self.showMaximized()

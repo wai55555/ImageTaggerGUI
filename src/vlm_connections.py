@@ -79,7 +79,7 @@ def resolve_custom_kind(locality: ConnectionLocality, base_url: str) -> Connecti
 @dataclass
 class RetryPolicy:
     connect_timeout_s: float = 10.0
-    read_timeout_s: float = 120.0
+    read_timeout_s: float = 60.0
     retry_same_max: int = 1
     retry_5xx: bool = True
     use_retry_after_on_429: bool = False   # spec: 429 は待たず failover

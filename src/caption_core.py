@@ -7,6 +7,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
+import constants
 from utils import log_dbg, GetString
 from app_settings import AppSettings
 from tagging_core import (
@@ -337,10 +338,9 @@ def process_caption_loop(
     n_errors = 0
     n_unchanged = 0
     failed_seen = set(failed_paths or ())
-    # progress_cb もクロススレッド signal なので毎画像発行を避け、全体で ~200 回に間引く
-    # （PR#16 レビュー指摘）。最後の1枚は必ず発行して N/N に到達させる。
-    # 天井除算: total//200 だと 201〜399 枚で step=1 になり間引きが効かない。
-    progress_step = max(1, (total + 199) // 200)
+    # 全体で PROGRESS_SIGNAL_BUDGET 回に間引く（理由と天井除算の根拠は
+    # constants.progress_step_for() を参照）。最後の1枚は必ず発行して N/N に到達させる。
+    progress_step = constants.progress_step_for(total)
 
     def mark_failed(path: Path) -> None:
         if failed_paths is not None and path not in failed_seen:

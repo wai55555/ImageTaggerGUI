@@ -5,13 +5,21 @@ from dataclasses import dataclass, field, is_dataclass, fields
 from pathlib import Path
 
 from utils import write_debug_log, GetString, default_get_string_fallback
+from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS
 
 _get_string: GetString = default_get_string_fallback
 
 # VLM の既定値。新規設定だけでなく、欠落した [Vlm] キーのフォールバックにも
 # 同じ値を使う。既存ユーザーが明示的に選んだモデル／順序は上書きしない。
+# 接続順序は既定プロファイル(gemma-4-31b-it)の本来の1社であるGeminiだけにする。
+# OpenRouter/Cloudflareを既定で並べても、どちらも利用者自身のAPIキー登録が無ければ
+# 認証すら通らず「複数社に自動フォールバックする」という体感上のメリットが無い
+# (実機検証: OpenRouterの無料枠はキー登録前提、Cloudflareも同様)。かつては複数社を
+# 既定で並べていたが、無料枠フォールバックの実態(readme/free_fallback_notes_ja.md)を
+# 踏まえ、初回起動時は単一の実用的な接続だけを見せる方針にした
+# (260922_vlm_fallback_ui_candidate_c_plan.md)。
 DEFAULT_VLM_MODEL_PROFILE_ID = "gemma-4-31b-it"
-DEFAULT_VLM_CONNECTION_ORDER = "gemini,nvidia,openrouter,cloudflare,groq"
+DEFAULT_VLM_CONNECTION_ORDER = "gemini"
 
 def set_get_string_func(func: GetString):
     global _get_string
@@ -232,12 +240,18 @@ class Vlm:
     markdown: str = "disabled"
     # standard / dataset_long / short_tags
     prompt_mode: str = "standard"
-    max_output_tokens: int = 3072
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     image_max_long_edge: int = 1536
     # 接続確認済みの binding。`<profile_id>:<provider_id>` をカンマ区切りで保持する。
     # キー登録時の軽量モデル一覧GET、接続診断のフルPASS、または1枚テスト成功で追記される。
     # UNKNOWN 出荷でもここに載れば VERIFIED 扱いになり、「厳格」モードでも候補に残る。
     verified_bindings: str = ""
+    # プロバイダーのモデル一覧メタデータで「画像入力に対応」と確認できた override の
+    # モデルID。`<profile_id>:<provider_id>=<model_id>` をカンマ区切りで保持する。
+    # 出荷カタログに無いIDはプロセス内登録（vlm_models.register_discovered_vlm_ids）
+    # にしか残らないため、これが無いと再起動後に同じIDが非VLM扱いへ戻り、利用者が
+    # 明示的に選んだ経路が黙って別の経路へ差し替わる（260922 レビュー指摘）。
+    vlm_capable_overrides: str = ""
     # True のとき、内蔵フォールバックは VERIFIED（実証済み or verified_bindings 収録）
     # の接続だけを候補にする。既定 False（同一と宣言されていれば未実証でも使う）。
     strict_identity: bool = False
@@ -299,8 +313,10 @@ def get_default_config() -> configparser.ConfigParser:
             'language': 'en', 'detail_level': 'maximum_detail',
             'sentence_mode': 'automatic_long_detailed', 'character_name_mode': 'explicit_only',
             'markdown': 'disabled', 'prompt_mode': 'standard',
-            'max_output_tokens': '3072', 'image_max_long_edge': '1536',
-            'verified_bindings': '', 'strict_identity': 'False', 'model_id_overrides': '',
+            'max_output_tokens': str(DEFAULT_MAX_OUTPUT_TOKENS),
+            'image_max_long_edge': '1536',
+            'verified_bindings': '',
+            'vlm_capable_overrides': '', 'strict_identity': 'False', 'model_id_overrides': '',
         },
         'Debug': {'debug_log': 'False'},
         'General': {'language_code': ''}
@@ -457,6 +473,7 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
         max_output_tokens=gi('max_output_tokens', d.max_output_tokens),
         image_max_long_edge=gi('image_max_long_edge', d.image_max_long_edge),
         verified_bindings=g('verified_bindings', d.verified_bindings),
+        vlm_capable_overrides=g('vlm_capable_overrides', d.vlm_capable_overrides),
         strict_identity=gb('strict_identity', d.strict_identity),
         model_id_overrides=g('model_id_overrides', d.model_id_overrides),
     )

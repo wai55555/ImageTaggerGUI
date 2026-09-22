@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QRect, QObject, QEvent, QTimer
 from PySide6.QtGui import QPixmap, QWheelEvent, QResizeEvent
 
 import tag_utils
+import constants
 from utils import write_debug_log
 from locale_manager import LocaleManager
 from app_settings import AppSettings
@@ -143,7 +144,7 @@ class ImageEditCellWidget(QWidget):
         # so the edit commits and Undo becomes available without waiting for focus-out.
         self._caption_save_timer = QTimer(self)
         self._caption_save_timer.setSingleShot(True)
-        self._caption_save_timer.setInterval(1200)
+        self._caption_save_timer.setInterval(constants.CAPTION_AUTOSAVE_DELAY_MS)
         self._caption_save_timer.timeout.connect(self._save_caption)
         self.caption_edit.textChanged.connect(self._caption_save_timer.start)
 
@@ -539,17 +540,20 @@ class GridViewWidget(QWidget):
         self.prev_page_btn.setStyleSheet("font-size: 14pt;")
         
         # Undo button (placed after "Previous 9")
-        self.undo_button = QPushButton("↶ Undo")
+        self.undo_button = QPushButton(
+            self.locale_manager.get_string("MainWindow", "Undo_Button"))
         self.undo_button.setEnabled(False)
         self.undo_button.setMaximumWidth(100)
         self.undo_button.setMinimumHeight(40)
         self.undo_button.setStyleSheet("font-size: 14pt;")
         self.undo_button.setToolTip(self.locale_manager.get_string("MainWindow", "Undo_No_Actions"))
         
-        self.page_label = QLabel("Page 1 / 1")
+        self.page_label = QLabel(self.locale_manager.get_string(
+            "GridView", "Page_Label", current=1, total=1))
         
         # Redo button (placed before "Next 9")
-        self.redo_button = QPushButton("↷ Redo")
+        self.redo_button = QPushButton(
+            self.locale_manager.get_string("MainWindow", "Redo_Button"))
         self.redo_button.setEnabled(False)
         self.redo_button.setMaximumWidth(100)
         self.redo_button.setMinimumHeight(40)
@@ -650,7 +654,14 @@ class GridViewWidget(QWidget):
 
         # Set initial size and position only if it's the first time showing
         if not self._image_viewer_dialog.isVisible():
-            screen_rect = QApplication.primaryScreen().availableGeometry()
+            # マルチディスプレイ対策: 常に primaryScreen ではなく、本体ウィンドウが乗っている
+            # スクリーンを基準にする（main_window.show_enlarged_image と同じ方針）。
+            main_window = self.window()
+            anchor = main_window.frameGeometry().topLeft()
+            target_screen = (QApplication.screenAt(anchor)
+                              or main_window.screen()
+                              or QApplication.primaryScreen())
+            screen_rect = target_screen.availableGeometry()
             scaled_size = pixmap.size().scaled(screen_rect.size(), Qt.AspectRatioMode.KeepAspectRatio)
             self._image_viewer_dialog.resize(scaled_size)
             self._image_viewer_dialog.move(screen_rect.center() - self._image_viewer_dialog.rect().center())
@@ -708,13 +719,16 @@ class GridViewWidget(QWidget):
             self._display_page()
     def _update_pagination_controls(self):
         if self._search_text and not self._filtered_image_paths:
-            self.page_label.setText("0 / 0")
+            self.page_label.setText(self.locale_manager.get_string(
+                "GridView", "Page_Label_Empty"))
             self.prev_page_btn.setEnabled(False)
             self.next_page_btn.setEnabled(False)
             return
         total_pages = (len(self._filtered_image_paths) + 8) // 9
         total_pages = max(1, total_pages)
-        self.page_label.setText(f"Page {self._current_page + 1} / {total_pages}")
+        self.page_label.setText(self.locale_manager.get_string(
+            "GridView", "Page_Label",
+            current=self._current_page + 1, total=total_pages))
         self.prev_page_btn.setEnabled(self._current_page > 0)
         self.next_page_btn.setEnabled((self._current_page + 1) * 9 < len(self._filtered_image_paths))
 
