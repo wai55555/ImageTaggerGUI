@@ -1,10 +1,10 @@
 # ImageTaggerGUI（原名 PixAI Tagger ONNX GUI）
 此應用程式是一個GUI工具，用於為本地的大量圖像自動產生快速準確的標籤和描述文字。透過直觀的操作，它極大地簡化了資料集的組織和管理。除了多種本地標籤和描述模型外，還支援 Gemini、OpenAI、Claude、Groq、本地 VLM 以及其他相容服務。
 
-|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.webp)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.webp)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.webp)
 
 ## 概述 (Overview)
 
@@ -67,6 +67,8 @@
 -   **新版本通知**: 啟動時檢查是否有新版本，如有則顯示下載頁面連結（僅通知，不會自動下載或自我更新）。可透過`config.ini`中的`[Behavior] update_check = dismissed`停用。
 
 ### 5. VLM 圖像描述（可選）
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/vlm_setting_01.webp)
+
 -   **透過網路 VLM 產生自然語言描述**: 啟用模型選擇框旁的「使用 VLM 連線」後，將使用視覺語言模型為每張圖像產生詳細的英文描述。預設關閉，不會影響本地標籤功能。
 -   **內建服務與同模型故障轉移**: 支援 Gemini API、OpenRouter、Cloudflare、Groq、NVIDIA NIM、Hugging Face、Vercel AI Gateway、OpenAI、Anthropic 和 xAI Grok。服務拒絕請求或受到速率限制時，只會嘗試提供*同一模型*的下一條連線，不會在未告知的情況下切換到其他模型。
 -   **自訂連線**: 可以新增任何相容 OpenAI API 的端點，包括 Ollama、LM Studio、llama.cpp 和 vLLM 等本地伺服器。

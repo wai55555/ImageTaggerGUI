@@ -1,10 +1,10 @@
 # ImageTaggerGUI (formerly PixAI Tagger ONNX GUI)
 This application is a GUI tool for automatically generating fast and accurate tags and captions for large collections of local images. It streamlines dataset organization and management with intuitive controls. In addition to multiple local tagger and captioner models, it supports Gemini, OpenAI, Claude, Groq, local VLMs, and other compatible services.
 
-|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.webp)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.webp)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.webp)
 
 ## Overview
 
@@ -67,6 +67,8 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
 -   **New Version Notification**: Checks for a new version on startup and, if one is out, shows a link to the download page (notification only - no automatic download or self-update). Can be disabled with `[Behavior] update_check = dismissed` in `config.ini`.
 
 ### 5. VLM Captioning (Optional)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/vlm_setting_01.webp)
+
 -   **Natural-language captions via a networked VLM**: Next to the model selector, a "Use VLM connection" checkbox switches generation from the local model to a Vision-Language Model that writes a detailed English caption for each image - handy as training-dataset descriptions. Off by default; local tagging is unchanged.
 -   **Built-in services with same-model fallback**: Gemini API, OpenRouter, Cloudflare, Groq, NVIDIA NIM, Hugging Face, Vercel AI Gateway, OpenAI, Anthropic, and xAI Grok are supported. If one service refuses or is rate limited, the next service offering the *same* model is tried automatically—it never silently switches to a different model. <!-- Mistral/Pixtral is commented out because its caption quality is currently too limited. -->
 -   **Custom connections**: Add any OpenAI-compatible endpoint, including local servers such as Ollama, LM Studio, llama.cpp or vLLM.

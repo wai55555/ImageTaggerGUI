@@ -3,10 +3,10 @@
 
 ローカル環境にある大量の画像に対して、高速かつ正確なタグやキャプションを自動生成するGUIツールです。直感的な操作で、データセットの整理や管理を劇的に効率化します。複数のローカルtagger／captionerモデルに加え、Gemini・OpenAI・Claude・Grok・ローカルVLMなどに対応しています。
 
-|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.webp)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.webp)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.webp)
 
 ## 概要 (Overview)
 
@@ -69,6 +69,8 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 - **新バージョン通知**: 起動時に新しいバージョンがないか確認し、あればダウンロードページへの案内を表示します（通知のみ、自動ダウンロードや自己更新は行いません）。`config.ini`の`[Behavior] update_check = dismissed`で無効化できます。
 
 ### 5. VLMキャプション（任意）
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/vlm_setting_01.webp)
+
 - **ネットワークVLMによる自然言語キャプション**: モデル選択欄の隣にある「VLM接続を使う」チェックを入れると、生成をローカルモデルからVLM（Vision-Language Model）へ切り替え、各画像に詳細な英語キャプションを付けます。学習用データセットの説明文に向いています。既定はOFFで、通常のタグ付けには影響しません。
 - **内蔵サービスと同一モデルフォールバック**: Gemini API・OpenRouter・Cloudflare・Groq・NVIDIA NIM・Hugging Face・Vercel AI Gateway・OpenAI・Anthropic・xAI Grokを利用できます。あるサービスが拒否・レート制限された場合、*同じ*モデルを提供する次のサービスへ自動で切り替えます。別モデルへ勝手に乗り換えることはありません。
 - **カスタム接続**: Ollama・LM Studio・llama.cpp・vLLM などローカルサーバーを含む、OpenAI 互換エンドポイントを追加できます。
