@@ -1,10 +1,10 @@
 # ImageTaggerGUI (ранее PixAI Tagger ONNX GUI)
 Это приложение представляет собой графический инструмент для автоматического создания точных тегов и описаний для больших коллекций локальных изображений. Интуитивно понятное управление значительно упрощает организацию наборов данных. Помимо нескольких локальных моделей тегирования и создания описаний, поддерживаются Gemini, OpenAI, Claude, Groq, локальные VLM и другие совместимые сервисы.
 
-|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.png)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.jpg)|
+|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_01.webp)|![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/main_window_02.webp)|
 |:-:|:-:|
 
-![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.jpg)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/gridview_01.webp)
 
 ## Обзор (Overview)
 
@@ -67,6 +67,8 @@
 -   **Уведомление о новой версии**: При запуске проверяется наличие новой версии, и если она есть, показывается ссылка на страницу загрузки (только уведомление - без автоматической загрузки или самообновления). Отключается через `[Behavior] update_check = dismissed` в `config.ini`.
 
 ### 5. Описания с помощью VLM (необязательно)
+![](https://raw.githubusercontent.com/wai55555/ImageTaggerGUI/refs/heads/main/sample/vlm_setting_01.webp)
+
 -   **Естественно-языковые описания через сетевую VLM**: Флажок «Использовать подключение VLM» рядом со списком моделей переключает генерацию на визуально-языковую модель, создающую подробное описание каждого изображения на английском языке. По умолчанию функция отключена и не влияет на локальное тегирование.
 -   **Встроенные сервисы и резервирование одной модели**: Поддерживаются Gemini API, OpenRouter, Cloudflare, Groq, NVIDIA NIM, Hugging Face, Vercel AI Gateway, OpenAI, Anthropic и xAI Grok. При отказе сервиса или ограничении частоты запросов приложение пробует следующее подключение только для *той же модели* и не переключается на другую модель без уведомления.
 -   **Пользовательские подключения**: Можно добавить любой OpenAI-совместимый endpoint, включая локальные серверы Ollama, LM Studio, llama.cpp и vLLM.
