@@ -31,7 +31,7 @@ RELEASE_URL_PREFIX = f"https://github.com/{REPO}/releases/"
 @dataclass
 class UpdateInfo:
     """`current_version` より新しいリリースが見つかったときに返す情報。"""
-    version: str        # tag_name そのまま（例 "v1.8.0"）
+    version: str        # tag_name そのまま（例 "v1.9.0"）
     html_url: str        # リリースページのブラウザURL（webbrowser.open 用）
     published_at: str
 

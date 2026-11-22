@@ -25,7 +25,7 @@ class _FakeResp:
 
 
 # A plausible html_url that passes the RELEASE_URL_PREFIX allowlist.
-_URL = UC.RELEASE_URL_PREFIX + "tag/v1.8.0"
+_URL = UC.RELEASE_URL_PREFIX + "tag/v1.9.0"
 
 
 def _http(status_code=200, payload=None, raise_on_json=None):
@@ -42,11 +42,11 @@ def _http_raises(exc):
 
 
 def test_returns_update_info_when_newer_version_available():
-    http = _http(200, {"tag_name": "v1.8.0", "html_url": _URL,
+    http = _http(200, {"tag_name": "v1.9.0", "html_url": _URL,
                        "published_at": "2026-01-01T00:00:00Z"})
     info = UC.check_for_update("1.7.0", http_get=http)
     assert info is not None
-    assert info.version == "v1.8.0"
+    assert info.version == "v1.9.0"
     assert info.html_url == _URL
     assert info.published_at == "2026-01-01T00:00:00Z"
 
@@ -94,12 +94,12 @@ def test_returns_none_when_tag_name_missing():
 
 
 def test_returns_none_when_tag_name_has_no_v_prefix_but_is_still_a_version():
-    # "1.8.0" without a leading v is still parseable and still newer - only truly
+    # "1.9.0" without a leading v is still parseable and still newer - only truly
     # unparseable tag names (e.g. a codename) should return None.
-    http = _http(200, {"tag_name": "1.8.0", "html_url": _URL})
+    http = _http(200, {"tag_name": "1.9.0", "html_url": _URL})
     info = UC.check_for_update("1.7.0", http_get=http)
     assert info is not None
-    assert info.version == "1.8.0"
+    assert info.version == "1.9.0"
 
 
 def test_returns_none_when_tag_name_is_empty():
@@ -113,14 +113,14 @@ def test_returns_none_when_tag_name_is_not_a_version():
 
 
 def test_returns_none_when_html_url_missing():
-    http = _http(200, {"tag_name": "v1.8.0"})
+    http = _http(200, {"tag_name": "v1.9.0"})
     assert UC.check_for_update("1.7.0", http_get=http) is None
 
 
 @pytest.mark.parametrize("bad_url", [
-    "https://evil.example/releases/tag/v1.8.0",      # other host
-    f"http://github.com/{UC.REPO}/releases/tag/v1.8.0",  # plain http
-    "https://github.com/someone-else/repo/releases/tag/v1.8.0",           # other repo
+    "https://evil.example/releases/tag/v1.9.0",      # other host
+    f"http://github.com/{UC.REPO}/releases/tag/v1.9.0",  # plain http
+    "https://github.com/someone-else/repo/releases/tag/v1.9.0",           # other repo
     "file:///C:/Windows/System32/calc.exe",
     "javascript:alert(1)",
     "",
@@ -130,12 +130,12 @@ def test_returns_none_when_html_url_missing():
 def test_returns_none_when_html_url_is_not_our_release_page(bad_url):
     """html_url goes straight to webbrowser.open() (os.startfile on Windows), so
     anything outside our own /releases/ pages is refused rather than opened."""
-    http = _http(200, {"tag_name": "v1.8.0", "html_url": bad_url})
+    http = _http(200, {"tag_name": "v1.9.0", "html_url": bad_url})
     assert UC.check_for_update("1.7.0", http_get=http) is None
 
 
 def test_accepts_html_url_under_our_release_prefix():
-    http = _http(200, {"tag_name": "v1.8.0", "html_url": UC.RELEASE_URL_PREFIX + "tag/v1.8.0"})
+    http = _http(200, {"tag_name": "v1.9.0", "html_url": UC.RELEASE_URL_PREFIX + "tag/v1.9.0"})
     info = UC.check_for_update("1.7.0", http_get=http)
     assert info is not None
     assert info.html_url.startswith(UC.RELEASE_URL_PREFIX)
@@ -151,12 +151,12 @@ def test_returns_none_when_payload_is_not_a_dict():
 
 
 def test_returns_none_when_current_version_is_unparseable():
-    http = _http(200, {"tag_name": "v1.8.0", "html_url": _URL})
+    http = _http(200, {"tag_name": "v1.9.0", "html_url": _URL})
     assert UC.check_for_update("dev", http_get=http) is None
 
 
 def test_published_at_defaults_to_empty_string_when_not_a_string():
-    http = _http(200, {"tag_name": "v1.8.0", "html_url": _URL, "published_at": None})
+    http = _http(200, {"tag_name": "v1.9.0", "html_url": _URL, "published_at": None})
     info = UC.check_for_update("1.7.0", http_get=http)
     assert info is not None
     assert info.published_at == ""
@@ -213,19 +213,19 @@ def test_update_settings_round_trip_through_config_file(monkeypatch, tmp_path):
     assert (s.behavior.update_check, s.behavior.update_check_last, s.behavior.update_skip_version) == ("ask", "", "")
     s.behavior.update_check = "dismissed"
     s.behavior.update_check_last = "2026-09-20T01:02:03.456789+00:00"
-    s.behavior.update_skip_version = "v1.8.0"
+    s.behavior.update_skip_version = "v1.9.0"
     assert A.save_config(s) is True
 
     raw = configparser.ConfigParser(interpolation=None)
     raw.read(cfg_path, encoding="utf-8")
     assert raw["Behavior"]["update_check"] == "dismissed"
     assert raw["Behavior"]["update_check_last"] == "2026-09-20T01:02:03.456789+00:00"
-    assert raw["Behavior"]["update_skip_version"] == "v1.8.0"
+    assert raw["Behavior"]["update_skip_version"] == "v1.9.0"
 
     reloaded = A.load_settings(A.load_config())
     assert reloaded.behavior.update_check == "dismissed"
     assert reloaded.behavior.update_check_last == "2026-09-20T01:02:03.456789+00:00"
-    assert reloaded.behavior.update_skip_version == "v1.8.0"
+    assert reloaded.behavior.update_skip_version == "v1.9.0"
 
 
 def test_missing_update_keys_in_old_config_fall_back_to_defaults():
