@@ -10,7 +10,7 @@
 
 ## 概要 (Overview)
 
-**ImageTaggerGUI** は、[PixAI](https://pixai.art/) のタグ付けモデル「PixAI Tagger v0.9」と「v1.0」の[ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)・[v1.0 ONNX変換版](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
+**ImageTaggerGUI** は、[PixAI](https://pixai.art/) のタグ付けモデル「PixAI Tagger v0.9」と「v1.0」の[v0.9 ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)・[v1.0 ONNX変換版](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
 
 本プロジェクトは PixAI Tagger の GUI（旧名 PixAI Tagger ONNX GUI）として始まり、現在は複数のローカルモデルとネットワーク VLM に対応しています。
 
