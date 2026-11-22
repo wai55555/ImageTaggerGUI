@@ -1,0 +1,55 @@
+{
+  "model_id": "pixai-tagger-v1.0",
+  "model_name": "PixAI Tagger v1.0 (ONNX)",
+  "model_type": "tagger",
+  "license": "Apache-2.0",
+  "source": "ONNX conversion by nocturna of pixai-labs/pixai-tagger-v1.0",
+  "network": {
+    "files": {
+      "model.onnx": "https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx/resolve/main/model.onnx",
+      "config.json": "https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx/resolve/main/config.json"
+    },
+    "hash_verified_file": "model.onnx"
+  },
+  "inference": {
+    "input_size": 1008,
+    "layout": "nchw",
+    "channel_order": "rgb",
+    "rescale_to_unit": true,
+    "pad_color_rgb": [0, 0, 0],
+    "resampling": "bilinear",
+    "alpha_background_rgb": [255, 255, 255],
+    "normalize_mean": [0.5, 0.5, 0.5],
+    "normalize_std": [0.5, 0.5, 0.5],
+    "extra_inputs": [],
+    "output_name": "probs",
+    "output_activation": "none"
+  },
+  "tags_csv": {
+    "format": "pixai_v1_config",
+    "file_name": "config.json",
+    "default_category": "general"
+  },
+  "ui": {
+    "supports_character_tag": true,
+    "supports_threshold_slider": true,
+    "categories": ["general", "character", "copyright", "style", "meta", "rating"],
+    "default_thresholds": {
+      "general": 0.17,
+      "character": 0.27,
+      "copyright": 0.24,
+      "style": 0.15,
+      "meta": 0.17,
+      "rating": 0.41
+    },
+    "default_limits": {
+      "general": 55,
+      "character": 1,
+      "copyright": 25,
+      "style": 25,
+      "meta": 15,
+      "rating": 4
+    }
+  },
+  "tag_translation": "english_only"
+}

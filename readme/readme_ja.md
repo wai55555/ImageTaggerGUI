@@ -10,11 +10,11 @@
 
 ## 概要 (Overview)
 
-**ImageTaggerGUI** は、[PixAI](https://pixai.art/) が開発した画像タグ付けモデルの[ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
+**ImageTaggerGUI** は、[PixAI](https://pixai.art/) のタグ付けモデル「PixAI Tagger v0.9」と「v1.0」の[ONNX版](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)・[v1.0 ONNX変換版](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx)をはじめとする複数のローカルモデルと、任意のネットワークVLMを利用し、画像にタグやキャプションを付与します。
 
 本プロジェクトは PixAI Tagger の GUI（旧名 PixAI Tagger ONNX GUI）として始まり、現在は複数のローカルモデルとネットワーク VLM に対応しています。
 
-PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的なタグ付けモデル（例：wd-taggerの約10,000タグ）と比較して有利です。このツールはその性能を最大限に引き出し、あなたの画像管理をサポートするために開発されました。
+PixAI Tagger v0.9は13,461タグ、v1.0は30,877タグに対応しています。同じ環境で20枚を処理した比較では、v1.0はv0.9の約2.3倍の時間がかかりました。実際の速度はハードウェアやCPU/GPUの使用状況によって異なります。v1.0のタグ名は現在英語のみです。
 
 画像の自動タグ付けはもちろん、タグの閲覧、個別編集、そして強力な一括編集機能（タグの追加・削除）を備えています。
 
@@ -47,7 +47,7 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
     - マウスホイールやキーボード（矢印キー, WASDなど）で、サクサクと次々に画像を切り替えて確認できます。
 
 ### 2. パワフルな自動タグ付け
-- **高速なONNX Runtime**: CPUでも軽快に動作するONNXモデルを採用。大量の画像もストレスなく処理します。
+- **ONNX Runtime**: CPUでの推論にも対応しています。処理速度はモデルやハードウェアによって異なります。
 - **モデル自動ダウンロード**: 選択したモデルと必要なメタデータを、設定された配布元からボタン一つでダウンロードできます。面倒な手作業は不要です。
 - **GPU対応（NVIDIA・任意）**: NVIDIA GPUがあると、起動時の確認ダイアログからGPUコンポーネント（2GB前後）を一度ダウンロードし、アプリを再起動すればtaggerをCUDAで実行できます（実測RTX 4070で約28倍高速）。ダウンロードしなくても、また非NVIDIA環境でも、従来どおりCPUで動作します。キャプション（Florence-2）は量子化モデルの都合でCPUのままです。切り替えは`config.ini`の`[Behavior] onnx_device`（`auto`／`cpu`／`cuda`）。
 
@@ -91,5 +91,5 @@ PixAI Taggerは13,000以上の豊富なタグに対応しており、一般的�
 ## 謝辞 (Acknowledgements)
 
 - このツールは [PixAI](https://pixai.art/) 様によってトレーニングされた素晴らしいタグ付けモデルを利用しています。Pixai Taggerが公開されていなければ、このアプリケーションは生まれませんでした。心から感謝申し上げます。本プロジェクトは PixAI Tagger の GUI（PixAI Tagger ONNX GUI）として始まりました。対応モデルが増えたため ImageTaggerGUI に改名しましたが、出発点が PixAI Tagger であることに変わりはありません。
-- ONNXモデルは [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)様 によってHugging Faceで公開されているものを利用しています。ありがとうございます。
+- PixAI Tagger v0.9のONNXモデルは [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) 様、v1.0のONNX変換版は [nocturna](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx) 様が公開したものを利用しています。ありがとうございます。
 - 追加対応しているモデルとその ONNX を公開してくださっている作者の皆さまにも感謝します。 [SmilingWolf](https://huggingface.co/SmilingWolf)（WD tagger系）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle）、および Florence-2（Microsoft）の ONNX 一式を公開する [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) の各氏。各モデルのライセンスは配布元に従います。

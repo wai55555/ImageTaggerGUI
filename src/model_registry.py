@@ -66,6 +66,7 @@ _PIXAI_CONFIG: dict[str, Any] = {
 # loads, but sorts after these entries, alphabetically by model_id.
 _MODEL_DISPLAY_ORDER: tuple[str, ...] = (
     "pixai-tagger-v0.9",
+    "pixai-tagger-v1.0",
     "wd_eva02_large_v3",
     "oppaioracle_v1_1",
     "camie_tagger_v2",

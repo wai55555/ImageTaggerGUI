@@ -8,11 +8,11 @@ This application is a GUI tool for automatically generating fast and accurate ta
 
 ## Overview
 
-**ImageTaggerGUI** uses multiple local models—including the [ONNX version](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) of the image tagging model developed by [PixAI](https://pixai.art/)—and optional network VLMs to generate tags and captions for images.
+**ImageTaggerGUI** uses multiple local models—including ONNX versions of [PixAI Tagger v0.9](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) and [v1.0](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx)—and optional network VLMs to generate tags and captions for images.
 
 This project started as a GUI for PixAI Tagger (formerly PixAI Tagger ONNX GUI) and now supports multiple local models and network VLMs.
 
-The original PixAI Tagger supports over 13,000 rich tags, offering an advantage compared to common tagging models (e.g., wd-tagger's ~10,000 tags). This tool was developed to maximize its performance and support your image management.
+PixAI Tagger v0.9 supports 13,461 tags, and v1.0 supports 30,877. In one 20-image comparison on the same system, v1.0 took about 2.3× as long to process as v0.9; actual speed depends on the hardware and CPU/GPU provider. v1.0 tag names are currently available in English only.
 
 It features automatic image tagging, tag browsing, individual editing, and powerful bulk editing functions (adding/deleting specific tags).
 
@@ -45,7 +45,7 @@ Double-clicking, wheel, and dragging are also effective when displaying 3x3. Ctr
     -   Quickly switch between images using the mouse wheel or keyboard (arrow keys, WASD, etc.).
 
 ### 2. Powerful Automatic Tagging
--   **High-speed ONNX Runtime**: Employs an ONNX model that operates smoothly even on CPUs. Processes large volumes of images without stress.
+-   **ONNX Runtime**: Supports CPU inference. Processing speed depends on the selected model and hardware.
 -   **Automatic Model Download**: Download the selected model and its required metadata from the configured source with one click. No tedious manual setup is required.
 -   **GPU Acceleration (NVIDIA, optional)**: With an NVIDIA GPU, a one-time download of the GPU components (~2GB) from the startup prompt, followed by a restart, lets the tagger run on CUDA from then on (~28x faster, measured on an RTX 4070). Skip the download - or run on a non-NVIDIA machine - and it keeps working on the CPU exactly as before. Captioning (Florence-2) always runs on the CPU due to its quantized model. Toggle with `[Behavior] onnx_device` in `config.ini` (`auto` / `cpu` / `cuda`).
 
@@ -88,5 +88,5 @@ This project is released under the **LGPLv3** and **Apache License 2.0** license
 ## Acknowledgements
 
 - This tool utilizes the excellent tagging model trained by [PixAI](https://pixai.art/). This application would not have been possible without the public release of Pixai Tagger. My heartfelt thanks. This project began as a GUI for PixAI Tagger (PixAI Tagger ONNX GUI). It was renamed ImageTaggerGUI as more models were added, but PixAI Tagger remains where it all started.
-- The ONNX model used is publicly available on Hugging Face by [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx). Thank you.
+- The PixAI Tagger v0.9 ONNX model is published by [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx), and the v1.0 ONNX conversion is published by [nocturna](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx). Thank you both.
 - Thanks also to the authors who publish the other supported models and their ONNX builds — [SmilingWolf](https://huggingface.co/SmilingWolf) (WD tagger family), [Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2) (wd-eva02 2026 Canary ONNX), [Camais03](https://huggingface.co/Camais03/camie-tagger-v2) (camie-tagger v2), [cella110n](https://huggingface.co/cella110n/cl_tagger) (cl_tagger), [Grio43](https://huggingface.co/Grio43/OppaiOracle) (OppaiOracle), and [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft) for the ONNX build of Florence-2 (Microsoft). Each model is used under its upstream license.
