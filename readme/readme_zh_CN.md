@@ -8,11 +8,11 @@
 
 ## 概述 (Overview)
 
-**ImageTaggerGUI** 使用多种本地模型（包括 [PixAI](https://pixai.art/) 开发的图像标注模型的 [ONNX 版本](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx)）以及可选的网络 VLM，为图像生成标签和描述文本。
+**ImageTaggerGUI** 使用多种本地模型（包括 [PixAI](https://pixai.art/) 的 [PixAI Tagger v0.9](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) 和 [v1.0](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx) ONNX 版本）以及可选的网络 VLM，为图像生成标签和描述文本。
 
 本项目最初是 PixAI Tagger 的 GUI（原名 PixAI Tagger ONNX GUI），现已支持多种本地模型和网络 VLM。
 
-原始的 PixAI Tagger 支持超过 13,000 个丰富的标签，与常见的标注模型（例如 wd-tagger 的约 10,000 个标签）相比具有优势。此工具旨在最大限度地发挥其性能并支持您的图像管理。
+PixAI Tagger v0.9 支持 13,461 个标签，v1.0 支持 30,877 个标签。在一次相同环境下处理 20 张图片的比较中，v1.0 的处理时间约为 v0.9 的 2.3 倍；实际速度取决于硬件和 CPU/GPU 使用情况。v1.0 的标签名称目前仅提供英文。
 
 它具有自动图像标注、标签浏览、单独编辑以及强大的批量编辑功能（添加/删除特定标签）。
 
@@ -45,7 +45,7 @@
     -   使用鼠标滚轮或键盘（箭头键、WASD 等）快速切换图像进行查看。
 
 ### 2. 强大的自动标注
--   **高速 ONNX Runtime**: 采用 ONNX 模型，即使在 CPU 上也能流畅运行。轻松处理大量图像。
+-   **ONNX Runtime**：支持 CPU 推理。处理速度取决于所选模型和硬件。
 -   **自动模型下载**: 只需单击一个按钮，即可从配置的来源下载所选模型及其必要的元数据。无需繁琐的手动设置。
 -   **GPU 加速（NVIDIA，可选）**: 如果检测到 NVIDIA GPU，只需在启动提示中一次性下载 GPU 组件（约 2GB），下载完成后重启应用程序，即可让标注器在 CUDA 上运行（RTX 4070 实测约快 28 倍）。不下载，或在非 NVIDIA 设备上，应用仍会像以前一样在 CPU 上正常运行。由于使用量化模型，图像描述（Florence-2）始终在 CPU 上运行。可通过 `config.ini` 中的 `[Behavior] onnx_device`（`auto` / `cpu` / `cuda`）切换。
 
@@ -88,5 +88,5 @@
 ## 致谢 (Acknowledgements)
 
 - 此工具利用了 [PixAI](https://pixai.art/) 训练的优秀标注模型。如果没有 Pixai Tagger 的公开发布，此应用程序将无法诞生。衷心感谢。本项目最初是 PixAI Tagger 的 GUI（PixAI Tagger ONNX GUI）。随着支持的模型增多，改名为 ImageTaggerGUI，但 PixAI Tagger 始终是这一切的起点。
-- 使用的 ONNX 模型由 [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) 在 Hugging Face 上公开。谢谢。
+- PixAI Tagger v0.9 的 ONNX 模型由 [deepghs](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) 发布，v1.0 的 ONNX 转换版由 [nocturna](https://huggingface.co/nocturna/pixai-tagger-v1.0-onnx) 发布。感谢两位作者。
 - 同样感谢公开了其它已支持模型及其 ONNX 版本的作者们 — [SmilingWolf](https://huggingface.co/SmilingWolf)（WD tagger 系列）、[Misaka41Z](https://huggingface.co/Misaka41Z/wd-eva02-tagger-2026-canary-onnx-v2)（wd-eva02 2026 Canary 的 ONNX）、[Camais03](https://huggingface.co/Camais03/camie-tagger-v2)（camie-tagger v2）、[cella110n](https://huggingface.co/cella110n/cl_tagger)（cl_tagger）、[Grio43](https://huggingface.co/Grio43/OppaiOracle)（OppaiOracle），以及公开 Florence-2（Microsoft）ONNX 全套文件的 [onnx-community](https://huggingface.co/onnx-community/Florence-2-base-ft)。各模型均遵循其上游许可协议。

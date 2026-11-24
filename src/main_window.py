@@ -351,9 +351,7 @@ class MainWindow(QMainWindow):
 
     def initial_load(self):
         """Performs the initial loading of images and tags after the main window is shown."""
-        self.tag_translation_map = load_tag_translation_map(constants.MODEL_PATH.parent,
-                                                       constants.MODELS_DIR / constants.MODEL_DIR_NAME,
-                                                       constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
+        self.tag_translation_map = self._load_tag_translation_map_for_model()
         self.reload_image_list()
         self.reload_tags_only()
         self._update_undo_redo_buttons()
@@ -371,6 +369,15 @@ class MainWindow(QMainWindow):
         # finished slot, which additionally waits out any modal still open (e.g. the
         # GPU download progress) - see _show_update_prompt.
         self._maybe_prompt_update_check()
+
+    def _load_tag_translation_map_for_model(self, entry: ModelEntry | None = None) -> dict[str, list[str]]:
+        """Load PixAI's shared tag translations unless the selected model is English-only."""
+        selected = entry or self._current_model_entry()
+        if selected.config.get("tag_translation") == "english_only":
+            return {}
+        return load_tag_translation_map(constants.MODEL_PATH.parent,
+                                        constants.MODELS_DIR / constants.MODEL_DIR_NAME,
+                                        constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
 
     def _maybe_prompt_gpu_setup(self):
         """NVIDIA GPU が使えるビルドで GPU コンポーネント未整備なら、ダウンロードを尋ねる。
@@ -1988,9 +1995,7 @@ class MainWindow(QMainWindow):
 
         if not self.tag_translation_map:
             # The worker may have just fetched PixAI's selected_tags.csv on our behalf.
-            self.tag_translation_map = load_tag_translation_map(constants.MODEL_PATH.parent,
-                                                       constants.MODELS_DIR / constants.MODEL_DIR_NAME,
-                                                       constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
+            self.tag_translation_map = self._load_tag_translation_map_for_model()
             self.grid_view_widget.set_tag_display_language(self._tag_display_language, self.tag_translation_map)
 
         self.reload_image_list(auto_select_path=path_to_reselect)
@@ -2025,9 +2030,7 @@ class MainWindow(QMainWindow):
             self._check_model_status_and_update_ui() # On success, check status to show "TAG" button
             
             # Reload tag translation map as files are now available
-            self.tag_translation_map = load_tag_translation_map(constants.MODEL_PATH.parent,
-                                                       constants.MODELS_DIR / constants.MODEL_DIR_NAME,
-                                                       constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
+            self.tag_translation_map = self._load_tag_translation_map_for_model()
             
             # Update UI with new translation map
             self.display_current_tag_page()

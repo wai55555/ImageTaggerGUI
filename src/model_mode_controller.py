@@ -6,10 +6,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 
 import app_settings
-import constants
 from utils import write_debug_log
 from model_registry import ModelEntry, config_mapping
-from tag_utils import load_tag_translation_map
 
 if TYPE_CHECKING:
     from main_window import MainWindow
@@ -49,18 +47,16 @@ class ModelModeController:
     def _reload_translation_map(self, entry: ModelEntry) -> None:
         """Regardless of which model is currently selected, look up by tag name from there."""
         mw = self.mw
-        mw.tag_translation_map = load_tag_translation_map(constants.MODEL_PATH.parent,
-                                                       constants.MODELS_DIR / constants.MODEL_DIR_NAME,
-                                                       constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
+        mw.tag_translation_map = mw._load_tag_translation_map_for_model(entry)
         mw.display_current_tag_page()
         mw._display_image_tag_page()
         mw.grid_view_widget.set_tag_display_language(mw._tag_display_language, mw.tag_translation_map)
 
     # Fallback per-category defaults when a model_config.json doesn't spell them out.
     _FALLBACK_THRESHOLDS = {"general": 0.40, "character": 0.65, "rating": 0.50,
-                            "copyright": 0.50, "artist": 0.50, "meta": 0.50,
+                            "copyright": 0.50, "style": 0.50, "artist": 0.50, "meta": 0.50,
                             "model": 0.50, "quality": 0.50, "year": 0.50}
-    _FALLBACK_LIMITS = {"general": 55, "character": 1, "rating": 0, "copyright": 0,
+    _FALLBACK_LIMITS = {"general": 55, "character": 1, "rating": 0, "copyright": 0, "style": 0,
                         "artist": 0, "meta": 0, "model": 0, "quality": 0, "year": 0}
 
     def _model_default_threshold(self, ui_cfg: dict, category: str) -> float:
@@ -72,7 +68,7 @@ class ModelModeController:
         if category == "character":
             return float(ui_cfg.get("default_character_threshold",
                                     ui_cfg.get("default_threshold", self._FALLBACK_THRESHOLDS["character"])))
-        # rating / copyright / artist / meta / model / quality / year: use the model's
+        # rating / copyright / style / artist / meta / model / quality / year: use the model's
         # own default_threshold so "set the model to X everywhere" is a one-value change.
         return float(ui_cfg.get("default_threshold", self._FALLBACK_THRESHOLDS.get(category, 0.50)))
 

@@ -36,7 +36,7 @@ class Paths:
 # order rows appear in the "詳細" (per-category) dialog. "general" and "character"
 # also have sliders in the main window; the rest are dialog-only.
 TAG_CATEGORY_NAMES: tuple[str, ...] = (
-    "general", "character", "rating", "copyright", "artist", "meta", "model", "quality", "year",
+    "general", "character", "rating", "copyright", "style", "artist", "meta", "model", "quality", "year",
 )
 
 
@@ -66,6 +66,7 @@ class Thresholds:
     # a category NOT listed here is reset to the new model's recommended default; a
     # listed one is left as the user set it (design: 2026-08-31 user decision).
     touched: str = ""
+    style: float = 0.50
 
 @dataclass
 class Limits:
@@ -79,6 +80,7 @@ class Limits:
     quality: int = 0
     year: int = 0
     touched: str = ""
+    style: int = 0
 
 @dataclass
 class Behavior:
@@ -109,7 +111,7 @@ class Behavior:
     # 直近の確認を試みた日時（ISO 8601, UTC）。空文字は「未確認」。
     # 起動のたびに通信しないための24時間スロットルに使う。
     update_check_last: str = ""
-    # ユーザーが「このバージョンはスキップ」を選んだ場合のタグ名（例 "v1.8.0"）。
+    # ユーザーが「このバージョンはスキップ」を選んだ場合のタグ名（例 "v1.9.0"）。
     # 次回以降、これ以下のバージョンでは再プロンプトしない。より新しい版が出れば再びプロンプトされる。
     update_skip_version: str = ""
 
@@ -297,8 +299,8 @@ def get_default_config() -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     DEFAULT_CONFIG = {
         'Paths': {'input_dir': str(BASE_DIR / "inputs"), 'model_dir': MODEL_DIR_NAME, 'model_filename': 'model.onnx'},
-        'Thresholds': {'general': '0.40', 'character': '0.65', 'rating': '0.50', 'copyright': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
-        'Limits': {'general': '55', 'character': '1', 'rating': '0', 'copyright': '0', 'artist': '0', 'meta': '0', 'model': '0', 'quality': '0', 'year': '0', 'touched': ''},
+        'Thresholds': {'general': '0.40', 'character': '0.65', 'rating': '0.50', 'copyright': '0.50', 'style': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
+        'Limits': {'general': '55', 'character': '1', 'rating': '0', 'copyright': '0', 'style': '0', 'artist': '0', 'meta': '0', 'model': '0', 'quality': '0', 'year': '0', 'touched': ''},
         'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL', 'onnx_device': 'auto', 'gpu_setup_prompt': 'ask', 'update_check': 'ask', 'update_check_last': '', 'update_skip_version': ''},
         'Window': {'geometry': '986x976+50+50', 'tag_display_rows': '6', 'tag_display_cols': '5'},
         'Model': {'model_id': 'pixai-tagger-v0.9', 'verified_models': ''},
@@ -385,6 +387,7 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
             character=config.getfloat('Thresholds', 'character', fallback=0.65),
             rating=config.getfloat('Thresholds', 'rating', fallback=0.50),
             copyright=config.getfloat('Thresholds', 'copyright', fallback=0.50),
+            style=config.getfloat('Thresholds', 'style', fallback=0.50),
             artist=config.getfloat('Thresholds', 'artist', fallback=0.50),
             meta=config.getfloat('Thresholds', 'meta', fallback=0.50),
             model=config.getfloat('Thresholds', 'model', fallback=0.50),
@@ -397,6 +400,7 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
             character=config.getint('Limits', 'character', fallback=1),
             rating=config.getint('Limits', 'rating', fallback=0),
             copyright=config.getint('Limits', 'copyright', fallback=0),
+            style=config.getint('Limits', 'style', fallback=0),
             artist=config.getint('Limits', 'artist', fallback=0),
             meta=config.getint('Limits', 'meta', fallback=0),
             model=config.getint('Limits', 'model', fallback=0),

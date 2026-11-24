@@ -135,6 +135,7 @@ class TagCategory(IntEnum):
     MODEL = 6
     QUALITY = 7
     YEAR = 8
+    STYLE = 9
 
 # Settings-side category name -> TagCategory. Mirrors app_settings.TAG_CATEGORY_NAMES;
 # kept here as a plain dict so tagging_core stays free of an app_settings import.
@@ -148,6 +149,7 @@ CATEGORY_NAME_TO_ENUM: dict[str, "TagCategory"] = {
     "model": TagCategory.MODEL,
     "quality": TagCategory.QUALITY,
     "year": TagCategory.YEAR,
+    "style": TagCategory.STYLE,
 }
 
 @dataclass(frozen=True)
@@ -179,9 +181,10 @@ _CATEGORY_LOOKUP: dict[str, int] = {
     "6": 6, "model": 6,     # cl_tagger (Model tags - 25-26 of them)
     "7": 7, "quality": 7,   # cl_tagger / cl_tagger v2 (best/normal/bad/worst quality)
     "8": 8, "year": 8,      # camie-tagger-v2
+    "style": 9,
 }
 
-TagsCsvFormat = str  # "pixai6col" | "simple3col" | "wd4col" | "idx_json" | "camie_metadata_json"
+TagsCsvFormat = str  # "pixai6col" | "simple3col" | "wd4col" | "idx_json" | "pixai_v1_config" | "camie_metadata_json"
 
 def _resolve_category(category_str: str) -> int | None:
     try:
@@ -324,6 +327,39 @@ def _load_selected_tags_idx_json(tags_path: Path) -> list[TagMeta]:
         labels.append(TagMeta(name=str(entry.get("tag", "")), category=category, count=None, ips=()))
     return labels
 
+
+def _load_pixai_v1_tags_json(tags_path: Path) -> list[TagMeta]:
+    """PixAI Tagger v1.0 config.json: ordered `tags` plus category/count pairs in
+    `tags_split`. Keeping this as a dedicated format avoids interpreting the model's
+    architecture config as a generic index map.
+    """
+    with tags_path.open(encoding="utf-8") as fp:
+        raw: Any = json.load(fp)
+
+    if not isinstance(raw, dict) or not isinstance(raw.get("tags"), list) or not isinstance(raw.get("tags_split"), list):
+        raise ValueError(f"Invalid PixAI v1.0 tag metadata: {tags_path}")
+
+    tags: list[Any] = raw["tags"]
+    splits: list[Any] = raw["tags_split"]
+    labels: list[TagMeta] = []
+    offset = 0
+    for split in splits:
+        if (not isinstance(split, list) or len(split) != 2 or
+                not isinstance(split[0], str) or isinstance(split[1], bool) or
+                not isinstance(split[1], int) or split[1] < 0):
+            raise ValueError(f"Invalid PixAI v1.0 category split in {tags_path}: {split!r}")
+        category_name, count = split
+        end = offset + count
+        if end > len(tags):
+            raise ValueError(f"PixAI v1.0 tag split exceeds tag list in {tags_path}")
+        category = _resolve_category_keep_row(category_name, context="pixai_v1_config")
+        labels.extend(TagMeta(name=str(name), category=category) for name in tags[offset:end])
+        offset = end
+
+    if offset != len(tags):
+        raise ValueError(f"PixAI v1.0 tag split covers {offset} of {len(tags)} tags in {tags_path}")
+    return labels
+
 def _load_selected_tags_camie_metadata_json(tags_path: Path) -> list[TagMeta]:
     """camie-tagger-v2: camie-tagger-v2-metadata.json -> dataset_info.tag_mapping.{idx_to_tag,tag_to_category}."""
     with tags_path.open(encoding="utf-8") as fp:
@@ -343,6 +379,7 @@ _TAGS_CSV_LOADERS: dict[str, Callable[[Path], list[TagMeta]]] = {
     "simple3col": _load_selected_tags_simple3col,
     "wd4col": _load_selected_tags_wd4col,
     "idx_json": _load_selected_tags_idx_json,
+    "pixai_v1_config": _load_pixai_v1_tags_json,
     "camie_metadata_json": _load_selected_tags_camie_metadata_json,
 }
 
@@ -421,6 +458,8 @@ class InferenceConfig:
     output_name_hint: str | None = None
     output_activation: str = "sigmoid"   # "sigmoid" | "none" (already applied in-graph)
     tags_csv_format: TagsCsvFormat = "pixai6col"
+    resampling: str = "lanczos"       # "nearest" | "bilinear" | "bicubic" | "lanczos"
+    alpha_background_rgb: tuple[int, int, int] | None = None
 
 class OnnxTagger:
     # Kept as class constants (matching InferenceConfig's own defaults) purely so any
@@ -499,6 +538,12 @@ class OnnxTagger:
         preprocessed_images: list[NDArray[np.float32]] = []
         padding_masks: list[NDArray[np.bool_]] = []
         needs_padding_mask = "padding_mask" in cfg.extra_inputs
+        resampling = {
+            "nearest": Image.Resampling.NEAREST,
+            "bilinear": Image.Resampling.BILINEAR,
+            "bicubic": Image.Resampling.BICUBIC,
+            "lanczos": Image.Resampling.LANCZOS,
+        }.get(cfg.resampling.lower(), Image.Resampling.LANCZOS)
 
         for img_array in images:
             image_pil = Image.fromarray(img_array)
@@ -506,7 +551,7 @@ class OnnxTagger:
             ratio = min(target_size / w, target_size / h)
             new_w = int(w * ratio)
             new_h = int(h * ratio)
-            resized_image = image_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            resized_image = image_pil.resize((new_w, new_h), resampling)
             canvas = Image.new("RGB", (target_size, target_size), cfg.pad_color_rgb)
             x_offset = (target_size - new_w) // 2
             y_offset = (target_size - new_h) // 2
@@ -615,7 +660,17 @@ class OnnxTagger:
         return results
 
     def infer_batch(self, images: Sequence[Image.Image], *, thresholds: Mapping[TagCategory, float] | None = None, max_tags: Mapping[TagCategory, int] | None = None) -> list[TagResult]:
-        rgb_arrays = [np.asarray(image.convert("RGB"), dtype=np.uint8) for image in images]
+        rgb_arrays: list[NDArray[np.uint8]] = []
+        for image in images:
+            background_rgb = self.inference_config.alpha_background_rgb
+            if background_rgb is not None and ("A" in image.getbands() or "transparency" in image.info):
+                rgba = image.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, (*background_rgb, 255))
+                background.alpha_composite(rgba)
+                image = background.convert("RGB")
+            else:
+                image = image.convert("RGB")
+            rgb_arrays.append(np.asarray(image, dtype=np.uint8))
         batch, extra_inputs = self.prepare_batch_from_rgb_np(rgb_arrays)
         return self.infer_batch_prepared(batch, extra_inputs, thresholds=thresholds, max_tags=max_tags)
 
@@ -628,7 +683,7 @@ def get_image_paths_recursive(base_dir: Path) -> list[Path]:
     return sorted(image_paths)
 
 def format_tags(tag_results: TagResult, convert_underscore: bool) -> str:
-    # Output order: artist, copyright, character, <series tags>, general, meta, rating.
+    # Output order: artist, copyright, character, <series tags>, general, style, meta, rating.
     # "character, <series>, general" is kept exactly as before, so models that only
     # emit general + character tags (which was every model until per-category limits
     # were added) produce byte-identical output. The other categories only appear
@@ -651,6 +706,7 @@ def format_tags(tag_results: TagResult, convert_underscore: bool) -> str:
     for series_tag in tag_results.series_tags:
         output_tags.append(series_tag.replace("_", " ") if convert_underscore else series_tag)
     output_tags += _emit(by_category.get(TagCategory.GENERAL, []))
+    output_tags += _emit(by_category.get(TagCategory.STYLE, []))
     output_tags += _emit(by_category.get(TagCategory.META, []))
     output_tags += _emit(by_category.get(TagCategory.MODEL, []))
     output_tags += _emit(by_category.get(TagCategory.QUALITY, []))
@@ -676,6 +732,7 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
         return tuple(value)  # type: ignore[return-value]
 
     pad_color = inference.get("pad_color_rgb")
+    alpha_background = inference.get("alpha_background_rgb", defaults.alpha_background_rgb)
     normalize_mean = inference.get("normalize_mean", defaults.normalize_mean)
     normalize_std = inference.get("normalize_std", defaults.normalize_std)
     extra_inputs = inference.get("extra_inputs", list(defaults.extra_inputs))
@@ -686,6 +743,8 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
         channel_order=inference.get("channel_order", defaults.channel_order),
         rescale_to_unit=inference.get("rescale_to_unit", defaults.rescale_to_unit),
         pad_color_rgb=tuple(pad_color) if pad_color is not None else defaults.pad_color_rgb,  # type: ignore[arg-type]
+        resampling=inference.get("resampling", defaults.resampling),
+        alpha_background_rgb=tuple(alpha_background) if alpha_background is not None else None,  # type: ignore[arg-type]
         normalize_mean=_tuple3(normalize_mean),
         normalize_std=_tuple3(normalize_std),
         extra_inputs=tuple(extra_inputs),
@@ -883,8 +942,9 @@ def process_image_loop(
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
 
         try:
-            with open(image_path, 'rb') as f:
-                image = Image.open(f).convert("RGB")
+            with Image.open(image_path) as opened_image:
+                # Preserve alpha so model-specific preprocessing can composite it.
+                image = opened_image.copy()
         except Exception as e:
             n_errors += 1
             mark_failed(image_path)
@@ -1007,7 +1067,7 @@ def filter_tags_by_solo_rule(
     """
     general_tags = [pred for pred in tag_result.tags if pred.category == TagCategory.GENERAL]
     character_tags = [pred for pred in tag_result.tags if pred.category == TagCategory.CHARACTER]
-    # Everything else (rating / copyright / artist / meta / model / quality / year) is
+    # Everything else (rating / copyright / style / artist / meta / model / quality / year) is
     # untouched by the solo rule - it only ever trims character tags. Dropping these here
     # would make the per-category thresholds / max-tag limits have no effect on output.
     other_tags = [pred for pred in tag_result.tags
