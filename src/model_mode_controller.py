@@ -29,7 +29,7 @@ class ModelModeController:
     def on_model_changed(self, entry: ModelEntry) -> None:
         write_debug_log(f"ModelModeController: switching to model_id={entry.model_id} ({entry.model_type})")
         self._apply_character_ui_visibility(entry)
-        self._reload_translation_map(entry)
+        self._reload_translation_map()
         self._apply_threshold_defaults(entry)
         self._apply_model_type_ui(entry)
         self.mw._check_model_status_and_update_ui()
@@ -44,10 +44,10 @@ class ModelModeController:
                 slider.setEnabled(supports_character)
                 value_label.setEnabled(supports_character)
 
-    def _reload_translation_map(self, entry: ModelEntry) -> None:
-        """Regardless of which model is currently selected, look up by tag name from there."""
+    def _reload_translation_map(self) -> None:
+        """Refresh tag labels from the shared PixAI translations for the active model."""
         mw = self.mw
-        mw.tag_translation_map = mw._load_tag_translation_map_for_model(entry)
+        mw.tag_translation_map = mw._load_shared_tag_translation_map()
         mw.display_current_tag_page()
         mw._display_image_tag_page()
         mw.grid_view_widget.set_tag_display_language(mw._tag_display_language, mw.tag_translation_map)

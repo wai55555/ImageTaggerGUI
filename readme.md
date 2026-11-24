@@ -13,7 +13,7 @@ This application is a GUI tool for automatically generating fast and accurate ta
 
 This project started as a GUI for PixAI Tagger (formerly PixAI Tagger ONNX GUI) and now supports multiple local models and network VLMs.
 
-PixAI Tagger v0.9 supports 13,461 tags, and v1.0 supports 30,877. In one 20-image comparison on the same system, v1.0 took about 2.3× as long to process as v0.9; actual speed depends on the hardware and CPU/GPU provider. v1.0 tag names are currently available in English only.
+PixAI Tagger v0.9 supports 13,461 tags, and v1.0 supports 30,877. In one 20-image comparison on the same system, v1.0 took about 2.3× as long to process as v0.9; actual speed depends on the hardware and CPU/GPU provider. v1.0 tag names are English, but tags found in the existing v0.9 multilingual CSVs are displayed in the selected language; tags without a matching translation remain in English.
 
 It features automatic image tagging, tag browsing, individual editing, and powerful bulk editing functions (adding/deleting specific tags).
 
