@@ -60,10 +60,16 @@ def _code_lines(name: str) -> str:
 
 
 def test_no_loop_hand_rolls_the_progress_step_any_more():
-    """3つの処理ループが constants.progress_step_for() を使っていること。"""
-    for name in ("tagging_core.py", "caption_core.py", "vlm_worker.py"):
+    """進捗間引きの天井除算は constants.progress_step_for() だけが持つ。
+
+    Phase 3（バッチループ共通化）以降、tagging / caption の間引きはループ骨格
+    （batch_runner.py）に集約された。vlm_worker は固有の制御フローを持つため
+    自前のループのまま `constants.progress_step_for()` を呼ぶ。
+    """
+    for name in ("batch_runner.py", "vlm_worker.py"):
         source = _source(name)
         assert "constants.progress_step_for(" in source, name
+    for name in ("tagging_core.py", "caption_core.py", "batch_runner.py", "vlm_worker.py"):
         # 以前の直書き式が戻っていない（コメント内の言及は対象外）。
         code = _code_lines(name)
         assert "+ 199) // 200" not in code, name

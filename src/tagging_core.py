@@ -64,33 +64,10 @@ if not TYPE_CHECKING:
             raise ImportError(_get_string("TaggerCore", "Error_Required_Libraries_NotFound"))
         sys.exit(1)
 
-@dataclass(frozen=True)
-class FileChange:
-    """1ファイル分の書き換え記録（design.md 2.2節）。
-
-    previous_content が None なら「変更前にファイルが存在しなかった」ことを表し、
-    Undo ではファイルを削除する。was_append は追記ログ / 説明用のメタ情報。
-    """
-    path: Path
-    previous_content: str | None
-    new_content: str
-    was_append: bool
-    added_tags: tuple[str, ...] = ()
-
-
-class ExistingFileMode(Enum):
-    """出力先の .txt が既に存在する場合の処理方針（spec.md 1.1節）。"""
-    ASK = auto()        # 都度確認
-    OVERWRITE = auto()  # 常に上書き
-    SKIP = auto()       # 常にスキップ
-    APPEND = auto()     # 常に追記
-
-
-class OverwriteDecision(Enum):
-    """ASK モードでユーザーが1ファイルに対して下した判断（spec.md 2.2節）。"""
-    OVERWRITE = auto()
-    SKIP = auto()
-    APPEND = auto()
+# REQ-3.3: バッチ処理の骨格（batch_runner）と共有する型は batch_types へ移した。
+# 既存の `from tagging_core import FileChange` 等が壊れないよう、ここで再エクスポートする。
+from batch_types import ExistingFileMode, FileChange, OverwriteDecision
+from batch_runner import ItemContext, ItemOutcome, run_batch
 
 
 EXISTING_FILE_MODE_MAP: dict[str, ExistingFileMode] = {
@@ -1235,11 +1212,10 @@ def process_image_loop(
 
     `progress_cb(done, total)` は全体で最大 constants.PROGRESS_SIGNAL_BUDGET 回
     ＋最後の N/N（完了）だけ呼ぶ。
-    issue #10: 1画像=1〜2回の GUI ログ発行だと高速ループ（SKIP など）で Qt イベント
-    キューが飽和して固まるため、ルーチンの「処理中／出力成功」ログは GUI へ出さず、
-    間引いた progress_cb へ回す（progress_cb 自体もクロススレッドの queued signal なので
-    毎画像発行はしない）。スキップ・エラー・警告・追記件数など有界・低頻度のログは
-    従来どおり GUI へ出す。
+
+    REQ-3.1: 反復・進捗・停止・既存ファイル判定・失敗収集・サマリ集計・FileChange 収集は
+    `batch_runner.run_batch()` に集約し、ここは「1 枚生成して書く」処理だけを持つ。
+    進捗発行→停止判定の順序（現行挙動）は `progress_before_stop=True` で保つ。
     """
 
     def core_log_gui(message: str, color: str = "black") -> None:
@@ -1248,73 +1224,34 @@ def process_image_loop(
 
     _get_string_internal = get_string if get_string else _get_string
     mode: ExistingFileMode = settings.get('EXISTING_FILE_MODE', ExistingFileMode.ASK)
-    changed_files: list[FileChange] = []
-    total = len(image_paths)
-    # issue #10: 1画像=1 GUI ログだと全既存フォルダの SKIP で Qt キューが飽和する。
-    # 個々の skip / 成功は debug log だけに残し、GUI へは末尾のサマリ1行だけ出す。
-    n_skipped = 0
-    n_errors = 0
-    n_unchanged = 0
-    failed_seen = set(failed_paths or ())
-    # 全体で PROGRESS_SIGNAL_BUDGET 回に間引く（理由と天井除算の根拠は
-    # constants.progress_step_for() を参照）。最後の1枚は必ず発行して
-    # N/N（完了）に到達させる。
-    progress_step = constants.progress_step_for(total)
 
-    def mark_failed(path: Path) -> None:
-        if failed_paths is not None and path not in failed_seen:
-            failed_seen.add(path)
-            failed_paths.append(path)
+    def index_str(context: ItemContext) -> str:
+        return f"[{context.index+1}/{context.total}]"
 
-    def mark_remaining_failed(start: int) -> None:
-        """Record unprocessed work without labelling SKIP outputs as failures."""
-        if failed_paths is None:
-            return
-        for pending in image_paths[start:]:
-            if (mode is ExistingFileMode.SKIP
-                    and pending.with_suffix(".txt").is_file()):
-                continue
-            mark_failed(pending)
+    def on_item_start(context: ItemContext) -> None:
+        # REQ-3.7: 相対パス計算は各ループ側に残す。入力ディレクトリ外のパスでは
+        # 現行どおり relative_to の例外になり、既存ファイル判定より前に評価される。
+        context.relative_path = context.image_path.relative_to(settings['INPUT_DIR'])
 
-    for i, image_path in enumerate(image_paths):
-        if progress_cb and ((i + 1) % progress_step == 0 or i == total - 1):
-            progress_cb(i + 1, total)
-        if stop_checker and stop_checker():
-            core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
-            log_dbg(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User_Debug"))
-            mark_remaining_failed(i)
-            break
+    def on_existing_skip(context: ItemContext) -> None:
+        log_dbg(_get_string_internal(
+            "TaggerCore", "Tag_Output_Skipped_Existing_File",
+            current_index_str=index_str(context), relative_path=str(context.relative_path)))
 
-        # First, check if the output file exists and should be skipped.
-        base_name, _ = os.path.splitext(str(image_path))
-        output_path = Path(base_name + ".txt")
-        relative_path = image_path.relative_to(settings['INPUT_DIR'])
-        current_index_str = f"[{i+1}/{len(image_paths)}]"
+    def on_stop() -> None:
+        core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
+        log_dbg(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User_Debug"))
 
-        will_append = False
-        if output_path.is_file():
-            if mode is ExistingFileMode.SKIP:
-                n_skipped += 1
-                log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Skipped_Existing_File", current_index_str=current_index_str, relative_path=str(relative_path)))
-                continue
-            if mode is ExistingFileMode.ASK:
-                if decision_resolver is None:
-                    # 防御: resolver 未設定なら既存ファイルには触らない
-                    n_skipped += 1
-                    log_dbg("process_image_loop: ASK モードだが decision_resolver が未設定のためスキップします")
-                    continue
-                if stop_checker and stop_checker():
-                    # ここで停止要求が来ていたら resolver（GUI 往復しうる）を呼ばずに抜ける
-                    mark_remaining_failed(i)
-                    break
-                decision = decision_resolver(output_path)
-                if decision is OverwriteDecision.SKIP:
-                    n_skipped += 1
-                    log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Skipped_Existing_File", current_index_str=current_index_str, relative_path=str(relative_path)))
-                    continue
-                will_append = decision is OverwriteDecision.APPEND
-            else:
-                will_append = mode is ExistingFileMode.APPEND
+    def process_item(context: ItemContext) -> ItemOutcome:
+        image_path = context.image_path
+        output_path = context.output_path
+        relative_path = context.relative_path
+        current_index_str = index_str(context)
+        # 追記かどうかは「既存があり、かつモードか ASK の決定が APPEND」で決まる
+        # （新規ファイルに対しては常に False。現行どおり）。
+        will_append = context.existed and (
+            context.mode is ExistingFileMode.APPEND
+            or context.decision is OverwriteDecision.APPEND)
 
         # ルーチンの「処理中」表示は GUI へ流さず debug log のみ（issue #10）。GUI は progress_cb 経由。
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
@@ -1326,11 +1263,9 @@ def process_image_loop(
                 # exif_transpose 後も保持されるので、モデル側の合成にそのまま渡せる。
                 image = ImageOps.exif_transpose(opened_image)
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Image_Load_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
             core_log_gui(_get_string_internal("TaggerCore", "Image_Load_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         try:
             results = tagger.infer_batch(
@@ -1339,11 +1274,9 @@ def process_image_loop(
                 max_tags=settings['MAX_TAGS_PER_CATEGORY'],
             )
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Tag_Inference_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
             core_log_gui(_get_string_internal("TaggerCore", "Tag_Inference_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         if not results or not results[0].tags:
             # REQ-A8: 全カテゴリの上限が 0 のときは hard_cap=0 で結果が必ず空になる。
@@ -1354,11 +1287,9 @@ def process_image_loop(
             limits = settings.get('MAX_TAGS_PER_CATEGORY') or {}
             limits_all_zero = bool(limits) and all(int(limit) == 0 for limit in limits.values())
             if not limits_all_zero:
-                n_errors += 1
-                mark_failed(image_path)
                 log_dbg(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed", current_index_str=current_index_str, relative_path=str(relative_path)))
                 core_log_gui(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
-                continue
+                return ItemOutcome.error()
             log_dbg(f"tags: all per-category limits are 0 for {relative_path}; treating the empty "
                     f"result as success (no tags) rather than a failure.")
             tag_result = results[0] if results else TagResult()
@@ -1370,7 +1301,7 @@ def process_image_loop(
         )
         tag_result.tags = final_tags
         tag_result.series_tags = tuple(sorted(list(all_series_tags)))
-        
+
         formatted_tags = format_tags(tag_result, settings['CONVERT_UNDERSCORE'])
 
         previous_content: str | None = None
@@ -1380,20 +1311,17 @@ def process_image_loop(
                 previous_content = output_path.read_text(encoding='utf-8')
             except Exception as e:
                 # 既存内容が読めないファイルは触らずスキップする（spec.md 3.3節）
-                n_errors += 1
-                mark_failed(image_path)
                 log_dbg(f"append: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
                 core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
-                continue
+                return ItemOutcome.error()
             existing_tags = [t.strip() for t in previous_content.split(",") if t.strip()]
             generated_tags = [t.strip() for t in formatted_tags.split(",") if t.strip()]
             merged = merge_tags(existing_tags, generated_tags)
             if merged == existing_tags:
                 # 追加できる新規タグが無い場合は mtime も変えない（spec.md 3.3節）
                 # ルーチン結果なので GUI へは出さず debug log のみ（issue #10）。
-                n_unchanged += 1
                 log_dbg(_get_string_internal("TaggerCore", "Log_No_New_Tags", current_index_str=current_index_str, file_name=output_path.name))
-                continue
+                return ItemOutcome.unchanged()
             added_tags = tuple(merged[len(existing_tags):])
             new_content = ", ".join(merged)
         else:
@@ -1406,11 +1334,9 @@ def process_image_loop(
                     # のまま書くと「元は存在しなかった」と undo に誤認され、undo で
                     # ファイルごと削除して原本を復元不能に破壊する（PR#16 レビュー指摘）。
                     # APPEND 分岐と同様、触らずスキップする。
-                    n_errors += 1
-                    mark_failed(image_path)
                     log_dbg(f"overwrite: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
                     core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
-                    continue
+                    return ItemOutcome.error()
             new_content = formatted_tags
 
         try:
@@ -1418,29 +1344,42 @@ def process_image_loop(
             # 現行の直接書きも fsync していないため耐久性は据え置き、原子性だけを得る
             # （計測: 0.10 → 0.33 ms/ファイル、fsync を足すと +7 ms/ファイル）。
             atomic_write_text(output_path, new_content, fsync=False, verify=False)
-
-            changed_files.append(FileChange(
-                path=output_path, previous_content=previous_content,
-                new_content=new_content, was_append=will_append, added_tags=added_tags))
-            # 個々の追記／出力成功は debug log のみ。件数は末尾サマリで GUI へ（issue #10）。
-            if will_append:
-                log_dbg(_get_string_internal("TaggerCore", "Log_Appended", current_index_str=current_index_str, count=len(added_tags), file_name=output_path.name))
-            else:
-                log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
-            log_dbg(_get_string_internal("TaggerCore", "Tagging_Result_Output", current_index_str=current_index_str, output_path_name=output_path.name))
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Save_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
-
             core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
+            return ItemOutcome.error()
 
-    n_appended = sum(1 for c in changed_files if c.was_append)
+        change = FileChange(
+            path=output_path, previous_content=previous_content,
+            new_content=new_content, was_append=will_append, added_tags=added_tags)
+        # 個々の追記／出力成功は debug log のみ。件数は末尾サマリで GUI へ（issue #10）。
+        if will_append:
+            log_dbg(_get_string_internal("TaggerCore", "Log_Appended", current_index_str=current_index_str, count=len(added_tags), file_name=output_path.name))
+        else:
+            log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
+        log_dbg(_get_string_internal("TaggerCore", "Tagging_Result_Output", current_index_str=current_index_str, output_path_name=output_path.name))
+        return ItemOutcome.written(change)
+
+    result = run_batch(
+        image_paths,
+        mode=mode,
+        output_path_for=lambda path: Path(os.path.splitext(str(path))[0] + ".txt"),
+        process_item=process_item,
+        decision_resolver=decision_resolver,
+        stop_checker=stop_checker,
+        progress_cb=progress_cb,
+        failed_paths=failed_paths,
+        on_item_start=on_item_start,
+        on_existing_skip=on_existing_skip,
+        on_stop=on_stop,
+        # tagging/caption は「進捗発行 → 停止判定」の現行順（§3.1）。
+        progress_before_stop=True,
+    )
     core_log_gui(_get_string_internal(
         "TaggerCore", "Batch_Summary",
-        written=len(changed_files), appended=n_appended, skipped=n_skipped,
-        unchanged=n_unchanged, errors=n_errors, total=total), "blue")
-    return changed_files
+        written=result.written, appended=result.appended, skipped=result.skipped,
+        unchanged=result.unchanged, errors=result.errors, total=result.total), "blue")
+    return result.changes
 
 def filter_tags_by_solo_rule(
     tag_result: TagResult,
