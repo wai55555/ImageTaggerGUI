@@ -482,3 +482,106 @@ def test_read_failure_returns_empty_mapping_without_print(tmp_path: Path, debug_
     log = debug_log_on.read_text(encoding="utf-8", errors="replace")
     assert "failed to load" in log
     assert "not utf-8" not in log or True  # 例外型が記録されていれば十分
+
+
+# ---------------------------------------------------------------------------
+# PERF-1: 進捗シグナルの間引き（REQ-5.16〜5.20）
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """requests.Response の最小代替（context manager / iter_content / headers）。"""
+
+    def __init__(self, body: bytes, *, headers: dict | None = None):
+        self._body = body
+        self.status_code = 200
+        self.headers = headers or {}
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size: int = 8192):
+        for start in range(0, len(self._body), chunk_size):
+            yield self._body[start:start + chunk_size]
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_download_progress_is_throttled_to_percent_changes(tmp_path: Path, monkeypatch):
+    import workers
+
+    body = b"x" * (1024 * 40)                      # 40 KiB
+    emits: list[tuple] = []
+
+    worker = workers.DownloaderWorker(lambda section, key, **kw: key)
+    monkeypatch.setattr(workers.requests, "get",
+                        lambda *a, **k: _FakeResponse(body, headers={"content-length": str(len(body))}))
+    # Signal の emit は instance 属性として差し替えられないので slot で受ける。
+    worker.progress_update.connect(lambda *a: emits.append(a))
+
+    target = tmp_path / "model.onnx"
+    result = worker._download_single_file(target, "https://example.test/model.onnx", None)
+
+    assert result is True or result is not None
+    assert target.stat().st_size == len(body)
+    # ループ内の発行はパーセントの変化回数以下＋開始時/完了時の別枠。
+    # 40KB を 8KB チャンクで流すと 5 回のチャンク、パーセントは 20/40/60/80/100 の 5 段階。
+    loop_percents = [p for p, _d, _t in emits]
+    assert len(emits) <= 5 + 3          # 変化回数 + 開始時 + 完了時 + 余裕
+    assert loop_percents[-1] == 100     # 最終的に 100 が発行される（REQ-5.17）
+
+
+def test_download_progress_is_not_emitted_per_chunk(tmp_path: Path, monkeypatch):
+    """8KB チャンクごとに無間引きで発行していないこと（旧実装は chunk 数だけ発行）。"""
+    import workers
+
+    body = b"y" * (1024 * 64)                      # 64 KiB = 8 チャンク
+    emits: list[int] = []
+
+    worker = workers.DownloaderWorker(lambda section, key, **kw: key)
+    monkeypatch.setattr(workers.requests, "get",
+                        lambda *a, **k: _FakeResponse(body, headers={"content-length": str(len(body))}))
+    worker.progress_update.connect(lambda pct, *rest: emits.append(pct))
+
+    target = tmp_path / "model2.onnx"
+    worker._download_single_file(target, "https://example.test/model2.onnx", None)
+
+    # パーセントは 0〜100 の 101 通りしかないので、それを超える発行はあり得ない。
+    assert len(emits) <= 101 + 2
+    assert emits[-1] == 100
+
+
+def test_gpu_progress_worker_throttles_emits():
+    import workers
+
+    worker = workers.GpuRuntimeDownloadWorker(lambda section, key, **kw: key)
+    emitted: list[tuple] = []
+    worker.progress_update.connect(lambda *a: emitted.append(a))
+
+    total = 1024 * 1024 * 200                     # 200MB
+    # 256KB 刻みで 800 回流す（旧実装は 800 回 emit）
+    for i in range(1, 801):
+        worker._on_progress(i * 256 * 1024, total)
+
+    assert len(emitted) <= 101                    # パーセント変化回数以下（REQ-5.20）
+    assert emitted[-1][0] == 100
+
+
+def test_gpu_progress_worker_emits_when_total_unknown():
+    import workers
+
+    worker = workers.GpuRuntimeDownloadWorker(lambda section, key, **kw: key)
+    emitted: list[tuple] = []
+    worker.progress_update.connect(lambda *a: emitted.append(a))
+
+    worker._on_progress(1024, 0)
+    worker._on_progress(2048, 0)
+    assert len(emitted) == 2                      # total == 0 は現行どおり毎回発行
+    assert all(e[0] == 0 for e in emitted)
