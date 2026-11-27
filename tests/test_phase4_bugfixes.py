@@ -164,3 +164,117 @@ def test_broken_config_still_saves_and_logs_fallback(config_path: Path, debug_lo
 
     utils._flush_debug_log()
     assert "could not be parsed" in debug_log_on.read_text(encoding="utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# BUG-2: delete_secret の成否判定（REQ-5.5〜5.7）
+# ---------------------------------------------------------------------------
+
+
+class _FakeKeyring:
+    """削除の読み直し挙動を差し替えられる最小の keyring 相当。"""
+
+    def __init__(self, *, read_error: bool = False, sticky: dict | None = None):
+        self.store: dict[tuple[str, str], str] = {}
+        self.read_error = read_error
+        self.sticky = sticky or {}
+
+    def get_password(self, service, ref):
+        if self.read_error:
+            raise RuntimeError("backend cannot read")
+        if (service, ref) in self.sticky:
+            return self.sticky[(service, ref)]
+        return self.store.get((service, ref))
+
+    def set_password(self, service, ref, value):
+        self.store[(service, ref)] = value
+
+    def delete_password(self, service, ref):
+        self.store.pop((service, ref), None)
+
+
+@pytest.fixture()
+def secrets_mod(monkeypatch):
+    import vlm_secrets
+
+    monkeypatch.setattr(vlm_secrets, "_session_store", {})
+    return vlm_secrets
+
+
+def test_delete_secret_treats_read_error_as_removed(secrets_mod, monkeypatch):
+    """未登録時に例外を返すバックエンド: 実際は消えているので True（旧実装は False）。"""
+    fake = _FakeKeyring(read_error=True)
+    monkeypatch.setattr(secrets_mod, "keyring", fake)
+    assert secrets_mod.delete_secret("vlm/gemini/api_key") is True
+
+
+def test_delete_secret_reports_false_when_value_still_readable(secrets_mod, monkeypatch):
+    fake = _FakeKeyring(sticky={(secrets_mod._SERVICE, "vlm/gemini/api_key"): "still-here"})
+    monkeypatch.setattr(secrets_mod, "keyring", fake)
+    assert secrets_mod.delete_secret("vlm/gemini/api_key") is False
+
+
+def test_delete_secret_reports_false_when_only_legacy_remains(secrets_mod, monkeypatch):
+    fake = _FakeKeyring(sticky={(secrets_mod._LEGACY_SERVICE, "vlm/gemini/api_key"): "old"})
+    monkeypatch.setattr(secrets_mod, "keyring", fake)
+    assert secrets_mod.delete_secret("vlm/gemini/api_key") is False
+
+
+def test_delete_secret_without_keyring_is_true(secrets_mod, monkeypatch):
+    monkeypatch.setattr(secrets_mod, "keyring", None)
+    assert secrets_mod.delete_secret("vlm/gemini/api_key") is True
+
+
+def test_delete_secret_clears_session_copy(secrets_mod, monkeypatch):
+    monkeypatch.setattr(secrets_mod, "keyring", None)
+    secrets_mod._session_store["vlm/gemini/api_key"] = "session-value"
+    assert secrets_mod.delete_secret("vlm/gemini/api_key") is True
+    assert "vlm/gemini/api_key" not in secrets_mod._session_store
+
+
+# ---------------------------------------------------------------------------
+# BUG-3: .env のクォート除去（REQ-5.8 / REQ-5.9）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("abc", "abc"),
+    ('"abc"', "abc"),
+    ("'abc'", "abc"),
+    ('"abc\'', '"abc\''),      # ミスマッチはそのまま
+    ("'abc\"", "'abc\""),
+    ('""x""', '"x"'),           # 外側 1 組だけ
+    ('"', '"'),                 # 1 文字はそのまま
+    ("''", ""),                 # 空クォート
+    ('""', ""),
+    ("", ""),
+    ("a=b", "a=b"),             # 値の途中の = は partition 側で処理済み
+])
+def test_unquote_dotenv_value(secrets_mod, raw, expected):
+    assert secrets_mod._unquote_dotenv_value(raw) == expected
+
+
+def test_dotenv_loading_keeps_unintentional_quotes(secrets_mod, monkeypatch, tmp_path):
+    """クォートしていない値の末尾の `"` を壊さない（旧実装は剥がしていた）。"""
+    import os
+
+    (tmp_path / ".env").write_text(
+        "PHASE4_BUG3_PLAIN=abc\"\n"
+        "PHASE4_BUG3_QUOTED=\"def\"\n"
+        "PHASE4_BUG3_MISMATCH=\"ghi'\n"
+        "export PHASE4_BUG3_EXPORT='jkl'\n",
+        encoding="utf-8",
+    )
+    for name in ("PHASE4_BUG3_PLAIN", "PHASE4_BUG3_QUOTED", "PHASE4_BUG3_MISMATCH",
+                 "PHASE4_BUG3_EXPORT"):
+        monkeypatch.delenv(name, raising=False)
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        secrets_mod._load_dotenv()
+        assert os.environ["PHASE4_BUG3_PLAIN"] == 'abc"'
+        assert os.environ["PHASE4_BUG3_QUOTED"] == "def"
+        assert os.environ["PHASE4_BUG3_MISMATCH"] == "\"ghi'"
+        assert os.environ["PHASE4_BUG3_EXPORT"] == "jkl"
+    finally:
+        os.chdir(cwd)
