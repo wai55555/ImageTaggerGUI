@@ -212,12 +212,14 @@ def _cell(cells: list[str], index: int) -> str:
 
 
 def _is_blank_csv_row(cells: list[str]) -> bool:
-    """空行（および空白だけの行）はデータ行ではないので読み飛ばす。
+    """物理的な空行だけをデータ行でないとみなす（REQ-A1 / PR#38 レビュー指摘）。
 
-    末尾の空行を 1 レコードとして数えると、短い行の保持（REQ-A1）とは逆に
-    ラベル数を増やしてずれの原因になる。
+    区切り文字だけの行（`,,` や `,,,,,`）は「列を持つ空レコード」であり、落とすと
+    以降の行が 1 行ずつずれてスコア対応が壊れる。プレースホルダ（空文字）として
+    位置を保つ。空白だけの行も同様に保持する: 末尾に余分な行が増えても `zip(tags,
+    scores)` が短い方で切るため、後続の対応はずれない（落とす方が危険）。
     """
-    return not cells or all(not cell.strip() for cell in cells)
+    return not cells
 
 
 def _load_selected_tags_pixai6col(tags_path: Path) -> list[TagMeta]:
@@ -322,6 +324,25 @@ def _as_index_key(key: Any) -> int | None:
         return None
 
 
+def _first_missing_indices(indices: list[int], limit: int = 5) -> list[int]:
+    """昇順インデックスの欠番を先頭から最大 `limit` 個返す。
+
+    `set(range(indices[-1] + 1))` を作ると、キーが `"0"` と `"1000000000"` の
+    2 件だけでも 10 億要素を確保してメモリ不足で落ちる（PR#38 レビュー指摘）。
+    診断目的なので、最初の数個が分かれば十分。
+    """
+    missing: list[int] = []
+    previous: int | None = None
+    for value in indices:
+        if previous is not None and value > previous + 1:
+            for candidate in range(previous + 1, min(value, previous + 1 + (limit - len(missing)))):
+                missing.append(candidate)
+            if len(missing) >= limit:
+                break
+        previous = value
+    return missing
+
+
 def _validated_numeric_keys(mapping: Any, *, context: str, tags_path: Path) -> list[str]:
     """インデックス写像の連続性を検証し、数値キーを昇順で返す（REQ-A2）。
 
@@ -344,7 +365,7 @@ def _validated_numeric_keys(mapping: Any, *, context: str, tags_path: Path) -> l
         if duplicates:
             problems.append(f"duplicate indices {duplicates}")
         if indices:
-            missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+            missing = _first_missing_indices(indices)
             if missing:
                 problems.append(f"missing indices {missing}")
         detail = "; ".join(problems) or f"non-contiguous indices {indices}"

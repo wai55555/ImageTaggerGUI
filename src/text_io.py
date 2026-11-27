@@ -33,6 +33,7 @@ symlink / hardlink（§6 U-7・2026-11-27 決定で対象外）:
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import uuid
 from pathlib import Path
@@ -75,6 +76,22 @@ def is_link_target(path: PathLike) -> bool:
         return os.lstat(path).st_nlink > 1
     except OSError:
         return False
+
+
+def _existing_mode(path: str) -> int | None:
+    """既存ファイルのモード（誰が読めるか）を返す。無ければ None。"""
+    try:
+        return stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return None
+
+
+def _apply_mode(path: str, mode: int) -> None:
+    """モードを設定する。失敗しても書き込み自体は続ける（Windows では制限あり）。"""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
 
 def atomic_write_text(
@@ -120,10 +137,18 @@ def atomic_write_text(
     if makedirs:
         os.makedirs(long_path_str(target.parent), exist_ok=True)
 
+    # 既存ファイルを置換する場合、一時ファイルを既定モード（umask 次第で 0644）で作ると
+    # 0600 だった内容が他ユーザーから読めるようになる。書き込み前から本人だけに絞り、
+    # 置換直前に元のモードへ戻す（PR#38 レビュー指摘）。新規作成は従来の open() と同じ
+    # モードのまま（広げるものが無いので触らない）。
+    preserved_mode = _existing_mode(long_target)
+
     tmp = target.with_name(f"{target.stem}.{uuid.uuid4().hex}{tmp_suffix}")
     long_tmp = long_path_str(tmp) if use_long_path else str(tmp)
     try:
         with open(long_tmp, "w", encoding=encoding, newline=newline) as handle:
+            if preserved_mode is not None:
+                _apply_mode(long_tmp, 0o600)
             handle.write(content)
             if fsync:
                 handle.flush()
@@ -135,6 +160,8 @@ def atomic_write_text(
                 written = handle.read()
             if written.replace("\r\n", "\n").replace("\r", "\n") != content:
                 raise OSError("verification mismatch after write")
+        if preserved_mode is not None:
+            _apply_mode(long_tmp, preserved_mode)
         os.replace(long_tmp, long_target)
     finally:
         try:

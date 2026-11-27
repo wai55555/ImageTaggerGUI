@@ -197,6 +197,18 @@ def reason_from_provider_code(code: str, message: str = "") -> VlmErrorReason | 
         return VlmErrorReason.SERVER_ERROR
     if low_code in _POLICY_CODES:
         return VlmErrorReason.CONTENT_POLICY
+    # 数値のプロバイダーコード（OpenRouter は HTTP 200 の本文に {"code":503} を返す）。
+    # 文字列コードと同じ理由づけを、数値にも最小限だけ当てる（PR#38 レビュー指摘）。
+    if low_code.isdigit() and len(low_code) <= 3:
+        status = int(low_code)
+        if status == 429:
+            return VlmErrorReason.RATE_LIMITED
+        if status in (401, 403):
+            return VlmErrorReason.AUTH_ERROR
+        if status == 404:
+            return VlmErrorReason.MODEL_UNSUPPORTED
+        if 500 <= status <= 599:
+            return VlmErrorReason.SERVER_ERROR
     low = str(message or "").lower()
     if "rate limit" in low or "quota" in low and "exceed" in low:
         return VlmErrorReason.RATE_LIMITED
