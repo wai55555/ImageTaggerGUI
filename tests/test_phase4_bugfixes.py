@@ -278,3 +278,75 @@ def test_dotenv_loading_keeps_unintentional_quotes(secrets_mod, monkeypatch, tmp
         assert os.environ["PHASE4_BUG3_EXPORT"] == "jkl"
     finally:
         os.chdir(cwd)
+
+
+# ---------------------------------------------------------------------------
+# BUG-4: カスタム接続の read_timeout 既定値（REQ-5.10〜5.12）
+# ---------------------------------------------------------------------------
+
+
+def _qt_app():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
+def test_read_timeout_default_comes_from_retry_policy():
+    """数値の 60 をテスト側に直書きせず、RetryPolicy の既定と一致することだけを固定する。"""
+    app = _qt_app()
+    import vlm_connections
+    from custom_connection_dialog import CustomConnectionDialog
+
+    expected = int(vlm_connections.RetryPolicy().read_timeout_s)
+    dialog = CustomConnectionDialog(lambda section, key, **kw: key)
+    app.processEvents()
+    try:
+        assert dialog.read_timeout.value() == expected
+    finally:
+        dialog.close()
+
+
+def test_missing_retry_block_falls_back_to_retry_policy_default():
+    app = _qt_app()
+    import vlm_connections
+    from custom_connection_dialog import CustomConnectionDialog
+
+    expected = int(vlm_connections.RetryPolicy().read_timeout_s)
+    dialog = CustomConnectionDialog(
+        lambda section, key, **kw: key,
+        existing={"display_name": "x", "base_url": "https://example.test/v1",
+                  "model_id": "m", "auth": {"type": "none"}},
+    )
+    app.processEvents()
+    try:
+        assert dialog.read_timeout.value() == expected
+        # spin の範囲は現行のまま
+        assert dialog.read_timeout.minimum() == 5
+        assert dialog.read_timeout.maximum() == 900
+    finally:
+        dialog.close()
+
+
+def test_explicit_read_timeout_is_preserved():
+    """明示的に保存済みの値（例 120）は書き換えない（REQ-5.11）。"""
+    app = _qt_app()
+    from custom_connection_dialog import CustomConnectionDialog
+
+    dialog = CustomConnectionDialog(
+        lambda section, key, **kw: key,
+        existing={"base_url": "https://example.test/v1", "model_id": "m",
+                  "auth": {"type": "none"}, "retry": {"read_timeout_s": 120}},
+    )
+    app.processEvents()
+    try:
+        assert dialog.read_timeout.value() == 120
+        dialog.name_edit.setText("kept")
+        dialog._on_save()  # 何も触らず保存しても 120 のまま
+        assert dialog._result is not None
+        assert dialog._result["retry"]["read_timeout_s"] == 120
+    finally:
+        dialog.close()
