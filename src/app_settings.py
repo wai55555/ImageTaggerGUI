@@ -1,9 +1,11 @@
 import configparser
+import io
 import os
 from typing import Any
 from dataclasses import dataclass, field, is_dataclass, fields
 from pathlib import Path
 
+from text_io import atomic_write_text
 from utils import write_debug_log, GetString, default_get_string_fallback
 from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS
 
@@ -326,6 +328,16 @@ def get_default_config() -> configparser.ConfigParser:
     config.read_dict(DEFAULT_CONFIG)
     return config
 
+def _write_config_atomically(config: configparser.ConfigParser) -> None:
+    """config.ini を原子的に書く（REQ-2.3 / REQ-2.7 の (i) 段）。
+
+    低頻度・高価値なファイルなので、fsync + 読み直し検証 + os.replace のフル装備を使う。
+    改行は現行どおり `newline=None`（Windows では CRLF へ翻訳）で、バイト列を変えない。
+    """
+    buffer = io.StringIO()
+    config.write(buffer)
+    atomic_write_text(CONFIG_PATH, buffer.getvalue(), fsync=True, verify=True)
+
 def load_config() -> configparser.ConfigParser:
     """Loads the config.ini file, creating it from defaults if it doesn't exist."""
     config = get_default_config()
@@ -335,8 +347,7 @@ def load_config() -> configparser.ConfigParser:
         write_debug_log(_get_string("ConfigUtils", "Config_File_Load_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
     else:
         try:
-            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                config.write(f)
+            _write_config_atomically(config)
             write_debug_log(_get_string("ConfigUtils", "Config_File_NotFound_Create_Default", CONFIG_PATH=CONFIG_PATH), _get_string)
         except Exception as e:
             write_debug_log(_get_string("ConfigUtils", "Config_File_Creation_Failed", e=e), _get_string)
@@ -532,8 +543,7 @@ def save_config(settings: AppSettings) -> bool:
 
 
     try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            config.write(f)
+        _write_config_atomically(config)
         write_debug_log(_get_string("ConfigUtils", "Config_File_Save_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
         return True
     except Exception as e:

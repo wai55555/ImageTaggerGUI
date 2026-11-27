@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
 import constants
+from text_io import atomic_write_text
 from utils import log_dbg, GetString
 from app_settings import AppSettings
 from tagging_core import (
@@ -514,10 +515,8 @@ def process_caption_loop(
             continue
 
         try:
-            resolved_path = output_path.resolve()
-            long_path_str = f"\\\\?\\{resolved_path}" if sys.platform == "win32" else str(resolved_path)
-            with open(long_path_str, "w", encoding="utf-8") as f:
-                f.write(new_content)
+            # REQ-2.3: 一時ファイル + os.replace で原子的に書く（REQ-2.7 の (iii) 段）。
+            atomic_write_text(output_path, new_content, fsync=False, verify=False)
             changed_files.append(FileChange(
                 path=output_path, previous_content=previous_content,
                 new_content=new_content, was_append=(placement != "OVERWRITE" and previous_content is not None)))

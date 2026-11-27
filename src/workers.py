@@ -11,6 +11,7 @@ from collections import Counter
 from PySide6.QtCore import QObject, Signal, Slot
 
 from utils import write_debug_log, calculate_sha256, GetString, default_get_string_fallback
+from text_io import atomic_write_text
 from constants import (
     DOWNLOAD_URLS, MODEL_PATH, TAGS_CSV_PATH, MODEL_POINTER_PATH
 )
@@ -1017,8 +1018,8 @@ class BulkTagWorker(QObject):
             
             if set(existing_tags) != set(modified_tags):
                 new_content = ", ".join(modified_tags)
-                with open(txt_file_path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                # REQ-2.3: 一時ファイル + os.replace で原子的に書く（(iii) 段）。
+                atomic_write_text(txt_file_path, new_content, fsync=False, verify=False)
                 return True
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_File_Processing_Failed", txt_name=txt_file_path.name, e=e)), self.get_string)

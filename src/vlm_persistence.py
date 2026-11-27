@@ -7,24 +7,12 @@
 """
 from __future__ import annotations
 
-import os
-import sys
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-
-# 既存 tagging_core / caption_core と同じ拡張長パス変換（undo_manager._long_path_str と同趣旨）。
-def _long_path_str(path: Path) -> str:
-    p = os.path.abspath(path)
-    if sys.platform != "win32":
-        return p
-    if p.startswith("\\\\?\\"):
-        # すでに拡張長パス。重ねて接頭辞を付けると os.replace 等が無効パスで失敗する。
-        return p
-    if p.startswith("\\\\"):
-        return "\\\\?\\UNC" + p[1:]
-    return "\\\\?\\" + p
+# REQ-2.2: 原子的書き込みと拡張長パス変換は VLM 非依存の共通部品（src/text_io.py）へ移した。
+# ここは従来どおり (i) fsync + 読み直し検証 + replace、親ディレクトリ作成ありで呼ぶ。
+from text_io import atomic_write_text, long_path_str
 
 
 VLM_PLACEMENTS = ("PREPEND", "APPEND", "OVERWRITE")
@@ -104,10 +92,10 @@ def save_caption(output_path: Path, caption: str, placement: str) -> SaveOutcome
     # 黙って LF 化されるのを防ぐ。undo スナップショット（previous_content / new_content）は
     # LF 正規化して持ち、_FileSnapshotAction._write（newline=None）の書き戻し翻訳と整合させる。
     output_newline = "\n"
-    fs_output_path = Path(_long_path_str(output_path))
+    fs_output_path = Path(long_path_str(output_path))
     if fs_output_path.is_file():
         # 読めない既存ファイルは新規扱いにしない（undo での破壊防止。PR#16 と同方針）。
-        with open(_long_path_str(output_path), "r", encoding="utf-8", newline="") as f:
+        with open(long_path_str(output_path), "r", encoding="utf-8", newline="") as f:
             raw_previous = f.read()
         output_newline = "\r\n" if "\r\n" in raw_previous else "\n"
         previous_content = raw_previous.replace("\r\n", "\n").replace("\r", "\n")
@@ -127,25 +115,15 @@ def save_caption(output_path: Path, caption: str, placement: str) -> SaveOutcome
 
 
 def _atomic_write(output_path: Path, content: str, *, newline: str = "\n") -> None:
-    """`content`（LF 前提）を `newline` 規約で原子的に書く。検証は改行を正規化して比較する。"""
-    os.makedirs(_long_path_str(output_path.parent), exist_ok=True)
-    tmp = output_path.with_name(f"{output_path.stem}.{uuid.uuid4().hex}.vlmtmp")
-    long_tmp = _long_path_str(tmp)
-    try:
-        with open(long_tmp, "w", encoding="utf-8", newline=newline) as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        # 検証: 書いた内容が読み直せて一致するか。newline="" で生読みし、書き出し時の
-        # 改行変換ぶんを正規化してから比較する。
-        with open(long_tmp, "r", encoding="utf-8", newline="") as f:
-            written = f.read()
-        if written.replace("\r\n", "\n").replace("\r", "\n") != content:
-            raise OSError("verification mismatch after write")
-        os.replace(_long_path_str(tmp), _long_path_str(output_path))
-    finally:
-        try:
-            if os.path.exists(long_tmp):
-                os.unlink(long_tmp)
-        except OSError:
-            pass
+    """`content`（LF 前提）を `newline` 規約で原子的に書く。検証は改行を正規化して比較する。
+
+    （REQ-2.2 で共通部品へ移動。ここは従来と同じフル装備 = fsync + 検証 + 親ディレクトリ作成。）
+    """
+    atomic_write_text(
+        output_path,
+        content,
+        newline=newline,
+        fsync=True,
+        verify=True,
+        makedirs=True,
+    )
