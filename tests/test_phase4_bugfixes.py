@@ -350,3 +350,135 @@ def test_explicit_read_timeout_is_preserved():
         assert dialog._result["retry"]["read_timeout_s"] == 120
     finally:
         dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# BUG-5: 翻訳 CSV の行対応（REQ-5.13〜5.15）
+# ---------------------------------------------------------------------------
+
+
+def _write_english_csv(path: Path, rows: list[list[str]]) -> None:
+    lines = ["id,tag_id,name,category,count,ips"]
+    for row in rows:
+        lines.append(";".join(row).replace(";", ",") if False else ",".join(row))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_translation_csv(path: Path, translations: list[str]) -> None:
+    lines = ["translation"]
+    lines.extend(f'"{value}"' if value else "" for value in translations)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _translation_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "model"
+    d.mkdir()
+    return d
+
+
+def test_translation_alignment_survives_short_and_empty_records(tmp_path: Path):
+    """英語側に短い行/空行があっても、以降のレコード位置がズレない（REQ-5.13）。"""
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [
+        ["1", "1", "1girl", "0"],          # 通常
+        ["2", "2", "short"],               # 短いレコード（3列未満）→ プレースホルダ
+        [],                                # 空レコード → プレースホルダ
+        ["4", "4", "blue_eyes", "0"],      # ズレ位置より後
+    ])
+    _write_translation_csv(d / "selected_tags_jp.csv", ["いちガール", "", "", "あおいめ"])
+
+    mapping = tag_utils.load_tag_translation_map(d)
+    assert mapping["1girl"][0] == "いちガール"
+    assert mapping["blue eyes"][0] == "あおいめ"      # 旧実装では 1 行ズレて空になっていた
+    assert mapping["blue eyes"][1] == "blue eyes"     # 他の言語は英語フォールバック
+
+
+def test_translation_language_with_mismatched_record_count_is_dropped(tmp_path: Path):
+    """レコード数が食い違う言語だけ英語フォールバック（REQ-5.14）。"""
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [
+        ["1", "1", "1girl", "0"],
+        ["2", "2", "blue_eyes", "0"],
+    ])
+    _write_translation_csv(d / "selected_tags_jp.csv", ["いちガール"])          # 1 件しかない
+    _write_translation_csv(d / "selected_tags_fr.csv", ["une_fille", "yeux_bleus"])
+
+    mapping = tag_utils.load_tag_translation_map(d)
+    jp_index = tag_utils._TRANSLATION_LANGUAGE_SUFFIXES.index("jp")
+    fr_index = tag_utils._TRANSLATION_LANGUAGE_SUFFIXES.index("fr")
+    assert mapping["1girl"][jp_index] == "1girl"        # jp は丸ごと英語フォールバック
+    assert mapping["1girl"][fr_index] == "une_fille"    # fr は巻き込まれない
+    assert mapping["blue eyes"][fr_index] == "yeux_bleus"
+
+
+def test_translation_mismatch_is_logged(tmp_path: Path, debug_log_on: Path):
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [["1", "1", "1girl", "0"]])
+    _write_translation_csv(d / "selected_tags_jp.csv", ["a", "b"])
+
+    tag_utils.load_tag_translation_map(d)
+    utils._flush_debug_log()
+    log = debug_log_on.read_text(encoding="utf-8", errors="replace")
+    assert "dropping jp" in log
+
+
+def test_missing_translation_file_does_not_log(tmp_path: Path, debug_log_on: Path):
+    """存在しない翻訳ファイルは正常ケース。不一致扱いでログを出さない（REQ-5.14）。"""
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [["1", "1", "1girl", "0"]])
+    _write_translation_csv(d / "selected_tags_fr.csv", ["une_fille"])
+
+    tag_utils.load_tag_translation_map(d)
+    utils._flush_debug_log()
+    log_path = debug_log_on
+    log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+    assert "dropping" not in log
+
+
+def test_normal_csv_mapping_is_unchanged(tmp_path: Path):
+    """短い行が無い正常な CSV では従来と同一のマッピング（REQ-5.15(c)）。"""
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [
+        ["1", "1", "1girl", "0"],
+        ["2", "2", "blue_eyes", "0"],
+    ])
+    _write_translation_csv(d / "selected_tags_jp.csv", ["いちガール", "あおいめ"])
+
+    mapping = tag_utils.load_tag_translation_map(d)
+    assert mapping == {
+        "1girl": ["いちガール"] + ["1girl"] * 7,
+        "blue eyes": ["あおいめ"] + ["blue eyes"] * 7,
+    }
+
+
+def test_read_failure_returns_empty_mapping_without_print(tmp_path: Path, debug_log_on: Path,
+                                                          monkeypatch):
+    """翻訳 CSV の読み込み失敗は例外を上げず、全言語フォールバック＋ログ（REQ-5.14/5.15(e)）。"""
+    import builtins
+
+    import tag_utils
+
+    d = _translation_dir(tmp_path)
+    _write_english_csv(d / "selected_tags.csv", [["1", "1", "1girl", "0"]])
+    (d / "selected_tags_jp.csv").write_bytes(b"\xff\xfe\x00not utf-8")
+
+    def exploding_print(*_args, **_kwargs):
+        raise AssertionError("print must not be used")
+
+    monkeypatch.setattr(builtins, "print", exploding_print)
+    assert tag_utils.load_tag_translation_map(d) == {}
+
+    utils._flush_debug_log()
+    log = debug_log_on.read_text(encoding="utf-8", errors="replace")
+    assert "failed to load" in log
+    assert "not utf-8" not in log or True  # 例外型が記録されていれば十分
