@@ -121,36 +121,49 @@ def load_tag_translation_map(model_dir: Path, *fallback_dirs: Path | None) -> di
         # 呼び出し側は空辞書に対して英語タグへフォールバックするので、これ以上何もしなくてよい。
         return mapping
 
-    try:
-        # 英語版CSVを読み込む（ベースとなる）
-        english_tags = []
-        with open(english_csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            next(reader)  # ヘッダーをスキップ
-            for row in reader:
-                if len(row) >= 3:
-                    # 3列目（インデックス2）がタグ名、アンダースコアをスペースに変換
-                    tag = row[2].strip().replace('_', ' ')
-                    english_tags.append(tag)
+    def _read_data_records(path: Path) -> list[list[str]]:
+        """ヘッダーを読み飛ばし、`csv.reader` の論理レコード単位で全行を返す。
 
-        # 各翻訳ファイルを読み込む（存在しないファイルは空リストのまま＝全行フォールバック）
+        クォート内の改行を含むフィールドも 1 レコードとして数える（物理行で数えない）。
+        """
+        with open(path, 'r', encoding='utf-8') as handle:
+            reader = csv.reader(handle)
+            next(reader, None)  # ヘッダー
+            return list(reader)
+
+    try:
+        # 英語版CSVを読み込む（ベースとなる）。REQ-5.13: 短い行・空行を「詰めて落とす」と
+        # 以降の翻訳が全部 1 行ずつズレるため、空文字のプレースホルダで位置を保つ。
+        english_tags: list[str] = []
+        for row in _read_data_records(english_csv_path):
+            if len(row) >= 3:
+                # 3列目（インデックス2）がタグ名、アンダースコアをスペースに変換
+                english_tags.append(row[2].strip().replace('_', ' '))
+            else:
+                english_tags.append('')
+
+        # 各翻訳ファイルを読み込む（存在しないファイルは空リストのまま＝英語でフォールバック）
         all_translations: list[list[str]] = []
-        for lang_path in language_paths:
+        for suffix, lang_path in zip(_TRANSLATION_LANGUAGE_SUFFIXES, language_paths):
             translations: list[str] = []
             if lang_path is not None:
-                with open(lang_path, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    next(reader)  # ヘッダーをスキップ
-                    for row in reader:
-                        if len(row) > 0:
-                            # カンマで終わる場合は削除
-                            trans = row[0].strip().rstrip(',')
-                            translations.append(trans if trans else '')
-                        else:
-                            translations.append('')
+                translations = [
+                    (row[0].strip().rstrip(',') if row else '')
+                    for row in _read_data_records(lang_path)
+                ]
+                # REQ-5.14: レコード数が英語と食い違う翻訳は位置合わせ自体が不可能。
+                # ズレた翻訳を黙って出さず、その言語だけ英語へフォールバックする
+                # （存在しないファイルと同じ扱い。他の言語は巻き込まない）。
+                if len(translations) != len(english_tags):
+                    write_debug_log(
+                        f"tag translations: {lang_path.name} has {len(translations)} data "
+                        f"records but selected_tags.csv has {len(english_tags)}; dropping "
+                        f"{suffix} and falling back to English"
+                    )
+                    translations = []
             all_translations.append(translations)
 
-        # 英語タグと翻訳を対応付ける
+        # 英語タグと翻訳を対応付ける（同じレコード位置どうし）
         for i, en_tag in enumerate(english_tags):
             if en_tag:
                 trans_list = []
@@ -163,8 +176,12 @@ def load_tag_translation_map(model_dir: Path, *fallback_dirs: Path | None) -> di
                 mapping[en_tag] = trans_list
 
     except Exception as e:
-        print(f"Error loading tag translations: {e}")
-        import traceback
-        traceback.print_exc()
+        # REQ-5.14: print / traceback.print_exc() は windowed ビルドで stdout/stderr が
+        # 無いとそれ自体が落ちるうえ利用者の手元に残らない。例外情報ごと debug log へ。
+        # 影響範囲は現行どおり全体（mapping は空のまま＝全言語が英語表示にフォールバック）。
+        write_debug_log(
+            f"tag translations: failed to load {english_csv_path}: "
+            f"{type(e).__name__}: {e}"
+        )
 
     return mapping

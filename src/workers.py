@@ -260,8 +260,13 @@ class DownloaderWorker(QObject):
                         downloaded_size += len(chunk)
                         if current_total_size_for_progress > 0:
                             percent = min(100, int(downloaded_size * 100 / current_total_size_for_progress))
-                            self.progress_update.emit(percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
-                            last_percent = percent
+                            # REQ-5.16: 8KB チャンクごとに emit すると 1.2GB のモデルで
+                            # 約 15 万回のクロススレッドシグナルになる。パーセントが
+                            # 変化したときだけ発行する（最大 101 回＋完了時の 100）。
+                            # 停止チェック（is_stopped）の粒度は変えない。
+                            if percent != last_percent:
+                                self.progress_update.emit(percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
+                                last_percent = percent
 
                 if self.is_stopped():
                     write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Aborted", file_name=file_name)), self.get_string)
@@ -574,6 +579,8 @@ class GpuRuntimeDownloadWorker(QObject):
         super().__init__()
         self.get_string: GetString = get_string if get_string else default_get_string_fallback
         self._stop_event = threading.Event()
+        # REQ-5.19: 進捗シグナルの間引き用（直前に発行したパーセント）。
+        self._last_progress_percent = -1
 
     def stop(self):
         write_debug_log(f"DEBUG: {type(self).__name__}.stop() called.")
@@ -583,9 +590,14 @@ class GpuRuntimeDownloadWorker(QObject):
         return self._stop_event.is_set()
 
     def _on_progress(self, done: int, total: int) -> None:
+        # REQ-5.19: gpu_runtime は 256KB チャンクごとに呼ぶ（合計約 2GB で約 8,000 回）。
+        # パーセントが変化したときだけ emit する。合計不明（total == 0）はパーセントが
+        # 定義できないため現行どおり毎回発行する。
         if total > 0:
             pct = max(0, min(100, int(done * 100 / total)))
-            self.progress_update.emit(pct, done / 1024 / 1024, total / 1024 / 1024)
+            if pct != self._last_progress_percent:
+                self._last_progress_percent = pct
+                self.progress_update.emit(pct, done / 1024 / 1024, total / 1024 / 1024)
         else:
             self.progress_update.emit(0, done / 1024 / 1024, 0.0)
 

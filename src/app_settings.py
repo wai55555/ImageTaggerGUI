@@ -494,6 +494,42 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
     )
 
 
+def _merge_unknown_config_entries(config: configparser.ConfigParser) -> bool:
+    """既存 config.ini の未知キー／未知セクションを `config` へ取り込む（REQ-5.2）。
+
+    `save_config()` は dataclass から config を**再構築**するため、そのまま書くと
+    手書きで足したキーや将来の版のキーが消える。現在のファイルを読んで、dataclass が
+    書かないキー／セクションだけを足す（既知キーの値は dataclass 側を正とする）。
+
+    旧形式の `[Model] verified` だけは**取り込まない**（移行で消費済みのキーで、残すと
+    `_parse_verified_models()` が `verified_models` より優先し続けて移行が完了しない）。
+
+    Returns:
+        取り込めたら True。ファイルが無い／パースできない場合は False。
+        パース不能（セクションヘッダ無し等）でも保存自体は成功させる（現行挙動の維持）。
+    """
+    if not CONFIG_PATH.is_file():
+        return False
+    existing = configparser.ConfigParser()
+    try:
+        existing.read(CONFIG_PATH, encoding='utf-8')
+    except Exception as e:
+        write_debug_log(
+            f"config.ini could not be parsed for unknown-key preservation; "
+            f"writing the dataclass defaults only ({type(e).__name__}: {e})"
+        )
+        return False
+    if existing.has_option('Model', 'verified'):
+        existing.remove_option('Model', 'verified')
+    for section in existing.sections():
+        if not config.has_section(section):
+            config.add_section(section)
+        for key, value in existing.items(section):
+            if not config.has_option(section, key):
+                config.set(section, key, value)
+    return True
+
+
 def save_config(settings: AppSettings) -> bool:
     """Saves the AppSettings object to the config.ini file.
 
@@ -516,7 +552,9 @@ def save_config(settings: AppSettings) -> bool:
             else:
                 # Convert value to string for configparser
                 if isinstance(value, float):
-                    config_parser.set(section_name, field_info.name, f"{value:.2f}")
+                    # REQ-5.1: `f"{value:.2f}"` は小数第3位以下を丸める（0.455 → 0.45）。
+                    # repr(float) は最短の往復表現なので、保存→読込→保存で値が変わらない。
+                    config_parser.set(section_name, field_info.name, repr(float(value)))
                 elif isinstance(value, Path):
                     config_parser.set(section_name, field_info.name, str(value))
                 elif isinstance(value, dict):
@@ -541,6 +579,9 @@ def save_config(settings: AppSettings) -> bool:
                 # and language_code is handled specifically.
                 pass # Or raise an error if unexpected direct fields exist
 
+
+    # REQ-5.2: 未知キー／未知セクションを保持する（壊れた config でも保存は続行）。
+    _merge_unknown_config_entries(config)
 
     try:
         _write_config_atomically(config)

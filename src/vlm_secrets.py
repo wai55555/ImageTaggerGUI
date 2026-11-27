@@ -44,6 +44,19 @@ def _service_for(secret_ref: str) -> str:
     return _SERVICE
 
 
+def _unquote_dotenv_value(value: str) -> str:
+    """.env の値をクォート解除する（REQ-5.8）。
+
+    両端が**対応する同じクォート**で囲まれているときだけ外側 1 組を外す。
+    旧実装の `val.strip().strip('"').strip("'")` はクォート文字を無条件に全部剥がすため、
+    クォートしていない値の両端の `"` / `'` まで壊していた（`"abc'` はそのまま、
+    `""x""` は `"x"` になる）。
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _load_dotenv() -> None:
     """exe/スクリプトの隣、または作業ディレクトリの `.env` を環境変数へ読み込む。
 
@@ -75,7 +88,7 @@ def _load_dotenv() -> None:
                 line = line[7:]
             key, _, val = line.partition("=")
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = _unquote_dotenv_value(val.strip())
             if key and key not in os.environ:
                 os.environ[key] = val
 
@@ -179,13 +192,19 @@ def delete_secret(secret_ref: str) -> bool:
                 keyring.delete_password(service, secret_ref)
             except Exception as e:  # backend 無し / エントリ未登録など
                 write_debug_log(f"vlm_secrets: keyring delete failed for a ref: {type(e).__name__}")
-        # 実際に消えたかを両サービス名で確認する（未登録なら例外でも結果的に None で OK）。
+        # 実際に消えたかを両サービス名で確認する。「値が残っていることを確認できた」
+        # ときだけ removed = False とする（REQ-5.5）。エントリ未登録のときに例外を返す
+        # バックエンドでは、読み直しが例外になるのが正常なので「確認できなかった」を
+        # 「残っている」と判定しない（旧実装はここで False を返していた）。
         for service in (_SERVICE, _LEGACY_SERVICE):
             try:
                 if keyring.get_password(service, secret_ref):
                     removed = False
-            except Exception:
-                removed = False
+            except Exception as e:
+                write_debug_log(
+                    f"vlm_secrets: could not verify deletion ({type(e).__name__}); "
+                    f"treating it as removed"
+                )
     with _lock:
         _session_store.pop(secret_ref, None)
     return removed
