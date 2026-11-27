@@ -189,3 +189,25 @@ def get_model_entry(model_id: str) -> ModelEntry | None:
         if entry.model_id == model_id:
             return entry
     return None
+
+
+def primary_onnx_file_name(entry: ModelEntry) -> str:
+    """Return the model's ONNX file name as declared by the manifest's `network.files`.
+
+    REQ-A4: the download side already treats `network.files` as the source of truth, so
+    inference must not hardcode a second copy of the name. Tagger manifests declare
+    exactly one `.onnx` entry; `model.onnx` remains the fallback for manifests that
+    declare none (the legacy PixAI pseudo-entry) or several (not expected for taggers).
+    """
+    files = config_mapping(entry.config, "network", "files")
+    onnx_names = [str(name) for name in files if str(name).lower().endswith(".onnx")]
+    if len(onnx_names) == 1:
+        return onnx_names[0]
+    if "model.onnx" in onnx_names:
+        return "model.onnx"
+    write_debug_log(
+        f"model_registry: '{entry.model_id}' declares {len(onnx_names)} .onnx files "
+        f"({onnx_names}); falling back to model.onnx for tagger inference."
+    )
+    return "model.onnx"
+

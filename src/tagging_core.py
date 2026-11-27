@@ -18,18 +18,19 @@ from constants import BASE_DIR
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
-    from PIL import Image
+    from PIL import Image, ImageOps
     import onnxruntime as ort # type: ignore
 else:
     try:
         import numpy as np
         from numpy.typing import NDArray
-        from PIL import Image
+        from PIL import Image, ImageOps
         import onnxruntime as ort # type: ignore
     except ImportError:
         np = None
         NDArray = None
         Image = None
+        ImageOps = None
         ort = None
 
 LOG_FILE_PATH = BASE_DIR / "debug_log.txt"
@@ -45,6 +46,12 @@ from onnx_providers import make_session
 # predict() を直接呼んだとき（単体テスト・スクリプト利用）だけ。出力仕様に影響
 # するため、無名の 100 ではなく根拠付きの定数として置く。
 DEFAULT_TAG_OUTPUT_CAP = 100
+
+# 透過画像を推論へ渡すときの合成背景（REQ-A9）。マニフェストで
+# inference.alpha_background_rgb を指定していないモデルにも同じ既定を適用する。
+# 値は唯一の既存定義（pixai-tagger-v1.0 の [255, 255, 255]）と VLM 経路の
+# 平坦化色に合わせた白。モデルごとに透明の扱いが変わるのを防ぐ。
+DEFAULT_ALPHA_BACKGROUND_RGB = (255, 255, 255)
 
 
 _get_string: GetString = lambda section, key, **kwargs: str(key)
@@ -205,6 +212,24 @@ def _resolve_category_keep_row(category_str: str, *, context: str) -> int:
         return int(TagCategory.GENERAL)
     return resolved
 
+def _cell(cells: list[str], index: int) -> str:
+    """CSV 行から列を取り出す。短い行は空文字で位置を保持する（REQ-A1）。
+
+    infer_batch_prepared はラベルとスコアを index で zip するため、短い行を
+    `continue` で飛ばすと以降のタグがすべて別のスコアに結び付く。
+    """
+    return cells[index] if index < len(cells) else ""
+
+
+def _is_blank_csv_row(cells: list[str]) -> bool:
+    """空行（および空白だけの行）はデータ行ではないので読み飛ばす。
+
+    末尾の空行を 1 レコードとして数えると、短い行の保持（REQ-A1）とは逆に
+    ラベル数を増やしてずれの原因になる。
+    """
+    return not cells or all(not cell.strip() for cell in cells)
+
+
 def _load_selected_tags_pixai6col(tags_path: Path) -> list[TagMeta]:
     labels: list[TagMeta] = []
     with tags_path.open(encoding="utf-8", newline="") as fp:
@@ -214,12 +239,12 @@ def _load_selected_tags_pixai6col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 6:
+            if _is_blank_csv_row(cells):
                 continue
-            tag_name = cells[2]
-            category = _resolve_category_keep_row(cells[3], context="pixai6col")
-            count_str = cells[4]
-            ips_json = cells[5]
+            tag_name = _cell(cells, 2)
+            category = _resolve_category_keep_row(_cell(cells, 3), context="pixai6col")
+            count_str = _cell(cells, 4)
+            ips_json = _cell(cells, 5)
             try:
                 count = int(count_str) if count_str else None
             except ValueError:
@@ -245,10 +270,10 @@ def _load_selected_tags_simple3col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 3:
+            if _is_blank_csv_row(cells):
                 continue
-            category = _resolve_category_keep_row(cells[2], context="simple3col")
-            labels.append(TagMeta(name=cells[1], category=category, count=None, ips=()))
+            category = _resolve_category_keep_row(_cell(cells, 2), context="simple3col")
+            labels.append(TagMeta(name=_cell(cells, 1), category=category, count=None, ips=()))
     return labels
 
 def _load_selected_tags_wd4col(tags_path: Path) -> list[TagMeta]:
@@ -261,15 +286,81 @@ def _load_selected_tags_wd4col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 4:
+            if _is_blank_csv_row(cells):
                 continue
-            category = _resolve_category_keep_row(cells[2], context="wd4col")
+            category = _resolve_category_keep_row(_cell(cells, 2), context="wd4col")
+            count_str = _cell(cells, 3)
             try:
-                count = int(cells[3]) if cells[3] else None
+                count = int(count_str) if count_str else None
             except ValueError:
                 count = None
-            labels.append(TagMeta(name=cells[1], category=category, count=count, ips=()))
+            labels.append(TagMeta(name=_cell(cells, 1), category=category, count=count, ips=()))
     return labels
+
+class _IndexPairsDict(dict):
+    """`json.load(object_pairs_hook=...)` の結果。重複キーを記録しておく。
+
+    json は重複キーを後勝ちで潰すため、parse 後の dict からは「重複していた」ことを
+    検出できない。インデックスの重複はタグとスコアの対応ずれに直結するので、
+    parse 時点で記録して REQ-A2 の検証へ渡す。
+    """
+
+    duplicate_keys: tuple[str, ...] = ()
+
+
+def _index_pairs_hook(pairs: list[tuple[str, Any]]) -> _IndexPairsDict:
+    result = _IndexPairsDict()
+    duplicates: list[str] = []
+    for key, value in pairs:
+        if key in result:
+            duplicates.append(key)
+        result[key] = value
+    result.duplicate_keys = tuple(duplicates)
+    return result
+
+
+def _load_index_json(tags_path: Path) -> Any:
+    """重複キーを記録しつつ JSON を読む（REQ-A2）。"""
+    with tags_path.open(encoding="utf-8") as fp:
+        return json.load(fp, object_pairs_hook=_index_pairs_hook)
+
+
+def _as_index_key(key: Any) -> int | None:
+    try:
+        return int(key)
+    except (TypeError, ValueError):
+        return None
+
+
+def _validated_numeric_keys(mapping: Any, *, context: str, tags_path: Path) -> list[str]:
+    """インデックス写像の連続性を検証し、数値キーを昇順で返す（REQ-A2）。
+
+    欠け・重複・非連続は「タグとスコアの対応が黙ってずれる」ため、詰めて読まずに
+    例外へ倒す（PixAI v1 のローダと同じ振る舞い）。
+    """
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            f"load_selected_tags[{context}]: expected an object, got "
+            f"{type(mapping).__name__} in {tags_path}"
+        )
+    numeric = _numeric_keys_sorted(mapping)
+    duplicates = sorted({
+        index for key in getattr(mapping, "duplicate_keys", ())
+        if (index := _as_index_key(key)) is not None
+    })
+    indices = [int(key) for key in numeric]
+    if duplicates or indices != list(range(len(indices))):
+        problems: list[str] = []
+        if duplicates:
+            problems.append(f"duplicate indices {duplicates}")
+        if indices:
+            missing = sorted(set(range(indices[-1] + 1)) - set(indices))
+            if missing:
+                problems.append(f"missing indices {missing}")
+        detail = "; ".join(problems) or f"non-contiguous indices {indices}"
+        raise ValueError(f"load_selected_tags[{context}]: {detail} in {tags_path}")
+    return numeric
+
 
 def _numeric_keys_sorted(raw: dict[str, Any]) -> list[str]:
     """Keys that are integer strings, in numeric order. Non-numeric keys (a stray
@@ -294,15 +385,14 @@ def _load_selected_tags_idx_json(tags_path: Path) -> list[TagMeta]:
          [optional] "idx_to_category": {"<idx>": "General"}}
     * flat list:  [{"tag"/"name": "...", "category": "..."}, ...]  (order == index)
     """
-    with tags_path.open(encoding="utf-8") as fp:
-        raw: Any = json.load(fp)
+    raw: Any = _load_index_json(tags_path)
     labels: list[TagMeta] = []
 
     if isinstance(raw, dict) and "idx_to_tag" in raw:
         idx_to_tag: dict[str, Any] = raw.get("idx_to_tag", {}) or {}
         tag_to_category: dict[str, Any] = raw.get("tag_to_category", {}) or {}
         idx_to_category: dict[str, Any] = raw.get("idx_to_category", {}) or {}
-        for idx in _numeric_keys_sorted(idx_to_tag):
+        for idx in _validated_numeric_keys(idx_to_tag, context="idx_json/v2", tags_path=tags_path):
             tag_name = str(idx_to_tag[idx])
             cat_str = str(idx_to_category.get(idx, tag_to_category.get(tag_name, "")))
             category = _resolve_category_keep_row(cat_str, context="idx_json/v2")
@@ -321,7 +411,7 @@ def _load_selected_tags_idx_json(tags_path: Path) -> list[TagMeta]:
         return labels
 
     # v1 shape: {"<idx>": {"tag": ..., "category": ...}}
-    for idx in _numeric_keys_sorted(raw):
+    for idx in _validated_numeric_keys(raw, context="idx_json", tags_path=tags_path):
         entry = raw[idx] if isinstance(raw[idx], dict) else {}
         category = _resolve_category_keep_row(str(entry.get("category", "")), context="idx_json")
         labels.append(TagMeta(name=str(entry.get("tag", "")), category=category, count=None, ips=()))
@@ -362,13 +452,12 @@ def _load_pixai_v1_tags_json(tags_path: Path) -> list[TagMeta]:
 
 def _load_selected_tags_camie_metadata_json(tags_path: Path) -> list[TagMeta]:
     """camie-tagger-v2: camie-tagger-v2-metadata.json -> dataset_info.tag_mapping.{idx_to_tag,tag_to_category}."""
-    with tags_path.open(encoding="utf-8") as fp:
-        raw: dict[str, Any] = json.load(fp)
-    tag_mapping = raw.get("dataset_info", {}).get("tag_mapping", {})
+    raw: dict[str, Any] = _load_index_json(tags_path)
+    tag_mapping = config_mapping(raw, "dataset_info", "tag_mapping")
     idx_to_tag: dict[str, str] = tag_mapping.get("idx_to_tag", {})
     tag_to_category: dict[str, str] = tag_mapping.get("tag_to_category", {})
     labels: list[TagMeta] = []
-    for idx in _numeric_keys_sorted(idx_to_tag):
+    for idx in _validated_numeric_keys(idx_to_tag, context="camie_metadata_json", tags_path=tags_path):
         tag_name = idx_to_tag[idx]
         category = _resolve_category_keep_row(str(tag_to_category.get(tag_name, "")), context="camie_metadata_json")
         labels.append(TagMeta(name=tag_name, category=category, count=None, ips=()))
@@ -388,7 +477,12 @@ def load_selected_tags(tags_csv: str | Path, csv_format: TagsCsvFormat = "pixai6
     if not tags_path.is_file():
         log_dbg(_get_string("TaggerCore", "Tag_CSV_File_Not_Found", tags_csv=str(tags_csv)))
         raise FileNotFoundError(_get_string("TaggerCore", "Tag_CSV_File_Not_Found", tags_csv=str(tags_csv)))
-    loader = _TAGS_CSV_LOADERS.get(csv_format, _load_selected_tags_pixai6col)
+    loader = _TAGS_CSV_LOADERS.get(csv_format)
+    if loader is None:
+        # REQ-A3(a): 未知の csv_format を PixAI 6列として黙って読むと、別形式の
+        # ファイルでタグとスコアの対応がずれる。fallback せず失敗させる。
+        log_dbg(f"load_selected_tags: unknown csv_format {csv_format!r} for {tags_path}")
+        raise ValueError(f"Unsupported tags csv_format: {csv_format!r}")
     return loader(tags_path)
 
 def discover_labels_csv(model_dir: Path, tags_csv: str | Path | None) -> Path | None:
@@ -418,6 +512,42 @@ def _normalize_np_chw(x: NDArray[np.float32], mean: NDArray[np.float_], std: NDA
     for c in range(3):
         x[c] = (x[c] - mean[c]) / std[c]
     return x
+
+
+def resampling_filter(name: str, default: str = "lanczos") -> "Image.Resampling":
+    """設定値のリサンプリング方式名を PIL のフィルタへ変換する。
+
+    未知の名前は `default` に倒す（従来どおり黙って LANCZOS / BILINEAR で動く）。
+    タガーの `inference.resampling` と Florence の preprocessor_config.json の
+    `resample` が同じ表を使うように、変換をここへ一本化する。
+    """
+    filters = {
+        "nearest": Image.Resampling.NEAREST,
+        "bilinear": Image.Resampling.BILINEAR,
+        "bicubic": Image.Resampling.BICUBIC,
+        "lanczos": Image.Resampling.LANCZOS,
+        "box": Image.Resampling.BOX,
+        "hamming": Image.Resampling.HAMMING,
+    }
+    key = str(name).strip().lower()
+    if key in filters:
+        return filters[key]
+    return filters.get(str(default).strip().lower(), Image.Resampling.LANCZOS)
+
+
+def flatten_alpha_to_rgb(image: "Image.Image", background_rgb: tuple[int, int, int]) -> "Image.Image":
+    """透過を指定色で平坦化して RGB 画像を返す（REQ-A9）。
+
+    EXIF Orientation の適用は呼び出し側の責務（読み込み時 or 前処理時）。
+    alpha を持たない画像は従来どおり `convert("RGB")` だけを行う。
+    """
+    has_alpha = "A" in image.getbands() or "transparency" in image.info
+    if not has_alpha:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (*background_rgb, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
 
 def make_cpu_session_options(intra_op_num_threads: int):
     """Return an ort.SessionOptions that caps intra-op parallelism, or None.
@@ -459,7 +589,7 @@ class InferenceConfig:
     output_activation: str = "sigmoid"   # "sigmoid" | "none" (already applied in-graph)
     tags_csv_format: TagsCsvFormat = "pixai6col"
     resampling: str = "lanczos"       # "nearest" | "bilinear" | "bicubic" | "lanczos"
-    alpha_background_rgb: tuple[int, int, int] | None = None
+    alpha_background_rgb: tuple[int, int, int] | None = DEFAULT_ALPHA_BACKGROUND_RGB
 
 class OnnxTagger:
     # Kept as class constants (matching InferenceConfig's own defaults) purely so any
@@ -538,19 +668,16 @@ class OnnxTagger:
         preprocessed_images: list[NDArray[np.float32]] = []
         padding_masks: list[NDArray[np.bool_]] = []
         needs_padding_mask = "padding_mask" in cfg.extra_inputs
-        resampling = {
-            "nearest": Image.Resampling.NEAREST,
-            "bilinear": Image.Resampling.BILINEAR,
-            "bicubic": Image.Resampling.BICUBIC,
-            "lanczos": Image.Resampling.LANCZOS,
-        }.get(cfg.resampling.lower(), Image.Resampling.LANCZOS)
+        resampling = resampling_filter(cfg.resampling)
 
         for img_array in images:
             image_pil = Image.fromarray(img_array)
             w, h = image_pil.size
             ratio = min(target_size / w, target_size / h)
-            new_w = int(w * ratio)
-            new_h = int(h * ratio)
+            # REQ-A6: int() 切り捨てだと極端なアスペクト比（長辺の 1/448 未満）で
+            # 短辺が 0 になり PIL が例外を出す。VLM 側と同じ round()＋最小1で揃える。
+            new_w = max(1, round(w * ratio))
+            new_h = max(1, round(h * ratio))
             resized_image = image_pil.resize((new_w, new_h), resampling)
             canvas = Image.new("RGB", (target_size, target_size), cfg.pad_color_rgb)
             x_offset = (target_size - new_w) // 2
@@ -661,15 +788,14 @@ class OnnxTagger:
 
     def infer_batch(self, images: Sequence[Image.Image], *, thresholds: Mapping[TagCategory, float] | None = None, max_tags: Mapping[TagCategory, int] | None = None) -> list[TagResult]:
         rgb_arrays: list[NDArray[np.uint8]] = []
+        background_rgb = self.inference_config.alpha_background_rgb
         for image in images:
-            background_rgb = self.inference_config.alpha_background_rgb
-            if background_rgb is not None and ("A" in image.getbands() or "transparency" in image.info):
-                rgba = image.convert("RGBA")
-                background = Image.new("RGBA", rgba.size, (*background_rgb, 255))
-                background.alpha_composite(rgba)
-                image = background.convert("RGB")
-            else:
+            # REQ-A9: 既定は白背景。マニフェストが明示的に null を書いた場合だけ
+            # 従来の「alpha を捨てる」変換に倒す。
+            if background_rgb is None:
                 image = image.convert("RGB")
+            else:
+                image = flatten_alpha_to_rgb(image, background_rgb)
             rgb_arrays.append(np.asarray(image, dtype=np.uint8))
         batch, extra_inputs = self.prepare_batch_from_rgb_np(rgb_arrays)
         return self.infer_batch_prepared(batch, extra_inputs, thresholds=thresholds, max_tags=max_tags)
@@ -714,6 +840,41 @@ def format_tags(tag_results: TagResult, convert_underscore: bool) -> str:
     output_tags += _emit(by_category.get(TagCategory.RATING, []))
     return ", ".join(output_tags)
 
+_INFERENCE_ACTIVATIONS = ("sigmoid", "none")
+_INFERENCE_LAYOUTS = ("nchw", "nhwc")
+_INFERENCE_CHANNEL_ORDERS = ("rgb", "bgr")
+_NORMALIZE_VECTOR_LENGTH = 3
+
+
+def _validated_choice(value: Any, allowed: tuple[str, ...], *, key: str) -> str:
+    """model_config.json の列挙値を検証する（REQ-A3(b)）。
+
+    activation のタイプミスで二重 sigmoid、未知 layout が nchw 扱い、未知 channel が
+    rgb 扱いになるのを防ぐ。`build_captioner_config` の検証と同じ方針。
+    """
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"inference.{key} must be one of {list(allowed)}, got {value!r}")
+    return value
+
+
+def _validated_normalize_vector(value: Any, *, key: str) -> tuple[float, float, float] | None:
+    """正規化用の3要素ベクトルであることを検証する（REQ-A3(b)）。
+
+    None は「このモデルは正規化しない」という明示指定として従来どおり許す。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"inference.{key} must be a list of 3 numbers, got {value!r}")
+    if len(value) != _NORMALIZE_VECTOR_LENGTH:
+        raise ValueError(
+            f"inference.{key} must have exactly {_NORMALIZE_VECTOR_LENGTH} elements, got {len(value)}"
+        )
+    if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
+        raise ValueError(f"inference.{key} must contain only numbers, got {value!r}")
+    return tuple(value)  # type: ignore[return-value]
+
+
 def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
     """
     Builds an InferenceConfig from a model_config.json dict's "inference"/"tags_csv"
@@ -724,13 +885,6 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
     tags_csv = config_mapping(model_config, "tags_csv")
     defaults = InferenceConfig()
 
-    def _tuple3(value: Any) -> tuple[float, float, float] | None:
-        # `value` has already had its default applied by inference.get(...); None here
-        # means the model explicitly disables normalization.
-        if value is None:
-            return None
-        return tuple(value)  # type: ignore[return-value]
-
     pad_color = inference.get("pad_color_rgb")
     alpha_background = inference.get("alpha_background_rgb", defaults.alpha_background_rgb)
     normalize_mean = inference.get("normalize_mean", defaults.normalize_mean)
@@ -739,17 +893,25 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
 
     return InferenceConfig(
         input_size=inference.get("input_size", defaults.input_size),
-        layout=inference.get("layout", defaults.layout),
-        channel_order=inference.get("channel_order", defaults.channel_order),
+        layout=_validated_choice(inference.get("layout", defaults.layout), _INFERENCE_LAYOUTS, key="layout"),
+        channel_order=_validated_choice(
+            inference.get("channel_order", defaults.channel_order),
+            _INFERENCE_CHANNEL_ORDERS,
+            key="channel_order",
+        ),
         rescale_to_unit=inference.get("rescale_to_unit", defaults.rescale_to_unit),
         pad_color_rgb=tuple(pad_color) if pad_color is not None else defaults.pad_color_rgb,  # type: ignore[arg-type]
         resampling=inference.get("resampling", defaults.resampling),
         alpha_background_rgb=tuple(alpha_background) if alpha_background is not None else None,  # type: ignore[arg-type]
-        normalize_mean=_tuple3(normalize_mean),
-        normalize_std=_tuple3(normalize_std),
+        normalize_mean=_validated_normalize_vector(normalize_mean, key="normalize_mean"),
+        normalize_std=_validated_normalize_vector(normalize_std, key="normalize_std"),
         extra_inputs=tuple(extra_inputs),
         output_name_hint=inference.get("output_name", defaults.output_name_hint),
-        output_activation=inference.get("output_activation", defaults.output_activation),
+        output_activation=_validated_choice(
+            inference.get("output_activation", defaults.output_activation),
+            _INFERENCE_ACTIVATIONS,
+            key="output_activation",
+        ),
         tags_csv_format=tags_csv.get("format", defaults.tags_csv_format),
     )
 
@@ -777,7 +939,9 @@ def setup_tagger_from_settings(app_settings: AppSettings, get_string: GetString 
             model_path = BASE_DIR / app_settings.paths.model_dir / app_settings.paths.model_filename
             inference_config = InferenceConfig()
         else:
-            model_path = entry.model_dir / "model.onnx"
+            # REQ-A4: ONNX ファイル名の正本はマニフェストの network.files。
+            # ここで "model.onnx" を二重管理しない。
+            model_path = entry.model_dir / model_registry.primary_onnx_file_name(entry)
             inference_config = build_inference_config(entry.config)
             # Models whose tag-metadata file isn't named selected_tags*.csv (camie's
             # own metadata JSON, cl_tagger's tag_mapping.json) must say so explicitly -
@@ -943,8 +1107,10 @@ def process_image_loop(
 
         try:
             with Image.open(image_path) as opened_image:
-                # Preserve alpha so model-specific preprocessing can composite it.
-                image = opened_image.copy()
+                # REQ-A5: VLM 経路と同じく EXIF Orientation を適用してから推論する
+                # （横向きのまま推論して黙って精度が落ちるのを防ぐ）。alpha は
+                # exif_transpose 後も保持されるので、モデル側の合成にそのまま渡せる。
+                image = ImageOps.exif_transpose(opened_image)
         except Exception as e:
             n_errors += 1
             mark_failed(image_path)
@@ -966,14 +1132,25 @@ def process_image_loop(
             continue
 
         if not results or not results[0].tags:
-            n_errors += 1
-            mark_failed(image_path)
-            log_dbg(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed", current_index_str=current_index_str, relative_path=str(relative_path)))
-            core_log_gui(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
-            continue
+            # REQ-A8: 全カテゴリの上限が 0 のときは hard_cap=0 で結果が必ず空になる。
+            # これを推論失敗として数えると「失敗分のみ」モードで同じ画像を無限に
+            # 再試行してしまうため、上限0による空は「成功（タグ無し）」として扱う。
+            # 判別はループ側が保持している設定値だけで行い、推論後処理の外部
+            # シグネチャは変えない。
+            limits = settings.get('MAX_TAGS_PER_CATEGORY') or {}
+            limits_all_zero = bool(limits) and all(int(limit) == 0 for limit in limits.values())
+            if not limits_all_zero:
+                n_errors += 1
+                mark_failed(image_path)
+                log_dbg(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed", current_index_str=current_index_str, relative_path=str(relative_path)))
+                core_log_gui(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
+                continue
+            log_dbg(f"tags: all per-category limits are 0 for {relative_path}; treating the empty "
+                    f"result as success (no tags) rather than a failure.")
+            tag_result = results[0] if results else TagResult()
+        else:
+            tag_result = results[0]
 
-        tag_result = results[0]
-        
         final_tags, all_series_tags = filter_tags_by_solo_rule(
             tag_result, tagger, settings['ENABLE_SOLO_LIMIT']
         )

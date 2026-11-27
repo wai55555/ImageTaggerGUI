@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import traceback
@@ -11,27 +12,29 @@ import constants
 from utils import log_dbg, GetString
 from app_settings import AppSettings
 from tagging_core import (
-    _normalize_np_chw, BASE_DIR, ExistingFileMode, FileChange, OverwriteDecision,
-    make_cpu_session_options, parse_existing_file_mode,
+    _normalize_np_chw, BASE_DIR, DEFAULT_ALPHA_BACKGROUND_RGB, ExistingFileMode,
+    FileChange, OverwriteDecision, flatten_alpha_to_rgb, make_cpu_session_options,
+    parse_existing_file_mode, resampling_filter,
 )
 
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
-    from PIL import Image
+    from PIL import Image, ImageOps
     import onnxruntime as ort  # type: ignore
     from tokenizers import Tokenizer  # type: ignore
 else:
     try:
         import numpy as np
         from numpy.typing import NDArray
-        from PIL import Image
+        from PIL import Image, ImageOps
         import onnxruntime as ort  # type: ignore
         from tokenizers import Tokenizer  # type: ignore
     except ImportError:
         np = None
         NDArray = None
         Image = None
+        ImageOps = None
         ort = None
         Tokenizer = None
 
@@ -56,6 +59,55 @@ class CaptionerConfig:
     decoder_head_dim: int = 64
     tasks: dict[str, str] = field(default_factory=dict)
     default_task: str = "MORE_DETAILED_CAPTION"
+    # DL 済み preprocessor_config.json の `resample` から決める補間方式（REQ-A7）。
+    # ファイルが無い場合の既定は Florence2ImageProcessor と同じ BILINEAR。
+    resampling: str = "bilinear"
+
+
+# torchvision / transformers の PILImageResampling と同じ並び。preprocessor_config.json は
+# この整数で `resample` を書く。
+_PIL_RESAMPLE_NAMES = {
+    0: "nearest",
+    1: "lanczos",
+    2: "bilinear",
+    3: "bicubic",
+    4: "box",
+    5: "hamming",
+}
+
+
+def _read_preprocessor_resampling(model_dir: Path) -> str:
+    """DL 済み preprocessor_config.json の補間方式を返す（REQ-A7(a)）。
+
+    Florence-2 の参照実装（Florence2ImageProcessor）の既定は BILINEAR。ファイルが
+    無い・読めない・値が想定外の場合はこの既定へ倒す。ハードコードの BICUBIC は
+    残さない。generation_config.json は読まない（max_new_tokens は
+    model_config.json の captioner 節が正本。読むと二重管理を作る）。
+    """
+    path = model_dir / "preprocessor_config.json"
+    try:
+        with path.open(encoding="utf-8") as fp:
+            data: Any = json.load(fp)
+    except FileNotFoundError:
+        log_dbg(f"captioner: {path.name} not found; using BILINEAR resampling (Florence-2 default).")
+        return "bilinear"
+    except (OSError, json.JSONDecodeError) as e:
+        log_dbg(f"captioner: could not read {path.name} ({type(e).__name__}: {e}); using BILINEAR resampling.")
+        return "bilinear"
+
+    value = data.get("resample") if isinstance(data, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        name = _PIL_RESAMPLE_NAMES.get(value)
+        if name is not None:
+            return name
+    if isinstance(value, str):
+        name = value.strip().lower()
+        if name.startswith("pilimageresampling."):
+            name = name.split(".", 1)[1]
+        if name in _PIL_RESAMPLE_NAMES.values():
+            return name
+    log_dbg(f"captioner: unexpected resample {value!r} in {path.name}; using BILINEAR resampling.")
+    return "bilinear"
 
 
 def build_captioner_config(model_dir: Path, model_config: dict[str, Any]) -> CaptionerConfig:
@@ -91,6 +143,7 @@ def build_captioner_config(model_dir: Path, model_config: dict[str, Any]) -> Cap
         decoder_head_dim=head_dim,
         tasks=cap.get("tasks", {}) or d.tasks,
         default_task=cap.get("default_task", d.default_task),
+        resampling=_read_preprocessor_resampling(model_dir),
     )
 
 
@@ -142,7 +195,13 @@ class Florence2Captioner:
 
     def _preprocess_image(self, image: "Image.Image") -> "NDArray[np.float32]":
         size = self.config.image_size
-        resized = image.convert("RGB").resize((size, size), Image.Resampling.BICUBIC)
+        # REQ-A5: VLM 経路と同じく EXIF Orientation を適用する。REQ-A9: 透過画像は
+        # タガーと同じ既定背景（白）で合成する。
+        image = ImageOps.exif_transpose(image)
+        image = flatten_alpha_to_rgb(image, DEFAULT_ALPHA_BACKGROUND_RGB)
+        resized = image.resize(
+            (size, size), resampling_filter(self.config.resampling, default="bilinear")
+        )
         arr = np.asarray(resized, dtype=np.float32) / 255.0
         chw = arr.transpose((2, 0, 1))
         mean = np.asarray(self.config.normalize_mean, dtype=np.float32)
@@ -392,7 +451,10 @@ def process_caption_loop(
 
         try:
             with open(image_path, "rb") as f:
-                image = Image.open(f).convert("RGB")
+                with Image.open(f) as opened_image:
+                    # alpha を落とさずに保持し、EXIF 回転と背景合成は _preprocess_image
+                    # へ任せる（REQ-A5 / A9）。
+                    image = opened_image.copy()
         except Exception as e:
             n_errors += 1
             mark_failed(image_path)
