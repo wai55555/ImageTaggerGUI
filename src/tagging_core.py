@@ -212,6 +212,18 @@ def _resolve_category_keep_row(category_str: str, *, context: str) -> int:
         return int(TagCategory.GENERAL)
     return resolved
 
+def _category_slot(category_key: Any) -> int | None:
+    """閾値／上限の Mapping のキーをカテゴリ ID（int）へ落とす。
+
+    `TagCategory` は IntEnum なので int キーでも同じスロットを指す。解釈できない
+    キーは呼び出し側で「使われないキー」として無視する（改修前の辞書引きと同じ挙動）。
+    """
+    try:
+        return int(category_key)
+    except (TypeError, ValueError):
+        return None
+
+
 def _cell(cells: list[str], index: int) -> str:
     """CSV 行から列を取り出す。短い行は空文字で位置を保持する（REQ-A1）。
 
@@ -610,6 +622,11 @@ class OnnxTagger:
     output_name: str
     tags: list[TagMeta]
     tag_meta_lookup: dict[str, TagMeta]
+    # REQ-1.2: 後処理をベクトル化するためのカテゴリ ID 列（TagMeta.category の int 配列）。
+    # self.tags は tag_meta_lookup 等の既存参照のために残す。タグ名の配列は作らない
+    # （並べ替えで同点が出た行だけタグ名を引けば足りるため。NFR-4）。
+    _tag_category_ids: NDArray[np.intp]
+    _category_slots: int
     session: ort.InferenceSession
     get_string: GetString
     inference_config: InferenceConfig
@@ -646,6 +663,8 @@ class OnnxTagger:
             raise FileNotFoundError(self.get_string("TaggerCore", "Tag_CSV_File_Not_Found_Check_Dir", model_dir=str(model_dir)))
         self.tags = load_selected_tags(tags_path, self.inference_config.tags_csv_format)
         self.tag_meta_lookup = {tag.name: tag for tag in self.tags}
+        # REQ-1.2: 後処理のフィルタ・上限判定を NumPy で回すための事前構築。
+        self._build_tag_arrays()
         log_dbg(self.get_string("TaggerCore", "Loaded_Tags_Count", count=len(self.tags), tags_path=tags_path.name))
 
         inputs: list[Any] = list(self.session.get_inputs()) # type: ignore
@@ -752,48 +771,233 @@ class OnnxTagger:
             scores_batch = output_array
         else:
             scores_batch = _sigmoid(output_array)
-        results: list[TagResult] = []
-        
         cat_thresholds: Mapping[TagCategory, float] = thresholds if thresholds is not None else {}
         cat_limits: Mapping[TagCategory, int] = max_tags if max_tags is not None else {}
 
         if not self.tags:
-             return [TagResult() for _ in scores_batch]
+            return [TagResult() for _ in scores_batch]
         hard_cap = (sum(cat_limits.values()) if cat_limits
                     else DEFAULT_TAG_OUTPUT_CAP)
         score_floor = 1e-4
-        for scores in scores_batch:
-            raw_predictions: list[TagPrediction] = []
-            for tag_meta, score in zip(self.tags, scores):
-                if score < score_floor:
-                    continue
-                category = TagCategory(tag_meta.category)
-                threshold = cat_thresholds.get(category, cat_thresholds.get(TagCategory.GENERAL, 0.0))
-                if float(score) < threshold:
-                    continue
-                raw_predictions.append(TagPrediction(
-                    name=tag_meta.name,
-                    score=float(score),
-                    category=category
-                ))
-            ordered = sorted(raw_predictions, key=lambda pred: (-pred.score, pred.name))
-            taken: list[TagPrediction] = []
-            per_category: dict[TagCategory, int] = {}
-            for prediction in ordered:
-                if len(taken) >= hard_cap:
-                    break
-                
-                category = prediction.category
-                limit = cat_limits.get(category)
+        # REQ-1.3: 閾値は呼び出しごとに変わる引数なので、行ループの外で 1 回だけ
+        # カテゴリ ID → 実効閾値のベクトルに落とす。
+        threshold_by_category = self._threshold_vector(cat_thresholds)
+        limit_by_category = self._limit_vector(cat_limits)
+        return [
+            TagResult(tags=self._predictions_for_row(
+                scores,
+                threshold_by_category,
+                limit_by_category,
+                hard_cap,
+                score_floor,
+            ))
+            for scores in scores_batch
+        ]
 
-                current = per_category.get(category, 0)
-                if limit is not None and current >= limit:
-                    continue
-                
-                per_category[category] = current + 1
-                taken.append(prediction)
-            results.append(TagResult(tags=taken))
-        return results
+    def _build_tag_arrays(self) -> None:
+        """タグメタデータから後処理用の NumPy 配列を構築する（REQ-1.2）。
+
+        `self.tags` を読み終えた直後に 1 回だけ呼ぶ。13k〜31k 要素の int 配列 1 本だけで、
+        タグ数に比例する追加コストは最小限に留める（NFR-4。タグ名の配列は作らない）。
+        テストなどで `__init__` を通さずにタグを組み立てる場合も、これを呼べば揃う。
+        """
+        self._tag_category_ids = np.fromiter(
+            (int(tag.category) for tag in self.tags), dtype=np.intp, count=len(self.tags)
+        )
+        # カテゴリ ID → 閾値／上限の配列長。全メンバーぶんを確保し、未知の ID が
+        # 混ざっていても（あり得ないが）インデックスがずれないよう最大値まで広げる。
+        max_category_id = int(self._tag_category_ids.max()) + 1 if self.tags else 0
+        self._category_slots = max(len(TagCategory), max_category_id)
+
+    def _threshold_vector(self, thresholds: Mapping[TagCategory, float]) -> NDArray[np.float64]:
+        """カテゴリ ID → その呼び出しでの実効閾値（float64）を作る。
+
+        フォールバック規則は改修前の `cat_thresholds.get(category,
+        cat_thresholds.get(GENERAL, 0.0))` と同一: 指定の無いカテゴリは GENERAL の
+        閾値、GENERAL も無ければ 0.0。dtype を float64 にするのは比較の等価性のためで、
+        float32 に落とすと Python float の閾値と約 1e-8 ずれ、閾値近傍で採否が反転し得る。
+        """
+        general = float(thresholds.get(TagCategory.GENERAL, 0.0))
+        vector = np.full(self._category_slots, general, dtype=np.float64)
+        for category_key, value in thresholds.items():
+            slot = _category_slot(category_key)
+            if slot is not None and 0 <= slot < vector.size:
+                # 改修前は辞書引きで「使われないキー」を無視していたので、範囲外・
+                # 解釈できないキーも無視して同じ結果にする。
+                vector[slot] = float(value)
+        return vector
+
+    def _limit_vector(self, limits: Mapping[TagCategory, int]) -> NDArray[np.float64]:
+        """カテゴリ ID → カテゴリ別上限を作る（NaN = 上限なし）。
+
+        改修前は `cat_limits.get(category)` が None のカテゴリを無制限として扱っていた。
+        判定を `current >= limit` の 1 比較に統一できるよう、無制限は NaN で表す
+        （NaN との比較は常に False になるので「上限に達していない」＝無制限になる）。
+        """
+        vector = np.full(self._category_slots, np.nan, dtype=np.float64)
+        for category_key, value in limits.items():
+            slot = _category_slot(category_key)
+            if slot is not None and 0 <= slot < vector.size:
+                vector[slot] = float(value)
+        return vector
+
+    def _predictions_for_row(
+        self,
+        scores: NDArray[np.float_],
+        threshold_by_category: NDArray[np.float64],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+        score_floor: float,
+    ) -> list[TagPrediction]:
+        """1 画像ぶんのスコア行から採用タグを選ぶ（REQ-1.3〜1.5, REQ-1.9）。
+
+        改修前（9e21884 の `infer_batch_prepared` 後段）と同一のセマンティクスを保つ:
+
+        - スコア床・カテゴリ別閾値とも「未満が棄却」（ちょうどは残る）。
+        - 並びはスコア降順 → タグ名昇順 → 元のタグ順（安定）。
+        - カテゴリ別上限に達したものは飛ばしつつ全体上限 hard_cap で打ち切る。
+        - zip と同じく min(len(tags), len(scores)) で打ち切る。
+
+        走査と棄却だけを NumPy で行い、TagPrediction の生成は採用された分に限る。
+        """
+        count = min(self._tag_category_ids.size, int(scores.size))
+        if count == 0 or hard_cap <= 0:
+            return []
+        row = scores[:count]
+        category_ids = self._tag_category_ids[:count]
+
+        # NaN は「床未満」「閾値未満」のどちらも False になるため改修前は通過していた。
+        # 通過させる点までは再現できるが、NaN を含むキーの並びは Python の sorted() と
+        # NumPy で一致しない（§6 U-1 / REQ-1.10 の判断対象）。勝手にどちらかへ倒さず、
+        # NaN を含む行だけ改修前の実装そのものへ委譲して挙動を固定する。
+        if np.isnan(row).any():
+            return self._predictions_for_row_reference(
+                row, threshold_by_category, limit_by_category, hard_cap, score_floor
+            )
+
+        keep = ~((row < score_floor) | (row < threshold_by_category[category_ids]))
+        candidate_index = np.flatnonzero(keep)
+        if candidate_index.size == 0:
+            return []
+        candidate_scores = row[candidate_index]
+        full_index, full_scores = candidate_index, candidate_scores
+
+        # 全体上限まで届く見込みがあるときは、先頭部分（真の並びの接頭辞）だけを確定
+        # させる。同点が多いモデルでは候補が数千件になるが、必要なのは先頭 hard_cap 件
+        # だけなので、これで並べ替えの対象を減らせる（§1.3 の計測に基づく）。
+        # 接頭辞が埋め切れなかった場合は全候補でやり直すので、結果は常に同じになる。
+        truncated = candidate_index.size > max(hard_cap * 4, 256)
+        if truncated:
+            top = np.argpartition(-candidate_scores, hard_cap - 1)[:hard_cap]
+            # 境界と同点の候補はどちらが先か決まらないので全部含める。こうすると
+            # 選んだ集合は必ず「真の並びの接頭辞」になる（外側はすべてスコアが低い）。
+            boundary = float(candidate_scores[top].min())
+            prefix_mask = candidate_scores >= boundary
+            candidate_index, candidate_scores = self._sort_candidates(
+                candidate_index[prefix_mask], candidate_scores[prefix_mask]
+            )
+        else:
+            candidate_index, candidate_scores = self._sort_candidates(candidate_index, candidate_scores)
+
+        taken = self._take_within_caps(
+            candidate_index, candidate_scores, category_ids, limit_by_category, hard_cap
+        )
+        if not truncated or len(taken) >= hard_cap:
+            return taken
+
+        # 上限を埋め切れなかった（上限に達していないカテゴリの候補が接頭辞の外にあった）
+        # → 全候補でやり直す。ここに来るのはカテゴリ別上限が厳しく効いている行だけ。
+        full_index, full_scores = self._sort_candidates(full_index, full_scores)
+        return self._take_within_caps(
+            full_index, full_scores, category_ids, limit_by_category, hard_cap
+        )
+
+    def _sort_candidates(
+        self,
+        candidate_index: NDArray[np.intp],
+        candidate_scores: NDArray[np.float_],
+    ) -> tuple[NDArray[np.intp], NDArray[np.float_]]:
+        """候補を「スコア降順 → タグ名昇順 → 元のタグ順」に並べる（REQ-1.4）。"""
+        # スコア降順。同点は kind="stable" で元のタグ順が保たれる。
+        order = np.argsort(-candidate_scores, kind="stable")
+        candidate_index = candidate_index[order]
+        candidate_scores = candidate_scores[order]
+        if candidate_scores.size > 1 and np.any(candidate_scores[1:] == candidate_scores[:-1]):
+            # 同点があるときだけタグ名昇順を足す（同点が無ければ argsort で確定）。
+            # 第 3 キーの candidate_index が一意なので並びは完全に決まる。
+            names = np.array([self.tags[int(tag_index)].name for tag_index in candidate_index])
+            tie_order = np.lexsort((candidate_index, names, -candidate_scores))
+            candidate_index = candidate_index[tie_order]
+            candidate_scores = candidate_scores[tie_order]
+        return candidate_index, candidate_scores
+
+    def _take_within_caps(
+        self,
+        candidate_index: NDArray[np.intp],
+        candidate_scores: NDArray[np.float_],
+        category_ids: NDArray[np.intp],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+    ) -> list[TagPrediction]:
+        """並び順に走査し、カテゴリ別上限を飛ばしつつ全体上限で打ち切る（§1.1-6）。"""
+        taken: list[TagPrediction] = []
+        per_category: dict[int, int] = {}
+        for position in range(candidate_index.size):
+            if len(taken) >= hard_cap:
+                break
+            tag_index = int(candidate_index[position])
+            category_id = int(category_ids[tag_index])
+            used = per_category.get(category_id, 0)
+            # 無制限は NaN なので比較は False になり、上限判定が効かない。
+            if used >= limit_by_category[category_id]:
+                continue
+            per_category[category_id] = used + 1
+            taken.append(TagPrediction(
+                name=self.tags[tag_index].name,
+                score=float(candidate_scores[position]),
+                category=TagCategory(category_id),
+            ))
+        return taken
+
+    def _predictions_for_row_reference(
+        self,
+        scores: NDArray[np.float_],
+        threshold_by_category: NDArray[np.float64],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+        score_floor: float,
+    ) -> list[TagPrediction]:
+        """改修前（9e21884）の後処理そのもの。NaN を含む行のためだけに残す。
+
+        `sorted()` は NaN キーに対して「比較が常に False」という定義外の並びを作る。
+        その並びは NumPy のソートと一致しないため、NaN を含む行ではこの実装へ委譲し、
+        改修前後で観測可能な出力が変わる余地を残さない（REQ-1.10）。
+        """
+        raw_predictions: list[TagPrediction] = []
+        for tag_meta, score in zip(self.tags, scores):
+            if score < score_floor:
+                continue
+            category = TagCategory(tag_meta.category)
+            if float(score) < threshold_by_category[int(category)]:
+                continue
+            raw_predictions.append(TagPrediction(
+                name=tag_meta.name,
+                score=float(score),
+                category=category
+            ))
+        ordered = sorted(raw_predictions, key=lambda pred: (-pred.score, pred.name))
+        taken: list[TagPrediction] = []
+        per_category: dict[TagCategory, int] = {}
+        for prediction in ordered:
+            if len(taken) >= hard_cap:
+                break
+            category = prediction.category
+            current = per_category.get(category, 0)
+            if current >= limit_by_category[int(category)]:
+                continue
+            per_category[category] = current + 1
+            taken.append(prediction)
+        return taken
 
     def infer_batch(self, images: Sequence[Image.Image], *, thresholds: Mapping[TagCategory, float] | None = None, max_tags: Mapping[TagCategory, int] | None = None) -> list[TagResult]:
         rgb_arrays: list[NDArray[np.uint8]] = []
