@@ -11,14 +11,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import vlm_transport as T
 from vlm_transport import RawHttpResponse, VlmExecutor
 from vlm_errors import VlmAttemptError, VlmErrorReason
-from vlm_connections import VlmConnection, ConnectionKind, AuthSpec
+from vlm_connections import VlmConnection, ConnectionKind, AuthSpec, RetryPolicy
 from vlm_image import PreparedImage
 from vlm_profiles import GenerationProfile
 
 
 def _conn(cid, protocol="openai_chat_completions"):
+    # バックオフは REQ-G8 の専用テストで検証する。既存のリトライ系テストは
+    # 実時間を待たないよう 0 を明示する。
     return VlmConnection(cid, cid, ConnectionKind.BUILTIN, protocol,
-                         "https://x/v1", "m", provider_id=cid, auth=AuthSpec(type="none"))
+                         "https://x/v1", "m", provider_id=cid, auth=AuthSpec(type="none"),
+                         retry=RetryPolicy(retry_same_backoff_s=0.0))
 
 
 def _spec():
@@ -40,7 +43,7 @@ class _Responder:
         self.script = script       # {url_substr: [resp, resp, ...]} ; resp は RawHttpResponse | VlmAttemptError
         self.calls = []
 
-    def __call__(self, req, *, connect_timeout, read_timeout, verify_tls=True):
+    def __call__(self, req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         self.calls.append(req.url)
         for key, seq in self.script.items():
             if key in req.url:
@@ -81,7 +84,7 @@ def test_adaptive_read_timeout_scales_with_max_output_tokens():
 def test_executor_passes_adaptive_timeout_to_execute_http():
     seen = {}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         seen["read_timeout"] = read_timeout
         return RawHttpResponse(200, {}, _ok_body(), "")
 
@@ -154,7 +157,7 @@ def test_empty_response_explains_custom_response_path():
 def test_429_failover():
     conns = {"a": _conn("a"), "b": _conn("b")}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         # both connections share a base_url; distinguish by call order.
         responder.n += 1
         if responder.n == 1:
@@ -180,7 +183,7 @@ def test_timeout_retry_then_failover():
     seq = {"a": [VlmAttemptError(VlmErrorReason.TIMEOUT, None, "t1"),
                  VlmAttemptError(VlmErrorReason.TIMEOUT, None, "t2")]}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         # first two calls (connection a) time out, then b succeeds
         if responder.n < 2:
             responder.n += 1
@@ -226,7 +229,7 @@ def test_chronically_timing_out_connection_gets_excluded_after_two_images():
     ]
     calls = {"n": 0}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         result = script[calls["n"]]
         calls["n"] += 1
         return result
@@ -272,7 +275,7 @@ def test_on_attempt_start_fires_before_each_http_call():
     read_timeout_s, default 60s) is still in flight instead of going silent."""
     conns = {"a": _conn("a"), "b": _conn("b")}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         if responder.n < 2:
             responder.n += 1
             return VlmAttemptError(VlmErrorReason.TIMEOUT, None, f"timeout {responder.n}")
@@ -310,7 +313,7 @@ def test_on_attempt_start_exception_does_not_break_the_request():
 def test_auth_error_excludes_connection():
     conns = {"a": _conn("a"), "b": _conn("b")}
 
-    def responder(req, *, connect_timeout, read_timeout, verify_tls=True):
+    def responder(req, *, connect_timeout, read_timeout, verify_tls=True, **_kwargs):
         if responder.first:
             responder.first = False
             return RawHttpResponse(401, {}, {"error": {"message": "bad key"}}, "unauthorized")
@@ -751,7 +754,7 @@ def test_diagnostics_billing_block_is_not_auth_failure():
 
 def test_model_list_fetch():
     import vlm_model_list as ML
-    from vlm_connections import VlmConnection, ConnectionKind, AuthSpec
+    from vlm_connections import VlmConnection, ConnectionKind, AuthSpec, RetryPolicy
     oai = VlmConnection("c", "c", ConnectionKind.BUILTIN, "openai_chat_completions",
                         "https://x/v1", "m", auth=AuthSpec(type="bearer", secret_ref="r"))
     gem = VlmConnection("g", "g", ConnectionKind.BUILTIN, "gemini_generate_content",

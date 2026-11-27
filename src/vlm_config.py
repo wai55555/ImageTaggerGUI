@@ -14,7 +14,7 @@ from pathlib import Path
 
 from constants import BASE_DIR
 from utils import write_debug_log
-from vlm_connections import VlmConnection, default_builtin_connections
+from vlm_connections import VlmConnection, default_builtin_connections, normalize_model_id
 from vlm_models import (
     ModelBinding, ModelIdentityStatus, VlmModelProfile, default_registry,
     is_vlm_model_id, register_discovered_vlm_ids,
@@ -282,12 +282,29 @@ def build_connection_map(vlm_settings, model_profile=None) -> dict[str, VlmConne
         if conn.provider_id == "anthropic" and anthropic_workspace:
             conn.request_headers["anthropic-workspace-id"] = anthropic_workspace
         result[conn.connection_id] = conn
+    # REQ-G9: カスタム接続が内蔵接続の id を上書きすると、細工した
+    # vlm_connections.json が本物の API キーを任意ホストへ送れてしまう。
+    # id 衝突は無効化（内蔵を優先）し、カスタム同士の衝突も後勝ちで黙って
+    # 上書きせず debug log に残す。
+    builtin_ids = {conn.connection_id for conn in default_builtin_connections()}
+    custom_ids: set[str] = set()
     for raw in load_custom_connections():
         try:
             conn = VlmConnection.from_mapping(raw)
         except (KeyError, ValueError) as e:
             write_debug_log(f"vlm_config: skip malformed custom connection: {e}")
             continue
+        if conn.connection_id in builtin_ids:
+            write_debug_log(
+                f"vlm_config: ignore custom connection id {conn.connection_id!r}: "
+                "conflicts with a built-in connection")
+            continue
+        if conn.connection_id in custom_ids:
+            write_debug_log(
+                f"vlm_config: ignore duplicate custom connection id {conn.connection_id!r}: "
+                "the first definition wins")
+            continue
+        custom_ids.add(conn.connection_id)
         result[conn.connection_id] = conn
     return result
 
@@ -371,7 +388,9 @@ def set_model_id_override(vlm_settings, provider_id: str, model_id: str,
     """
     key = f"{profile_id or vlm_settings.model_profile_id}:{provider_id}"
     m = vlm_settings.model_id_override_map()
-    model_id = (model_id or "").strip()
+    # REQ-G3: 手入力の保存経路でも `models/` 接頭辞を落として保存する
+    # （実行経路と同じ共有の正規化）。
+    model_id = normalize_model_id(model_id)
     previous = (m.get(key) or "").strip()
     if model_id:
         m[key] = model_id

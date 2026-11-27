@@ -16,7 +16,10 @@ from PySide6.QtWidgets import (
 )
 
 import vlm_secrets
-from vlm_connections import ConnectionKind, ConnectionLocality, VlmConnection, resolve_custom_kind
+from vlm_connections import (
+    ConnectionKind, ConnectionLocality, VlmConnection, normalize_model_id, resolve_custom_kind,
+)
+from vlm_scrub import strip_url_userinfo
 from vlm_config import new_connection_id
 from vlm_model_list import ModelCatalogEntry, catalog_entry_from_id, filter_vlm_catalog
 from vlm_worker import VlmModelListWorker
@@ -312,8 +315,10 @@ class CustomConnectionDialog(QDialog):
 
     def _on_save(self) -> None:
         name = self.name_edit.text().strip()
-        base_url = self.base_url_edit.text().strip()
-        model_id = self.model_edit.currentText().strip()
+        # REQ-G12: base_url の userinfo は保存しない。
+        # REQ-G3: `models/` 接頭辞は保存前に落とす（実行経路と同じ正規化）。
+        base_url = strip_url_userinfo(self.base_url_edit.text().strip())
+        model_id = normalize_model_id(self.model_edit.currentText())
         if not name or not base_url or not model_id:
             QMessageBox.warning(self, self._t("Vlm", "Custom_Dialog_Title"),
                                 self._t("Vlm", "Custom_Validation_Required"))

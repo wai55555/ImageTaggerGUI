@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
+from urllib.parse import urlparse
+
 import requests
 
 from utils import write_debug_log
@@ -24,6 +26,7 @@ from vlm_protocols import (
     default_auth_key, get_protocol,
 )
 from vlm_ratelimit import RateLimitState, update_from_429
+from vlm_scrub import AUTH_HEADER_NAMES, scrub_exception
 
 StopChecker = Callable[[], bool]
 
@@ -39,6 +42,22 @@ class RawHttpResponse:
 # 推論系VLM向けに助言する max_output_tokens。GenerationProfile の既定値をそのまま
 # 使う（助言だけ古い値を言い続ける、を防ぐ）。
 _SUGGESTED_MAX_OUTPUT_TOKENS = DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def suggested_max_output_tokens(current: int | None) -> int:
+    """OUTPUT_LIMIT で助言する上限値（REQ-G14）。
+
+    既に既定より大きい値を設定している利用者へ「3072 へ増やせ」と言わないよう、
+    現在値より必ず大きい値を返す（既定以下なら従来どおり既定値）。
+    """
+    base = _SUGGESTED_MAX_OUTPUT_TOKENS
+    try:
+        current_value = int(current or 0)
+    except (TypeError, ValueError):
+        return base
+    if current_value > base:
+        return max(current_value * 2, base)
+    return base
 
 
 def _output_limit_reason(protocol_name: str, body: Any) -> str:
@@ -83,16 +102,17 @@ def _enrich_parse_failure(parsed: VlmParseResult, *, protocol, body: Any,
     path = conn.text_path or getattr(protocol, "default_text_path", "") or "(protocol default)"
     limit_reason = _output_limit_reason(protocol.name, body)
     if error.reason is VlmErrorReason.EMPTY_RESPONSE and limit_reason:
+        # REQ-G14: 現在値より大きい値だけを助言する（8192 設定済みに 3072 を勧めない）。
+        suggested = suggested_max_output_tokens(max_output_tokens)
         return replace(parsed, error=VlmAttemptError(
             VlmErrorReason.OUTPUT_LIMIT, error.http_status,
             "output limit reached: max_output_tokens={} finish_reason={}; "
             "the model returned no final text. Increase VLM max tokens to {} or higher "
-            "for reasoning VLMs.".format(max_output_tokens, limit_reason,
-                                         _SUGGESTED_MAX_OUTPUT_TOKENS),
+            "for reasoning VLMs.".format(max_output_tokens, limit_reason, suggested),
             error.provider_code,
             message_key="Advice_Output_Limit",
             message_args={"limit": max_output_tokens, "finish_reason": limit_reason,
-                          "suggested": _SUGGESTED_MAX_OUTPUT_TOKENS}))
+                          "suggested": suggested}))
 
     # 対処案は英語の message へ足したまま（デバッグログ用）にし、表示用には
     # 翻訳キーを別に持たせる。以前は英語の対処案がそのまま翻訳済みメッセージの
@@ -130,36 +150,11 @@ def _enrich_parse_failure(parsed: VlmParseResult, *, protocol, body: Any,
                                          message_key=hint_key, message_args=hint_args))
 
 
-# URL トークン（絶対 URL でも `url: /rel/path?...` の相対形でも）のクエリ文字列を丸ごと伏せる。
-_URL_QUERY_RE = re.compile(r"((?:https?://|/)[^\s'\"]*?)\?[^\s'\"]*")
-# URL の userinfo（http://user:pass@host）も伏せる。
-_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s'\"@]+@")
-# `?foo=VALUE` / `&foo=VALUE` の値部分を伏せる（キー名は問わない。クエリ文脈のみ）。
-_SECRET_PARAM_RE = re.compile(r"([?&][A-Za-z0-9_.\-]{1,40}=)[^\s&'\"]+")
-# `Bearer <token>` のトークン部を伏せる（この接頭辞がある文脈だけ。パスは壊さない）。
-_BEARER_RE = re.compile(r"(bearer\s+)[^\s'\",;)}\]]+", re.IGNORECASE)
-# 認証系ヘッダー名 ": value" / "= value" の値を伏せる（ヘッダー文脈だけ）。
-_AUTH_HEADER_RE = re.compile(
-    r"(?i)\b(authorization|x-api-key|x-goog-api-key|api[-_]?key|api[-_]?token"
-    r"|anthropic-workspace-id)(['\"]?\s*[:=]\s*['\"]?)([^\s'\",;)}\]]+)")
-
-
+# 伏せ字処理は vlm_protocols（エラーボディ）と共有するため vlm_scrub に置いた。
+# 既存の呼び出し・テスト互換のため、この名前は残す。
 def _scrub_exc(exc: Exception) -> str:
-    """requests 例外のテキストから資格情報を落とす。
-
-    query_key 認証では API キーが URL のクエリ文字列に載り、requests の例外文言
-    （"... with url: /v1/chat?key=SECRET ..." など。相対パスのこともある）へそのまま
-    現れる。ホスト名・パスは診断に役立つので残し、クエリ文脈（`?`/`&` 以降）・URL の
-    userinfo・`Bearer <token>`・認証系ヘッダーの値だけを伏せる（いずれも文脈が明確な
-    箇所のみ。任意部分文字列の置換はパス情報まで壊すので行わない）。
-    """
-    text = " ".join(str(exc).split())
-    text = _URL_USERINFO_RE.sub(r"\1<redacted>@", text)
-    text = _URL_QUERY_RE.sub(r"\1?<redacted>", text)
-    text = _SECRET_PARAM_RE.sub(r"\1<redacted>", text)
-    text = _BEARER_RE.sub(r"\1<redacted>", text)
-    text = _AUTH_HEADER_RE.sub(r"\1\2<redacted>", text)
-    return text[:300]
+    """例外のテキストから資格情報を落とす（実装は vlm_scrub.scrub_text）。"""
+    return scrub_exception(exc)
 
 
 def adaptive_read_timeout(base_read_timeout_s: float, max_output_tokens: int) -> float:
@@ -180,18 +175,80 @@ def adaptive_read_timeout(base_read_timeout_s: float, max_output_tokens: int) ->
     return base_read_timeout_s * ratio
 
 
+class GuardedSession(requests.Session):
+    """別ホストへのリダイレクトで認証ヘッダーを落とす Session（REQ-G11）。
+
+    requests が自動で落とすのは Authorization だけなので、header_key 系
+    （x-api-key 等）も同等に扱う。`sensitive_headers` はリクエスト直前に
+    execute_http が設定する（Session は 1 スレッド内での逐次利用を前提とする）。
+    """
+
+    sensitive_headers: frozenset[str] = frozenset()
+
+    def rebuild_auth(self, prepared_request, response) -> None:  # type: ignore[override]
+        super().rebuild_auth(prepared_request, response)
+        previous = response.request
+        if previous is None:
+            return
+        old = urlparse(previous.url)
+        new = urlparse(prepared_request.url)
+        if (old.scheme, old.hostname, old.port) == (new.scheme, new.hostname, new.port):
+            return
+        for name in list(prepared_request.headers):
+            if name.lower() in self.sensitive_headers:
+                prepared_request.headers.pop(name, None)
+
+
 def execute_http(req, *, connect_timeout: float, read_timeout: float,
-                 verify_tls: bool = True) -> RawHttpResponse | VlmAttemptError:
-    """1回の HTTP リクエストを実行する。ネットワーク例外は VlmAttemptError にして返す。"""
+                 verify_tls: bool = True,
+                 session: requests.Session | None = None,
+                 sensitive_headers: tuple[str, ...] = (),
+                 total_timeout_s: float | None = None
+                 ) -> RawHttpResponse | VlmAttemptError:
+    """1回の HTTP リクエストを実行する。ネットワーク例外は VlmAttemptError にして返す。
+
+    - `session` を渡すと接続（TLS/keep-alive）を再利用する（REQ-G7）。
+    - `sensitive_headers` は別ホストへのリダイレクト時に落とす認証ヘッダー名（REQ-G11）。
+    - `total_timeout_s` は受信全体の締切（REQ-G6）。read タイムアウトは recv 単位で
+      総量ではないため、少しずつ送り続ける相手では終わらない。None なら従来どおり
+      単発の read タイムアウトに任せる（生成経路はこちら）。
+    """
+    client = session if session is not None else requests
+    if session is not None:
+        try:
+            session.sensitive_headers = frozenset(  # type: ignore[attr-defined]
+                {name.lower() for name in AUTH_HEADER_NAMES}
+                | {name.lower() for name in sensitive_headers if name})
+        except AttributeError:  # 独自 Session 実装は属性を持てないことがある
+            pass
+
+    started = time.monotonic()
+    timeout: tuple[float, float] | float
+    if total_timeout_s is None:
+        timeout = (connect_timeout, read_timeout)
+    else:
+        # 全体締切を read タイムアウトの上限としても使い、まず単発の受信で切る。
+        timeout = (connect_timeout, max(0.001, min(read_timeout, total_timeout_s)))
     try:
-        resp = requests.request(
-            req.method, req.url,
-            headers=req.headers or None,
-            params=req.params or None,
-            json=req.json_body or None,
-            timeout=(connect_timeout, read_timeout),
-            verify=verify_tls,
-        )
+        if total_timeout_s is None:
+            resp = client.request(
+                req.method, req.url,
+                headers=req.headers or None,
+                params=req.params or None,
+                json=req.json_body or None,
+                timeout=timeout,
+                verify=verify_tls,
+            )
+        else:
+            resp = client.request(
+                req.method, req.url,
+                headers=req.headers or None,
+                params=req.params or None,
+                json=req.json_body or None,
+                timeout=timeout,
+                verify=verify_tls,
+                stream=True,
+            )
     except requests.exceptions.Timeout:
         return VlmAttemptError(VlmErrorReason.TIMEOUT, None, "request timed out")
     except requests.exceptions.SSLError as e:
@@ -201,12 +258,35 @@ def execute_http(req, *, connect_timeout: float, read_timeout: float,
     except requests.exceptions.RequestException as e:
         return VlmAttemptError(VlmErrorReason.UNKNOWN, None, f"request failed: {_scrub_exc(e)}")
 
-    text_body = resp.text or ""
+    if total_timeout_s is not None:
+        chunks: list[bytes] = []
+        try:
+            # チャンクを小さく保つ: chunk_size が大きいと「少しずつ送る相手」では
+            # 次のチャンクが満たされるまで read が返らず、締切の判定が遅れる。
+            for chunk in resp.iter_content(chunk_size=512):
+                if chunk:
+                    chunks.append(chunk)
+                if time.monotonic() - started > total_timeout_s:
+                    resp.close()
+                    return VlmAttemptError(
+                        VlmErrorReason.TIMEOUT, None,
+                        f"total deadline {total_timeout_s:.0f}s exceeded while receiving")
+        except requests.exceptions.Timeout:
+            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, "request timed out")
+        except requests.exceptions.RequestException as e:
+            return VlmAttemptError(VlmErrorReason.NETWORK, None,
+                                   f"receive error: {_scrub_exc(e)}")
+        raw_bytes = b"".join(chunks)
+        encoding = resp.encoding or "utf-8"
+        text_body = raw_bytes.decode(encoding, errors="replace")
+    else:
+        text_body = resp.text or ""
+
     body: Any = None
     ctype = resp.headers.get("Content-Type", "")
     if "json" in ctype.lower() or (text_body[:1] in ("{", "[")):
         try:
-            body = resp.json()
+            body = json.loads(text_body) if total_timeout_s is not None else resp.json()
         except (ValueError, json.JSONDecodeError):
             body = None
     return RawHttpResponse(status=resp.status_code, headers=dict(resp.headers),
@@ -257,6 +337,16 @@ class ImageResult:
         return self.error is None and not self.stopped and bool((self.text or "").strip())
 
 
+def _sensitive_header_names(conn: VlmConnection, default_key: str | None) -> tuple[str, ...]:
+    """リダイレクト時に落とすべき認証ヘッダー名（REQ-G11）。"""
+    names: list[str] = []
+    if default_key:
+        names.append("Authorization")
+    if conn.auth.type in ("header_key", "query_key") and conn.auth.header_name:
+        names.append(conn.auth.header_name)
+    return tuple(names)
+
+
 class VlmExecutor:
     """フォールバック順に接続を試し、最初に成功したキャプションを返す。
 
@@ -267,10 +357,19 @@ class VlmExecutor:
     def __init__(self, connections: dict[str, VlmConnection],
                  secret_resolver: Callable[[str], str | None],
                  *, stop_checker: StopChecker | None = None,
-                 on_attempt_start: Callable[[VlmConnection, int], None] | None = None):
+                 on_attempt_start: Callable[[VlmConnection, int], None] | None = None,
+                 sleep: Callable[[float], None] | None = None,
+                 clock: Callable[[], float] | None = None):
         self._connections = connections
         self._resolve_secret = secret_resolver
         self._stop = stop_checker or (lambda: False)
+        # REQ-G7: 接続（TLS/keep-alive）を試行ごとに張り直さず Session を使い回す。
+        self._session: GuardedSession | None = None
+        # REQ-G7: API キーは試行のまとまり（executor の寿命）ごとに 1 回だけ解決する。
+        self._secret_cache: dict[str, str | None] = {}
+        # REQ-G8: 同一接続リトライの待機。テストでは注入して実時間を待たない。
+        self._sleep = sleep
+        self._clock = clock or time.monotonic
         self._runtime: dict[str, ConnectionRuntime] = {}
         # UI 側で「今どの接続に問い合わせているか」を示すための通知フック。1リクエストが
         # 最大 read_timeout_s（既定60秒）かかりうる上、失敗時は同一接続で再試行もするため、
@@ -279,17 +378,59 @@ class VlmExecutor:
         # try/except で囲んで呼ぶ。
         self._on_attempt_start = on_attempt_start
 
+    def close(self) -> None:
+        """Session を閉じる（接続の解放）。ジョブ終了時に呼ぶ。"""
+        session, self._session = self._session, None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 - 解放失敗でジョブ結果を壊さない
+                pass
+
+    def _session_for_requests(self) -> GuardedSession:
+        if self._session is None:
+            self._session = GuardedSession()
+        return self._session
+
+    def _secret(self, secret_ref: str) -> str | None:
+        """secret_ref ごとに 1 回だけ解決する（REQ-G7）。"""
+        if not secret_ref:
+            return None
+        if secret_ref not in self._secret_cache:
+            self._secret_cache[secret_ref] = self._resolve_secret(secret_ref)
+        return self._secret_cache[secret_ref]
+
+    def _wait_before_retry(self, seconds: float) -> bool:
+        """RETRY_SAME のバックオフ待機（REQ-G8）。停止要求で False を返す。"""
+        if seconds <= 0:
+            return not self._stop()
+        if self._sleep is not None:
+            self._sleep(seconds)
+            return not self._stop()
+        # 実時間待機でも停止ボタンへ即応できるよう細かく分割する。
+        deadline = self._clock() + seconds
+        while True:
+            if self._stop():
+                return False
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return True
+            time.sleep(min(0.1, remaining))
+
     def runtime(self, cid: str) -> ConnectionRuntime:
         return self._runtime.setdefault(cid, ConnectionRuntime())
 
-    def live_candidates(self, ordered_ids: list[str], now: float | None = None) -> list[str]:
-        now = now if now is not None else time.time()
+    def live_candidates(self, ordered_ids: list[str],
+                        now_mono: float | None = None) -> list[str]:
+        # REQ-G5: クールダウン判定は単調時計。壁時計を渡すと期限が常に過去になり
+        # フィルタが効かない（比較側だけ差し替えると壊れる典型）。
+        now_mono = now_mono if now_mono is not None else self._clock()
         out = []
         for cid in ordered_ids:
             rt = self.runtime(cid)
             if rt.is_excluded:
                 continue
-            if rt.rate_limit is not None and rt.rate_limit.in_cooldown(now):
+            if rt.rate_limit is not None and rt.rate_limit.in_cooldown(now_mono):
                 continue
             out.append(cid)
         return out
@@ -342,7 +483,7 @@ class VlmExecutor:
         # カスタム接続のレスポンス抽出パス上書き（fresh なインスタンスなので安全）。
         if conn.text_path:
             protocol.default_text_path = conn.text_path
-        api_key = self._resolve_secret(conn.auth.secret_ref) if conn.auth.type != "none" else None
+        api_key = self._secret(conn.auth.secret_ref) if conn.auth.type != "none" else None
         default_key = default_auth_key(conn.auth.type, api_key)
         call = VlmCallSpec(
             model_id=conn.model_id,
@@ -371,21 +512,29 @@ class VlmExecutor:
                                   conn.auth.header_name, conn.auth.query_param)
             apply_request_headers(req, conn.request_headers)
             apply_request_body(req, conn.request_body)
+            session = self._session_for_requests()
             raw = execute_http(req, connect_timeout=conn.retry.connect_timeout_s,
                                read_timeout=adaptive_read_timeout(
                                    conn.retry.read_timeout_s, profile.max_output_tokens),
-                               verify_tls=conn.verify_tls)
+                               verify_tls=conn.verify_tls,
+                               session=session,
+                               sensitive_headers=_sensitive_header_names(conn, default_key))
             if isinstance(raw, VlmAttemptError):
                 parsed = VlmParseResult(error=raw)
                 response_body = None
             else:
-                if raw.status == 429:
-                    rt.rate_limit = update_from_429(rt.rate_limit or RateLimitState(conn.connection_id), raw.headers)
                 parsed = protocol.parse_response(raw.status, raw.json_body, raw.text_body)
                 response_body = raw.json_body
             parsed = _enrich_parse_failure(
                 parsed, protocol=protocol, body=response_body, conn=conn,
                 max_output_tokens=profile.max_output_tokens)
+            # REQ-G1: 200 の本文が rate limit を示す場合も、非200(429) と同じく
+            # クールダウンへ登録する（ヘッダーは 200 応答にも付く）。
+            if (isinstance(raw, RawHttpResponse)
+                    and parsed.error is not None
+                    and parsed.error.reason is VlmErrorReason.RATE_LIMITED):
+                rt.rate_limit = update_from_429(
+                    rt.rate_limit or RateLimitState(conn.connection_id), raw.headers)
 
             if parsed.ok:
                 rt.consecutive_timeouts = 0
@@ -421,8 +570,14 @@ class VlmExecutor:
                 f"(http={err.http_status}) => {cls.value}")
 
             if cls is VlmErrorClass.RETRY_SAME and same_conn_attempts < max_same_conn_attempts:
+                # REQ-G8: 同一接続リトライは即時再試行ではなく最小のバックオフを挟む。
+                # クールダウン登録（429）とは独立の、同接続リトライ用の待機。
+                base = max(0.0, float(getattr(conn.retry, "retry_same_backoff_s", 0.0) or 0.0))
+                delay = base * (2 ** min(rt.same_retries_this_image, 6))
                 rt.retried_same_this_image = True
                 rt.same_retries_this_image += 1
+                if delay > 0 and not self._wait_before_retry(delay):
+                    return "stopped"
                 continue
             if cls is VlmErrorClass.EXCLUDE:
                 rt.excluded_reason = err.reason.value

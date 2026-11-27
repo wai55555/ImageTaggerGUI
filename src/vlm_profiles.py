@@ -248,10 +248,13 @@ def _language_clause(language: str) -> str:
     raw = str(language or "en").strip()
     labels = {
         "en": "English", "english": "English", "ja": "Japanese", "japanese": "Japanese",
-        "zh": "Chinese", "zh-cn": "Chinese", "zh_tw": "Traditional Chinese",
+        "zh": "Chinese", "zh_cn": "Chinese", "zh_tw": "Traditional Chinese",
         "ko": "Korean", "fr": "French", "de": "German", "es": "Spanish",
     }
-    return f"Write the output in {labels.get(raw.lower(), raw or 'English')}."
+    # REQ-G13: 参照前に区切り（ハイフン／アンダースコア）と大小を正規化する。
+    # "zh-TW" が表から外れて生コードがプロンプトへ入るのを防ぐ。
+    key = raw.lower().replace("-", "_").strip()
+    return f"Write the output in {labels.get(key, raw or 'English')}."
 
 
 def build_user_prompt(profile: GenerationProfile) -> str:

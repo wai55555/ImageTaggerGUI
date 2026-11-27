@@ -7,6 +7,7 @@ API が能力を返さないプロバイダーについては ``vlm_models`` の
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from vlm_connections import VlmConnection
 from vlm_errors import VlmAttemptError, VlmErrorReason
@@ -20,6 +21,40 @@ from vlm_transport import RawHttpResponse, execute_http
 # Mistral/PixtralはVLM対応でもキャプション品質が弱いため、内蔵プロバイダーの
 # 動的モデル一覧からも選択肢に出さない。手入力のカスタム接続までは妨げない。
 _DISABLED_BUILTIN_VLM_MARKERS = ("mistral", "pixtral")
+
+# REQ-G6 / U-G1: モデルカタログ取得の総量締切（秒）。
+# 実測（後述の tests/test_vlm_phase_g.py::test_ug1_*）ではローカル往復のカタログ取得が
+# 0.1 秒未満で完了する。公衆回線・大型カタログ（Cloudflare per_page=100 等）でも
+# 日常の取得を誤って切らないよう、RetryPolicy 既定の read_timeout（60 秒）を下限とした。
+CATALOG_TOTAL_DEADLINE_S = 60.0
+
+
+def is_cloudflare_connection(conn: VlmConnection, base_url: str | None = None) -> bool:
+    """Cloudflare Workers AI の接続か（REQ-G15: 実経路と診断で同じ述語を使う）。"""
+    if str(getattr(conn, "provider_id", "") or "") == "cloudflare":
+        return True
+    base = base_url if base_url is not None else (conn.base_url or "")
+    try:
+        host = urlparse(base).hostname or ""
+    except ValueError:
+        return False
+    return host == "api.cloudflare.com" or host.endswith(".api.cloudflare.com")
+
+
+def model_list_endpoint(conn: VlmConnection) -> tuple[str, dict[str, str]]:
+    """モデル一覧の URL とクエリを返す（REQ-G15: 実経路・診断の共有定義）。
+
+    - Cloudflare Workers AI: `/ai/v1` を `/ai` に落として `/models/search`
+    - xAI: `/language-models`（`/models` は能力メタデータを返さない）
+    - それ以外: `/models`
+    """
+    base = (conn.base_url or "").rstrip("/")
+    params: dict[str, str] = {}
+    if is_cloudflare_connection(conn) and base.endswith("/ai/v1"):
+        return base[: -len("/v1")] + "/models/search", {"per_page": "100"}
+    if str(getattr(conn, "provider_id", "") or "") == "xai":
+        return f"{base}/language-models", params
+    return f"{base}/models", params
 
 
 @dataclass(frozen=True)
@@ -90,21 +125,9 @@ def _fetch_model_body(conn: VlmConnection, api_key: str | None,
         return VlmAttemptError(VlmErrorReason.UNKNOWN, None,
                                "connection base url is not ready (Cloudflare account id?)",
                                message_key="ModelList_Base_Url_Not_Ready")
-    # Cloudflare Workers AI はモデル一覧が別パス（/ai/models/search）。
-    if conn.provider_id == "cloudflare" and base.endswith("/ai/v1"):
-        url = base[: -len("/v1")] + "/models/search"
-    elif conn.provider_id == "xai":
-        # xAI の /v1/models は OpenAI 互換の最小形。/v1/language-models なら
-        # input_modalities / output_modalities を返すので VLM 判定に使える。
-        url = f"{base}/language-models"
-    else:
-        url = f"{base}/models"
-
-    params: dict[str, str] = {}
     # Cloudflare の検索 API はデフォルトページサイズが小さいため、現行カタログを
-    # 1回で取りこぼさない値を指定する。API が上限を下げても安全に処理できる。
-    if conn.provider_id == "cloudflare":
-        params["per_page"] = "100"
+    # 1回で取りこぼさない値を指定する（共有定義側で設定）。API が上限を下げても安全。
+    url, params = model_list_endpoint(conn)
     req = VlmHttpRequest(method="GET", url=url, headers={}, params=params, json_body={})
     if conn.protocol == "anthropic_messages":
         req.headers["anthropic-version"] = "2023-06-01"
@@ -114,8 +137,11 @@ def _fetch_model_body(conn: VlmConnection, api_key: str | None,
     apply_connection_auth(req, conn.auth.type, api_key, conn.auth.header_name, conn.auth.query_param)
     apply_request_headers(req, conn.request_headers)
 
+    # REQ-G6: read タイムアウトは recv 単位で総量ではない。遅滴ピアで終わらないため、
+    # カタログ取得には総量の締切を渡す（生成経路の execute_http は対象外）。
     raw = execute_http(req, connect_timeout=connect_timeout, read_timeout=read_timeout,
-                       verify_tls=conn.verify_tls)
+                       verify_tls=conn.verify_tls,
+                       total_timeout_s=CATALOG_TOTAL_DEADLINE_S)
     if not isinstance(raw, RawHttpResponse):
         return raw
     if raw.status in (401, 403):
