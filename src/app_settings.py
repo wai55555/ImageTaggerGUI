@@ -510,7 +510,11 @@ def _merge_unknown_config_entries(config: configparser.ConfigParser) -> bool:
     """
     if not CONFIG_PATH.is_file():
         return False
-    existing = configparser.ConfigParser()
+    # REQ（PR#38 レビュー）: `items()` は既定で補間するため、値に `%` を含む未知キー
+    # （例: `progress = 100%`）で InterpolationSyntaxError になる。保存に使う parser も
+    # 補間なしで作らないと `set()` が単独の `%` を拒否するので、両方 `interpolation=None`
+    # にして生の表現のまま持ち回る（未知キーはアプリが読まないため補間は不要）。
+    existing = configparser.ConfigParser(interpolation=None)
     try:
         existing.read(CONFIG_PATH, encoding='utf-8')
     except Exception as e:
@@ -537,7 +541,8 @@ def save_config(settings: AppSettings) -> bool:
     configuration file cannot be written.
     """
     write_debug_log(_get_string("ConfigUtils", "Settings_Save_Start"), _get_string)
-    config = configparser.ConfigParser()
+    # 未知キーの値をそのまま書き戻せるよう補間なしで組み立てる（上記と同じ理由）。
+    config = configparser.ConfigParser(interpolation=None)
 
     def _save_dataclass_to_config(config_parser: configparser.ConfigParser, dataclass_instance: Any, section_name: str):
         if not config_parser.has_section(section_name):
@@ -580,10 +585,11 @@ def save_config(settings: AppSettings) -> bool:
                 pass # Or raise an error if unexpected direct fields exist
 
 
-    # REQ-5.2: 未知キー／未知セクションを保持する（壊れた config でも保存は続行）。
-    _merge_unknown_config_entries(config)
-
     try:
+        # REQ-5.2: 未知キー／未知セクションを保持する（壊れた config でも保存は続行）。
+        # 取り込みで予期しない失敗をしても、保存 API の契約どおり False を返して
+        # 例外を漏らさないよう try の内側で行う（PR#38 レビュー指摘）。
+        _merge_unknown_config_entries(config)
         _write_config_atomically(config)
         write_debug_log(_get_string("ConfigUtils", "Config_File_Save_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
         return True

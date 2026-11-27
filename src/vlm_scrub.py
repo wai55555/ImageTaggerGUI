@@ -14,12 +14,16 @@ _URL_QUERY_RE = re.compile(r"((?:https?://|/)[^\s'\"]*?)\?[^\s'\"]*")
 _URL_USERINFO_RE = re.compile(r"(https?://)[^/\s'\"@]+@")
 # `?foo=VALUE` / `&foo=VALUE` の値部分を伏せる（キー名は問わない。クエリ文脈のみ）。
 _SECRET_PARAM_RE = re.compile(r"([?&][A-Za-z0-9_.\-]{1,40}=)[^\s&'\"]+")
-# `Bearer <token>` のトークン部を伏せる（この接頭辞がある文脈だけ。パスは壊さない）。
-_BEARER_RE = re.compile(r"(bearer\s+)[^\s'\",;)}\]]+", re.IGNORECASE)
+# `Bearer <token>` / `Basic <credentials>` / `Token <token>` のトークン部を伏せる
+# （この接頭辞がある文脈だけ。パスは壊さない）。
+_BEARER_RE = re.compile(r"((?:bearer|basic|token)\s+)[^\s'\",;)}\]]+", re.IGNORECASE)
 # 認証系ヘッダー名 ": value" / "= value" の値を伏せる（ヘッダー文脈だけ）。
 _AUTH_HEADER_RE = re.compile(
     r"(?i)\b(authorization|x-api-key|x-goog-api-key|api[-_]?key|api[-_]?token"
-    r"|anthropic-workspace-id)(['\"]?\s*[:=]\s*['\"]?)([^\s'\",;)}\]]+)")
+    r"|anthropic-workspace-id)(['\"]?\s*[:=]\s*['\"]?)"
+    # 値は `Basic dXNlcjpwYXNz` のように「スキーム＋資格情報」の 2 トークンになりうる。
+    # 1 トークンだけ伏せると Base64 部分が残るため、スキームごと伏せる（PR#38 レビュー指摘）。
+    r"((?:(?:bearer|basic|token)\s+)?[^\s'\",;)}\]]+)")
 
 # 別ホストへのリダイレクトで落とす認証ヘッダー名（REQ-G11）。
 AUTH_HEADER_NAMES = (
@@ -42,8 +46,9 @@ def scrub_text(text: str, *, limit: int = 300) -> str:
     text = _URL_USERINFO_RE.sub(r"\1<redacted>@", text)
     text = _URL_QUERY_RE.sub(r"\1?<redacted>", text)
     text = _SECRET_PARAM_RE.sub(r"\1<redacted>", text)
-    text = _BEARER_RE.sub(r"\1<redacted>", text)
+    # ヘッダー文脈を先に処理する（`Authorization: Basic <b64>` を 1 回で伏せるため）。
     text = _AUTH_HEADER_RE.sub(r"\1\2<redacted>", text)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
     return text[:limit]
 
 

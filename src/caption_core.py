@@ -94,7 +94,10 @@ def _read_preprocessor_resampling(model_dir: Path) -> str:
     except FileNotFoundError:
         log_dbg(f"captioner: {path.name} not found; using BILINEAR resampling (Florence-2 default).")
         return "bilinear"
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError は ValueError であって OSError ではない。json.load() は
+        # 解析前にデコードするため、不正な UTF-8 の preprocessor_config.json は
+        # ここで捕まえないと Florence の初期化ごと落ちる（PR#38 レビュー指摘）。
         log_dbg(f"captioner: could not read {path.name} ({type(e).__name__}: {e}); using BILINEAR resampling.")
         return "bilinear"
 

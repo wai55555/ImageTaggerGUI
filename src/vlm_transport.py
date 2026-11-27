@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
@@ -213,14 +214,17 @@ def execute_http(req, *, connect_timeout: float, read_timeout: float,
       総量ではないため、少しずつ送り続ける相手では終わらない。None なら従来どおり
       単発の read タイムアウトに任せる（生成経路はこちら）。
     """
-    client = session if session is not None else requests
-    if session is not None:
-        try:
-            session.sensitive_headers = frozenset(  # type: ignore[attr-defined]
-                {name.lower() for name in AUTH_HEADER_NAMES}
-                | {name.lower() for name in sensitive_headers if name})
-        except AttributeError:  # 独自 Session 実装は属性を持てないことがある
-            pass
+    # PR#38 レビュー: session 未指定だと requests モジュールを直接使い、認証ヘッダーの
+    # リダイレクト保護（GuardedSession.rebuild_auth）が効かなかった。診断の軽量プローブは
+    # ここを通るため、既定でも GuardedSession を使う。1 リクエストごとに作るのは
+    # `requests.request()` が内部で Session を作るのと同じコスト。
+    client = session if session is not None else GuardedSession()
+    try:
+        client.sensitive_headers = frozenset(  # type: ignore[attr-defined]
+            {name.lower() for name in AUTH_HEADER_NAMES}
+            | {name.lower() for name in sensitive_headers if name})
+    except AttributeError:  # 独自 Session 実装は属性を持てないことがある
+        pass
 
     started = time.monotonic()
     timeout: tuple[float, float] | float
@@ -260,22 +264,53 @@ def execute_http(req, *, connect_timeout: float, read_timeout: float,
 
     if total_timeout_s is not None:
         chunks: list[bytes] = []
+        # PR#38 レビュー: `iter_content` は chunk_size が貯まるまで返らないため、
+        # 少しずつ送り続けるサーバーでは「チャンク受信後の判定」まで締切を超えて待つ。
+        # 締切でレスポンスを閉じる watchdog を併用し、read が戻った時点で必ず諦める。
+        deadline_expired = threading.Event()
+
+        def _expire() -> None:
+            deadline_expired.set()
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001 - 締切処理なので握りつぶす
+                pass
+
+        remaining = total_timeout_s - (time.monotonic() - started)
+        if remaining <= 0:
+            resp.close()
+            return VlmAttemptError(
+                VlmErrorReason.TIMEOUT, None,
+                f"total deadline {total_timeout_s:.0f}s exceeded before receiving")
+        watchdog = threading.Timer(remaining, _expire)
+        watchdog.daemon = True
+        watchdog.start()
         try:
-            # チャンクを小さく保つ: chunk_size が大きいと「少しずつ送る相手」では
-            # 次のチャンクが満たされるまで read が返らず、締切の判定が遅れる。
+            # チャンクは小さく保つ（1 チャンクあたりの待ち時間の上限を下げる）。
             for chunk in resp.iter_content(chunk_size=512):
+                if deadline_expired.is_set():
+                    break
                 if chunk:
                     chunks.append(chunk)
                 if time.monotonic() - started > total_timeout_s:
-                    resp.close()
-                    return VlmAttemptError(
-                        VlmErrorReason.TIMEOUT, None,
-                        f"total deadline {total_timeout_s:.0f}s exceeded while receiving")
+                    break
         except requests.exceptions.Timeout:
-            return VlmAttemptError(VlmErrorReason.TIMEOUT, None, "request timed out")
+            if not deadline_expired.is_set():
+                return VlmAttemptError(VlmErrorReason.TIMEOUT, None, "request timed out")
         except requests.exceptions.RequestException as e:
-            return VlmAttemptError(VlmErrorReason.NETWORK, None,
-                                   f"receive error: {_scrub_exc(e)}")
+            if not deadline_expired.is_set():
+                return VlmAttemptError(VlmErrorReason.NETWORK, None,
+                                       f"receive error: {_scrub_exc(e)}")
+        except Exception as e:  # noqa: BLE001 - close() による中断も含む
+            if not deadline_expired.is_set():
+                return VlmAttemptError(VlmErrorReason.UNKNOWN, None,
+                                       f"receive error: {_scrub_exc(e)}")
+        finally:
+            watchdog.cancel()
+        if deadline_expired.is_set():
+            return VlmAttemptError(
+                VlmErrorReason.TIMEOUT, None,
+                f"total deadline {total_timeout_s:.0f}s exceeded while receiving")
         raw_bytes = b"".join(chunks)
         encoding = resp.encoding or "utf-8"
         text_body = raw_bytes.decode(encoding, errors="replace")
