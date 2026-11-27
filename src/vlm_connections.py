@@ -13,6 +13,8 @@ import ipaddress
 import math
 from dataclasses import dataclass, field
 from enum import Enum
+
+from vlm_scrub import strip_url_userinfo
 from typing import Any
 from urllib.parse import urlparse
 
@@ -83,6 +85,9 @@ class RetryPolicy:
     retry_same_max: int = 1
     retry_5xx: bool = True
     use_retry_after_on_429: bool = False   # spec: 429 は待たず failover
+    # REQ-G8: 同一接続リトライ（RETRY_SAME）の最小バックオフ秒。試行回数に応じて倍にする。
+    # クールダウン（429）とは独立で、同接続の再試行間隔としてのみ使う。
+    retry_same_backoff_s: float = 0.5
 
     @classmethod
     def from_mapping(cls, data: dict | None) -> "RetryPolicy":
@@ -94,6 +99,8 @@ class RetryPolicy:
             retry_same_max=_i(d.get("retry_same_max"), base.retry_same_max),
             retry_5xx=_b(d.get("retry_5xx"), base.retry_5xx),
             use_retry_after_on_429=_b(d.get("use_retry_after_on_429"), base.use_retry_after_on_429),
+            retry_same_backoff_s=_timeout(d.get("retry_same_backoff_s"),
+                                          base.retry_same_backoff_s),
         )
 
 
@@ -115,6 +122,19 @@ class AuthSpec:
             header_name=str(d.get("header_name", base.header_name) or base.header_name),
             query_param=str(d.get("query_param", base.query_param) or base.query_param),
         )
+
+
+def normalize_model_id(model_id: str) -> str:
+    """model_id の正規化（REQ-G3）。
+
+    公式ドキュメント表記（Gemini の `models/gemini-2.0-flash`）を貼られても
+    二重接頭辞にならないよう、先頭の `models/` を落とす。保存経路（from_mapping）と
+    実行経路（build_request）の両方がこの関数を通る。
+    """
+    value = str(model_id or "").strip()
+    while value.startswith("models/"):
+        value = value[len("models/"):].lstrip("/")
+    return value
 
 
 @dataclass
@@ -170,8 +190,10 @@ class VlmConnection:
             display_name=str(data.get("display_name", data["connection_id"])),
             kind=kind,
             protocol=str(data.get("protocol", "openai_chat_completions")),
-            base_url=str(data.get("base_url", "")),
-            model_id=str(data.get("model_id", "")),
+            # REQ-G12: base_url の userinfo は保存／読込の時点で除去する
+            # （診断画面にも生で出さない）。
+            base_url=strip_url_userinfo(str(data.get("base_url", ""))),
+            model_id=normalize_model_id(str(data.get("model_id", ""))),
             provider_id=str(data.get("provider_id", "")),
             enabled=_b(data.get("enabled"), True),
             auth=AuthSpec.from_mapping(raw_auth if isinstance(raw_auth, dict) else None),

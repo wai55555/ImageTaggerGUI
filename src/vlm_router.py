@@ -137,8 +137,13 @@ def select_candidates(
     supports_image: dict[str, bool] | None = None,
     now: float | None = None,
 ) -> CandidateSet:
-    """処理開始時に一度だけ呼ぶ。結果はジョブスナップショットへ固定する。"""
-    now = now if now is not None else time.time()
+    """処理開始時に一度だけ呼ぶ。結果はジョブスナップショットへ固定する。
+
+    `cooldown_until` は **単調時計の deadline**（`RateLimitState.cooldown_deadline_mono`）
+    として比較する（REQ-G5）。壁時計の絶対時刻を渡すと、期限が常に過去になり
+    クールダウンが無視される。
+    """
+    now = now if now is not None else time.monotonic()
     cooldown_until = cooldown_until or {}
     has_auth = has_auth or {}
     supports_image = supports_image or {}

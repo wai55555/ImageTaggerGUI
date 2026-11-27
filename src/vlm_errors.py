@@ -162,6 +162,50 @@ def _looks_like_prompt_format(message: str, provider_code: str = "") -> bool:
     ))
 
 
+# REQ-G1: HTTP 200 の本文が返すエラーコードの分類。非200 の分類へ合流させる。
+_RATE_LIMIT_CODES = {
+    "rate_limit_exceeded", "rate_limit", "ratelimitexceeded", "insufficient_quota",
+    "quota_exceeded", "resource_exhausted", "too_many_requests",
+}
+_MODEL_CODES = {
+    "model_not_found", "model_not_supported", "modelnotfound", "invalid_model",
+    "unknown_model", "model_unavailable",
+}
+_AUTH_CODES = {
+    "invalid_api_key", "authentication_error", "permission_denied", "unauthorized",
+    "forbidden", "insufficient_permissions",
+}
+_SERVER_CODES = {"server_error", "internal_error", "overloaded_error", "api_error", "unavailable"}
+_POLICY_CODES = {"content_filter", "content_policy", "safety", "refusal", "blocked"}
+
+
+def reason_from_provider_code(code: str, message: str = "") -> VlmErrorReason | None:
+    """本文のエラーコード（および明確な文言）から理由を決める。該当なしは None。
+
+    200 応答の本文にしかエラーが無い経路（Responses API の status="failed" 等）で、
+    実エラーコードを捨てて EMPTY_RESPONSE に潰さないために使う（REQ-G1）。
+    コードが主、文言は明確な句だけを補助に使う（誤分類を避ける）。
+    """
+    low_code = str(code or "").strip().lower()
+    if low_code in _RATE_LIMIT_CODES:
+        return VlmErrorReason.RATE_LIMITED
+    if low_code in _MODEL_CODES:
+        return VlmErrorReason.MODEL_UNSUPPORTED
+    if low_code in _AUTH_CODES:
+        return VlmErrorReason.AUTH_ERROR
+    if low_code in _SERVER_CODES:
+        return VlmErrorReason.SERVER_ERROR
+    if low_code in _POLICY_CODES:
+        return VlmErrorReason.CONTENT_POLICY
+    low = str(message or "").lower()
+    if "rate limit" in low or "quota" in low and "exceed" in low:
+        return VlmErrorReason.RATE_LIMITED
+    if "model not found" in low or "model_not_found" in low or (
+            "model" in low and "does not exist" in low):
+        return VlmErrorReason.MODEL_UNSUPPORTED
+    return None
+
+
 def reason_from_http_status(status: int, message: str = "",
                             provider_code: str = "") -> VlmErrorReason:
     if status == 408:
