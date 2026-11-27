@@ -472,6 +472,15 @@ _TAGS_CSV_LOADERS: dict[str, Callable[[Path], list[TagMeta]]] = {
     "camie_metadata_json": _load_selected_tags_camie_metadata_json,
 }
 
+# CSV 形式のタグファイルが持つ列数。DL 側（workers）の「取得済みファイルが完全か」の
+# 判定に使う（REQ-E3）。ローダーと同じ表をここに置き、列数を二重管理しない。
+# 列数が変わるとタグとスコアの対応も変わるので、形式を足すときは両方を確認すること。
+TAGS_CSV_COLUMN_COUNTS: dict[str, int] = {
+    "pixai6col": 6,
+    "simple3col": 3,
+    "wd4col": 4,
+}
+
 def load_selected_tags(tags_csv: str | Path, csv_format: TagsCsvFormat = "pixai6col") -> list[TagMeta]:
     tags_path = Path(tags_csv)
     if not tags_path.is_file():
