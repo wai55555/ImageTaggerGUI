@@ -30,6 +30,7 @@ import app_settings # Added import
 from app_settings import load_config, load_settings, save_config # Updated import
 from custom_widgets import PathLineEdit, TagListWidget
 import tag_utils
+from text_io import atomic_write_text
 from tag_utils import load_tag_translation_map
 from tagging_core import ExistingFileMode, OverwriteDecision
 from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSettingsDialog
@@ -915,7 +916,8 @@ class MainWindow(QMainWindow):
         if new_text == old_text:
             return
         try:
-            txt_path.write_text(new_text, encoding='utf-8')
+            # REQ-2.3: 一時ファイル + os.replace で原子的に（REQ-2.7 の (iii) 段）。
+            atomic_write_text(txt_path, new_text, fsync=False, verify=False)
             write_debug_log(self.locale_manager.get_string("MainWindow", "Caption_Saved", txt_path_name=txt_path.name))
         except Exception as e:
             self.update_log(self.locale_manager.get_string("MainWindow", "Error_Caption_Save_Failed", txt_path_name=txt_path.name, e=e), "red")
@@ -1615,7 +1617,7 @@ class MainWindow(QMainWindow):
             for tag in tags_to_add:
                 existing_tags.append(tag)
             
-            txt_path.write_text(', '.join(existing_tags), 'utf-8')
+            atomic_write_text(txt_path, ', '.join(existing_tags), fsync=False, verify=False)
             
             # Record action for undo
             action = AddTagsAction(file_path=txt_path, added_tags=tags_to_add)
@@ -1658,7 +1660,7 @@ class MainWindow(QMainWindow):
                 
                 tags.remove(tag_to_delete)
                 write_debug_log(f"[_delete_image_tag] Tags after removal: {tags}")
-                txt_path.write_text(', '.join(tags), 'utf-8')
+                atomic_write_text(txt_path, ', '.join(tags), fsync=False, verify=False)
                 write_debug_log(f"[_delete_image_tag] Successfully wrote tags to file: {txt_path.name}")
                 
                 # Record action for undo

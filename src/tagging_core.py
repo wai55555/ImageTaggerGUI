@@ -39,6 +39,7 @@ CONFIG_PATH = BASE_DIR / "config.ini"
 from utils import config_mapping, log_dbg, GetString
 from app_settings import AppSettings, load_settings
 from onnx_providers import make_session
+from text_io import atomic_write_text
 
 
 # カテゴリ別の最大タグ数が1つも指定されていない場合に適用する出力上限。
@@ -1413,14 +1414,10 @@ def process_image_loop(
             new_content = formatted_tags
 
         try:
-            resolved_path = output_path.resolve()
-            if sys.platform == "win32":
-                long_path_str = f"\\\\?\\{resolved_path}"
-            else:
-                long_path_str = str(resolved_path)
-
-            with open(long_path_str, 'w', encoding='utf-8') as f:
-                f.write(new_content)
+            # REQ-2.3: 一時ファイル + os.replace で原子的に書く（REQ-2.7 の (iii) 段）。
+            # 現行の直接書きも fsync していないため耐久性は据え置き、原子性だけを得る
+            # （計測: 0.10 → 0.33 ms/ファイル、fsync を足すと +7 ms/ファイル）。
+            atomic_write_text(output_path, new_content, fsync=False, verify=False)
 
             changed_files.append(FileChange(
                 path=output_path, previous_content=previous_content,

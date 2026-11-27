@@ -1,6 +1,9 @@
 from pathlib import Path
 import csv
 
+from text_io import atomic_write_text
+from utils import write_debug_log
+
 def get_txt_path(image_path: Path) -> Path:
     """Return the path to the txt file corresponding to the image path."""
     return image_path.with_suffix('.txt')
@@ -16,39 +19,53 @@ def read_tags(txt_path: Path) -> list[str]:
         # Remove leading/trailing whitespace from tags and exclude empty tags
         return [tag.strip() for tag in content.split(',') if tag.strip()]
     except Exception as e:
-        print(f"Error reading tag file {txt_path}: {e}")
+        # REQ-2.10: print は windowed ビルドで sys.stdout が無いとそれ自体が例外になり、
+        # フォールバックの return [] まで到達しない。本体側と同じ debug log へ残す
+        # （write_debug_log は [Debug] debug_log 有効時のみ記録する既存方針のまま）。
+        write_debug_log(f"tag_utils.read_tags failed for {txt_path}: {type(e).__name__}: {e}")
         return []
 
-def write_tags(txt_path: Path, tags: list[str]):
-    """Write a list of tags to a txt file (overwriting existing content)."""
+def write_tags(txt_path: Path, tags: list[str]) -> bool:
+    """Write a list of tags to a txt file (overwriting existing content).
+
+    REQ-2.10: 書き込みは一時ファイル + os.replace で原子的に行い、成否を戻り値で返す。
+    失敗しても例外は上げない（呼び出し側の現行契約を維持しつつ、成功扱いだけを防ぐ）。
+    """
     # Join tags with ", " as separator
     content = ', '.join(tags)
     try:
-        txt_path.write_text(content, encoding='utf-8')
+        atomic_write_text(txt_path, content, fsync=False, verify=False)
+        return True
     except Exception as e:
-        print(f"Error writing tag file {txt_path}: {e}")
+        write_debug_log(f"tag_utils.write_tags failed for {txt_path}: {type(e).__name__}: {e}")
+        return False
 
 def add_tags_to_file(txt_path: Path, tags_to_add: list[str]) -> bool:
-    """Add new tags to an existing tag file (avoiding duplicates)."""
+    """Add new tags to an existing tag file (avoiding duplicates).
+
+    戻り値は「新規タグがあって、かつ書き込みに成功した」ときだけ True（REQ-2.10）。
+    """
     existing_tags = read_tags(txt_path)
     added = False
     for tag in tags_to_add:
         if tag not in existing_tags:
             existing_tags.append(tag)
             added = True
-    
-    if added:
-        write_tags(txt_path, existing_tags)
-    return added
+
+    if not added:
+        return False
+    return write_tags(txt_path, existing_tags)
 
 def remove_tag_from_file(txt_path: Path, tag_to_remove: str) -> bool:
-    """Remove the specified tag from the tag file."""
+    """Remove the specified tag from the tag file。
+
+    戻り値は「削除対象が存在し、かつ書き込みに成功した」ときだけ True（REQ-2.10）。
+    """
     existing_tags = read_tags(txt_path)
-    if tag_to_remove in existing_tags:
-        existing_tags.remove(tag_to_remove)
-        write_tags(txt_path, existing_tags)
-        return True
-    return False
+    if tag_to_remove not in existing_tags:
+        return False
+    existing_tags.remove(tag_to_remove)
+    return write_tags(txt_path, existing_tags)
 
 # Must match the shipped filenames exactly (selected_tags_zh_CN.csv / _zh_TW.csv) -
 # on a case-sensitive filesystem the lowercase forms silently fail to load.
