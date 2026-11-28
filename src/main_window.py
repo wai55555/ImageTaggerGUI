@@ -1171,11 +1171,13 @@ class MainWindow(QMainWindow):
                 display_text = tag_name
                 
                 # 英語以外かつ、辞書にタグが存在する場合
-                if lang_index != -1 and tag_name in self.tag_translation_map:
+                if lang_index != -1:
                     try:
-                        # 指定した言語の翻訳を取得
-                        translations = self.tag_translation_map[tag_name]
-                        if len(translations) > lang_index:
+                        # 指定した言語の翻訳を取得（REQ-H5: `_`->' ' 正規化キーへ
+                        # フォールバックし、アンダースコア変換オフでも引けるようにする）
+                        translations = tag_utils.get_tag_translations(
+                            self.tag_translation_map, tag_name)
+                        if translations is not None and len(translations) > lang_index:
                             display_text = translations[lang_index]
                     except IndexError:
                         pass # エラー時は英語のまま
@@ -1215,10 +1217,12 @@ class MainWindow(QMainWindow):
             display_text = tag_name
             
             # 翻訳処理
-            if lang_index != -1 and tag_name in self.tag_translation_map:
+            if lang_index != -1:
                 try:
-                    translations = self.tag_translation_map[tag_name]
-                    if len(translations) > lang_index:
+                    # REQ-H5: 生タグで外れたら正規化キーでも引く
+                    translations = tag_utils.get_tag_translations(
+                        self.tag_translation_map, tag_name)
+                    if translations is not None and len(translations) > lang_index:
                         display_text = translations[lang_index]
                 except IndexError:
                     pass
@@ -1591,11 +1595,9 @@ class MainWindow(QMainWindow):
         if not tags_raw:
             return
 
-        # (Normalization logic for full-width chars, spaces, commas...)
-        tags_processed = ' '.join(tags_raw.replace('ã€€', ' ').split())
-        while ',,' in tags_processed:
-            tags_processed = tags_processed.replace(',,', ',')
-        new_tags = [t.strip() for t in tags_processed.split(',') if t.strip()]
+        # REQ-H2: whitespace normalization is shared with the grid and bulk add so
+        # "long  hair" cannot become a different tag depending on the entry point.
+        new_tags = tag_utils.parse_tag_input(tags_raw)
         if not new_tags:
             return
 
@@ -1607,8 +1609,9 @@ class MainWindow(QMainWindow):
             if txt_path.is_file():
                 existing_tags = [t.strip() for t in txt_path.read_text('utf-8').split(',') if t.strip()]
             
-            # Filter out tags that already exist
-            tags_to_add = [tag for tag in new_tags if tag not in existing_tags]
+            # Filter out tags that already exist (REQ-H1: case-insensitive, like
+            # tagging_core.merge_tags, so `Solo` is not added next to `solo`).
+            tags_to_add = tag_utils.filter_new_tags(existing_tags, new_tags)
             
             if not tags_to_add:
                 self.update_log(self.locale_manager.get_string("MainWindow", "Tag_Already_Exists"), "orange")
