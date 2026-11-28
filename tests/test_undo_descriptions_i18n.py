@@ -44,10 +44,10 @@ def _actions():
             Path("dir/a.txt"), "p", "n", ["cat", "dog"])),
         ("CompositeUndoAction", U.CompositeUndoAction([])),
         ("BulkAddTagsAction/1", U.BulkAddTagsAction(
-            [Path("a.txt")] * 3, ["cat"], "append")),
+            [(Path("a.txt"), ["cat"])] * 3, "append")),
         ("BulkAddTagsAction/2", U.BulkAddTagsAction(
-            [Path("a.txt")] * 3, ["cat", "dog"], "append")),
-        ("BulkRemoveTagsAction", U.BulkRemoveTagsAction("cat", [(Path("a.txt"), 0)] * 3)),
+            [(Path("a.txt"), ["cat", "dog"])] * 3, "append")),
+        ("BulkRemoveTagsAction", U.BulkRemoveTagsAction("cat", [(Path("a.txt"), [0])] * 3)),
     ]
 
 

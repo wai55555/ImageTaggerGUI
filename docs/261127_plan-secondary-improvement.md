@@ -504,11 +504,46 @@ Phase 5 のうちダイアログ側のもの。
 - フォルダ切替後の Undo が前フォルダを触らないことのテスト
 
 **完了判定**
-- [ ] REQ-3.1 の意味論文書が PR に含まれ、全アクションがそれに従う
-- [ ] 対称性テストと部分失敗テストが入り、§9.1 が通過する
-- [ ] REQ-3.5 の検証（フォルダ切替後の Undo が前フォルダを触らないこと）のテストが入り、通過している
-- [ ] REQ-3.8 の保持量上限が実装され、上限超過時に文書化された扱いどおりに振る舞うことのテストがある
-- [ ] REQ-3.6（CWD を変更しても Undo が正しいファイルを指すこと）と REQ-3.7（Undo で空ファイルが残らないこと、Undo／Redo 後にグリッド側キャッシュへ反映されること）のテストが入り、通過している
+- [x] REQ-3.1 の意味論文書が PR に含まれ、全アクションがそれに従う
+- [x] 対称性テストと部分失敗テストが入り、§9.1 が通過する
+- [x] REQ-3.5 の検証（フォルダ切替後の Undo が前フォルダを触らないこと）のテストが入り、通過している
+- [x] REQ-3.8 の保持量上限が実装され、上限超過時に文書化された扱いどおりに振る舞うことのテストがある
+- [x] REQ-3.6（CWD を変更しても Undo が正しいファイルを指すこと）と REQ-3.7（Undo で空ファイルが残らないこと、Undo／Redo 後にグリッド側キャッシュへ反映されること）のテストが入り、通過している
+
+**実装記録（2026-11-29）**
+
+- 意味論: `docs/261129_phase3_undo_semantics.md` を新設（REQ-3.1 の文書化）。
+  `UndoResult`（FULL／PARTIAL／FAILED）と `UndoManager` のスタック遷移、
+  恒久失敗の履歴外し、アクション別の記録内容、パス解決、保持量上限を確定した。
+- REQ-3.1／3.2: `CompositeUndoAction` と一括 2 アクションの undo/redo が `UndoResult` を返す。
+  `any(...)`／`success_count > 0` は src から消えた（grep 0 件）。単一アクションは
+  `bool` のまま `as_undo_result()` で正規化する。部分成功は反対スタックへ進め、
+  失敗パスを `UndoManager.last_failed_paths` に残し、GUI は
+  `MainWindow.Undo_Partial_Failure`（9 言語追加）で件数を出す。恒久失敗
+  （対象と親フォルダの消失・権限拒否）だけ履歴から外す（R11-11 の解消）。
+- REQ-3.3: `BulkAddTagsAction` はファイルごとの実際の追加タグ、`BulkRemoveTagsAction` は
+  ファイルごとの全出現位置を持つ（R22-4／R5-5）。並び順のソートを外し、利用者の
+  指定順を保つ（R1-4）。どちらも冪等（既にその状態なら書かない）。
+- REQ-3.4: `EditCaptionAction` と `_FileSnapshotAction` の unlink は、現在の内容が
+  自分の書いた内容と一致するときだけ行う（R13-6）。
+- REQ-3.5: `_handle_folder_drop()` で `undo_manager.clear()` を呼ぶ（R20-2）。
+- REQ-3.6: `AddTagsAction`／`RemoveTagAction`／一括 2 アクションに生成時 abspath 固定を
+  追加し、読み書きを `text_io.read_text` 経由にした（R9-8）。`EditCaptionAction` は
+  従来どおり abspath のみ（意図された例外）。
+- REQ-3.7: `AddTagsAction`／`BulkAddTagsAction` の undo は、中身が自分の追加分だけなら
+  ファイルごと消す（R2-9）。`_build_tag_cache()` が新しい dict をグリッドへ渡し直す
+  ようにし、Undo/Redo 後の検索キャッシュを同期する（R2-10）。
+- REQ-3.8: 一括アクションのエントリ数が `UNDO_BATCH_SNAPSHOT_LIMIT`（500）を超えたら
+  その操作の Undo を作らない（既存履歴は保持。R20-4）。バッチ側と同じ扱い。
+- テスト: `tests/test_phase3_undo_integrity.py`（15 件）。対称性（重複タグ・既存タグ・
+  prepend/append）、部分失敗の 3 値とスタック遷移、恒久失敗の履歴外し、複合の 3 値、
+  R13-6 の unlink 条件、R2-9、R9-8（CWD 変更）、R20-2、R2-10、R20-4 を固定した。
+- §9.1: `pytest` **1040 passed / 2 skipped**、`ruff` 421（増加なし）、`pyright` 83。
+  実 config・VLM JSON の SHA-256 は不変。
+- 付随修正（Phase 外・別コミット `a6d8803`）: `vlm_transport.execute_http` が総量締切で
+  打ち切った読み取りを TIMEOUT ではなく部分 200 として返すことがあり、
+  `test_g6_catalog_fetch_has_a_total_deadline` が高負荷時に不安定だった。締切超過で
+  抜けたことを記録し、常に TIMEOUT を返すようにした（REQ-G6 の意図に合わせる）。
 
 ---
 

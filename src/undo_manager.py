@@ -8,11 +8,12 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 
 from utils import write_debug_log
-from text_io import atomic_write_text, long_path_str
+from text_io import atomic_write_text, long_path_str, read_text
 
 
 def _desc(key: str, **kwargs: object) -> str:
@@ -65,9 +66,96 @@ class GetString(Protocol):
         ...
 
 
+class UndoResult(Enum):
+    """複合・一括アクションの undo/redo の結果（REQ-3.1 / NFR-10）。
+
+    FULL:    対象全てに成功した。
+    PARTIAL: 一部だけ成功した（失敗対象は `failed_paths`、件数は呼び出し側が明示する）。
+    FAILED:  1 つも成功しなかった。
+    """
+
+    FULL = "full"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+def as_undo_result(value: bool | UndoResult) -> UndoResult:
+    """単一アクションの bool 戻り値を 3 値へ正規化する（既存 API を壊さない）。"""
+    if isinstance(value, UndoResult):
+        return value
+    return UndoResult.FULL if value else UndoResult.FAILED
+
+
+def _permanently_missing(path: Path) -> bool:
+    """対象 .txt も親フォルダも無い = 再試行しても変わらない失敗か（U-2）。"""
+    try:
+        return not path.exists() and not path.parent.is_dir()
+    except OSError:
+        return False
+
+
+@dataclass
+class _Outcome:
+    """一括・複合アクションの成否集計（3 値 + 失敗対象。REQ-3.1）。"""
+
+    failures: list[Path] = field(default_factory=list)
+    transient: bool = False
+    succeeded: int = 0
+
+    def ok(self) -> None:
+        self.succeeded += 1
+
+    def fail(self, path: Path | None, exc: BaseException | None = None) -> None:
+        if path is not None:
+            self.failures.append(path)
+        permanent = isinstance(exc, PermissionError) or (
+            path is not None and _permanently_missing(path))
+        if not permanent:
+            # 一時的な失敗が 1 つでもあれば、履歴からは外さない（再試行の余地を残す）。
+            self.transient = True
+
+    def result(self) -> UndoResult:
+        if not self.failures:
+            return UndoResult.FULL
+        return UndoResult.PARTIAL if self.succeeded else UndoResult.FAILED
+
+    @property
+    def permanent(self) -> bool:
+        return bool(self.failures) and not self.transient
+
+
 class UndoAction(ABC):
     """Abstract base class for all undoable actions."""
-    
+
+    # REQ-3.1: 直近の undo/redo で失敗した対象（複合・一括アクションが埋める）。
+    failed_paths: list[Path]
+    # 再試行しても変わらない失敗だけだったか（U-2: 履歴から外す判断に使う）。
+    permanent_failure: bool
+
+    def _succeed(self) -> bool:
+        self.failed_paths = []
+        self.permanent_failure = False
+        return True
+
+    def _fail(self, path: Path | None, exc: BaseException | None = None) -> bool:
+        self.failed_paths = [path] if path is not None else []
+        self.permanent_failure = (
+            isinstance(exc, PermissionError)
+            or (path is not None and _permanently_missing(path))
+        )
+        return False
+
+    def _apply(self, outcome: _Outcome) -> UndoResult:
+        self.failed_paths = list(outcome.failures)
+        self.permanent_failure = outcome.permanent
+        result = outcome.result()
+        if outcome.failures:
+            write_debug_log(
+                f"{type(self).__name__}: {result.value} "
+                f"({len(outcome.failures)} failed: "
+                f"{', '.join(p.name for p in outcome.failures[:5])})")
+        return result
+
     @abstractmethod
     def undo(self) -> bool:
         """
@@ -97,66 +185,74 @@ class AddTagsAction(UndoAction):
     """Action for adding tags to a single image."""
     file_path: Path
     added_tags: list[str]
-    
+
+    def __post_init__(self) -> None:
+        # REQ-3.6: 登録時点の絶対パスへ固定する（CWD 変更や相対入力フォルダで undo が
+        # 別ファイルを叩かないように）。正本は _FileSnapshotAction と同じ。
+        self.file_path = Path(os.path.abspath(self.file_path))
+
     def undo(self) -> bool:
         """Remove the added tags from the file."""
+        path = self.file_path
         try:
-            if not self.file_path.exists():
-                write_debug_log(f"Undo failed: File not found: {self.file_path}")
-                return False
-            
-            # Read current tags
-            with open(self.file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            
+            if not path.exists():
+                write_debug_log(f"Undo failed: File not found: {path}")
+                return self._fail(path)
+
+            # Read current tags（REQ-B2: 長パス変換を通す）
+            content = read_text(path, encoding='utf-8').strip()
             if not content:
-                return True
-            
+                return self._succeed()
+
             tags = [tag.strip() for tag in content.split(',')]
-            
+
             # Remove added tags
+            remaining = list(tags)
             for tag in self.added_tags:
-                if tag in tags:
-                    tags.remove(tag)
-            
+                if tag in remaining:
+                    remaining.remove(tag)
+
+            if not remaining and all(tag in self.added_tags for tag in tags):
+                # REQ-3.7 / R2-9: この操作が作り出した（= 中身が追加タグだけの）ファイルは、
+                # 空ファイルを残さず「無かった状態」へ戻す。
+                os.unlink(_long_path_str(path))
+                write_debug_log(f"Undo AddTags: removed the file the action created: {path.name}")
+                return self._succeed()
+
             # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
-            
-            write_debug_log(f"Undo AddTags: Removed {len(self.added_tags)} tags from {self.file_path.name}")
-            return True
-            
+            atomic_write_text(path, ', '.join(remaining), fsync=False, verify=False)
+
+            write_debug_log(f"Undo AddTags: Removed {len(self.added_tags)} tags from {path.name}")
+            return self._succeed()
+
         except Exception as e:
             write_debug_log(f"Undo AddTags failed: {e}")
-            return False
-    
+            return self._fail(path, e)
+
     def redo(self) -> bool:
-        """Re-add the tags to the file."""
+        """Re-add the tags to the file (recreates it when undo removed it)."""
+        path = self.file_path
         try:
-            if not self.file_path.exists():
-                write_debug_log(f"Redo failed: File not found: {self.file_path}")
-                return False
-            
-            # Read current tags
-            with open(self.file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            
-            tags = [tag.strip() for tag in content.split(',')] if content else []
-            
+            tags: list[str] = []
+            if path.exists():
+                content = read_text(path, encoding='utf-8').strip()
+                tags = [tag.strip() for tag in content.split(',')] if content else []
+
             # Add tags (avoid duplicates)
             for tag in self.added_tags:
                 if tag not in tags:
                     tags.append(tag)
-            
+
             # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
-            
-            write_debug_log(f"Redo AddTags: Added {len(self.added_tags)} tags to {self.file_path.name}")
-            return True
-            
+            atomic_write_text(path, ', '.join(tags), fsync=False, verify=False)
+
+            write_debug_log(f"Redo AddTags: Added {len(self.added_tags)} tags to {path.name}")
+            return self._succeed()
+
         except Exception as e:
             write_debug_log(f"Redo AddTags failed: {e}")
-            return False
-    
+            return self._fail(path, e)
+
     def description(self) -> str:
         """Return a localized description of this action."""
         if len(self.added_tags) == 1:
@@ -173,64 +269,63 @@ class RemoveTagAction(UndoAction):
     file_path: Path
     removed_tag: str
     original_index: int
-    
+
+    def __post_init__(self) -> None:
+        # REQ-3.6: 登録時点の絶対パスへ固定する（CWD 変更に影響されない）。
+        self.file_path = Path(os.path.abspath(self.file_path))
+
     def undo(self) -> bool:
         """Re-insert the removed tag at its original position."""
+        path = self.file_path
         try:
-            if not self.file_path.exists():
-                write_debug_log(f"Undo failed: File not found: {self.file_path}")
-                return False
-            
-            # Read current tags
-            with open(self.file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            
+            if not path.exists():
+                write_debug_log(f"Undo failed: File not found: {path}")
+                return self._fail(path)
+
+            content = read_text(path, encoding='utf-8').strip()
             tags = [tag.strip() for tag in content.split(',')] if content else []
-            
+
             # Insert tag at original position
             insert_pos = min(self.original_index, len(tags))
             tags.insert(insert_pos, self.removed_tag)
-            
+
             # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
-            
-            write_debug_log(f"Undo RemoveTag: Re-inserted '{self.removed_tag}' at position {insert_pos} in {self.file_path.name}")
-            return True
-            
+            atomic_write_text(path, ', '.join(tags), fsync=False, verify=False)
+
+            write_debug_log(f"Undo RemoveTag: Re-inserted '{self.removed_tag}' at position {insert_pos} in {path.name}")
+            return self._succeed()
+
         except Exception as e:
             write_debug_log(f"Undo RemoveTag failed: {e}")
-            return False
-    
+            return self._fail(path, e)
+
     def redo(self) -> bool:
         """Remove the tag again."""
+        path = self.file_path
         try:
-            if not self.file_path.exists():
-                write_debug_log(f"Redo failed: File not found: {self.file_path}")
-                return False
-            
-            # Read current tags
-            with open(self.file_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            
+            if not path.exists():
+                write_debug_log(f"Redo failed: File not found: {path}")
+                return self._fail(path)
+
+            content = read_text(path, encoding='utf-8').strip()
             if not content:
-                return True
-            
+                return self._succeed()
+
             tags = [tag.strip() for tag in content.split(',')]
-            
-            # Remove tag
+
             if self.removed_tag in tags:
                 tags.remove(self.removed_tag)
-            
+
             # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
-            
-            write_debug_log(f"Redo RemoveTag: Removed '{self.removed_tag}' from {self.file_path.name}")
-            return True
-            
+            atomic_write_text(path, ', '.join(tags), fsync=False, verify=False)
+
+            write_debug_log(f"Redo RemoveTag: Removed '{self.removed_tag}' from {path.name}")
+            return self._succeed()
+
         except Exception as e:
             write_debug_log(f"Redo RemoveTag failed: {e}")
-            return False
-    
+            return self._fail(path, e)
+
     def description(self) -> str:
         """Return a localized description of this action."""
         return _desc("Undo_Desc_Remove_Tag", tag=self.removed_tag)
@@ -260,21 +355,36 @@ class EditCaptionAction(UndoAction):
             # REQ-2.9 / U-3: このクラスだけは従来どおり拡張長パス変換を通さない
             # （経路のパス解決セマンティクスを変えないため use_long_path=False）。
             atomic_write_text(self.file_path, text, fsync=False, verify=False, use_long_path=False)
-            return True
+            return self._succeed()
         except Exception as e:
             write_debug_log(f"EditCaption write failed for {self.file_path}: {e}")
-            return False
+            return self._fail(self.file_path, e)
 
     def undo(self) -> bool:
         if not self.file_existed_before:
             # The edit created the file; undo must restore its absence, otherwise
             # caption generation treats the leftover .txt as done and skips the image.
+            # REQ-3.4 / R13-6: ただし現在の内容が自分の書いた new_text と一致するときだけ
+            # 消す。他経路が書き換えていたら消さず、部分失敗として扱う。
+            try:
+                current = (read_text(self.file_path, encoding='utf-8')
+                           if self.file_path.exists() else None)
+            except (OSError, UnicodeError) as e:
+                write_debug_log(f"EditCaption undo read failed for {self.file_path}: {e}")
+                return self._fail(self.file_path, e)
+            if current is None:
+                return self._succeed()
+            if current != self.new_text:
+                write_debug_log(
+                    "EditCaption undo skipped unlink: the file was changed after the "
+                    f"action ({self.file_path.name})")
+                return self._fail(self.file_path)
             try:
                 self.file_path.unlink(missing_ok=True)
-                return True
+                return self._succeed()
             except Exception as e:
                 write_debug_log(f"EditCaption undo unlink failed for {self.file_path}: {e}")
-                return False
+                return self._fail(self.file_path, e)
         return self._write(self.old_text)
 
     def redo(self) -> bool:
@@ -336,21 +446,36 @@ class _FileSnapshotAction(UndoAction):
             # CRLF へ化けるのを防ぐ）。検出できなければ現行どおり None。
             atomic_write_text(self.file_path, text, fsync=False, verify=False,
                               newline=self.newline)
-            return True
+            return self._succeed()
         except Exception as e:
             write_debug_log(f"{type(self).__name__} write failed for {self.file_path}: {e}")
-            return False
+            return self._fail(self.file_path, e)
 
     def undo(self) -> bool:
         if self.previous_content is None:
+            # REQ-3.4 / R13-6: 現在の内容が自分の書いた new_content と一致するときだけ
+            # 消す。他経路が書き換えていたら消さず、部分失敗として扱う。
+            try:
+                current = (read_text(self.file_path, encoding='utf-8')
+                           if self.file_path.exists() else None)
+            except (OSError, UnicodeError) as e:
+                write_debug_log(f"{type(self).__name__} undo read failed for {self.file_path}: {e}")
+                return self._fail(self.file_path, e)
+            if current is None:
+                return self._succeed()
+            if current != self.new_content:
+                write_debug_log(
+                    f"{type(self).__name__} undo skipped unlink: the file was changed "
+                    f"after the action ({self.file_path.name})")
+                return self._fail(self.file_path)
             try:
                 os.unlink(_long_path_str(self.file_path))
             except FileNotFoundError:
                 pass
             except Exception as e:
                 write_debug_log(f"{type(self).__name__} undo unlink failed for {self.file_path}: {e}")
-                return False
-            return True
+                return self._fail(self.file_path, e)
+            return self._succeed()
         return self._write(self.previous_content)
 
     def redo(self) -> bool:
@@ -389,14 +514,37 @@ class CompositeUndoAction(UndoAction):
     actions: list[UndoAction]
     label: str = ""
 
-    def undo(self) -> bool:
-        # 逆順に戻す。1つでも成功していれば「元に戻した」とみなす（部分成功を許容）
-        results = [action.undo() for action in reversed(self.actions)]
-        return any(results)
+    def undo(self) -> UndoResult:
+        # 逆順に戻す。1 つでも成功していれば「部分成功」として履歴を進める（REQ-3.1）。
+        # any(...) を全成功の根拠にしない（NFR-10）。
+        outcome = _Outcome()
+        for action in reversed(self.actions):
+            result = as_undo_result(action.undo())
+            if result is UndoResult.FAILED:
+                paths = getattr(action, "failed_paths", None) or []
+                if paths:
+                    for path in paths:
+                        outcome.fail(path)
+                else:
+                    outcome.fail(None)
+            else:
+                outcome.ok()
+        return self._apply(outcome)
 
-    def redo(self) -> bool:
-        results = [action.redo() for action in self.actions]
-        return any(results)
+    def redo(self) -> UndoResult:
+        outcome = _Outcome()
+        for action in self.actions:
+            result = as_undo_result(action.redo())
+            if result is UndoResult.FAILED:
+                paths = getattr(action, "failed_paths", None) or []
+                if paths:
+                    for path in paths:
+                        outcome.fail(path)
+                else:
+                    outcome.fail(None)
+            else:
+                outcome.ok()
+        return self._apply(outcome)
 
     def description(self) -> str:
         # label は生成側（main_window）が [MainWindow] Undo_Batch_Tagging から
@@ -408,167 +556,180 @@ class CompositeUndoAction(UndoAction):
 
 @dataclass
 class BulkAddTagsAction(UndoAction):
-    """Action for adding tags to multiple images."""
-    file_paths: list[Path]
-    added_tags: list[str]
+    """Action for adding tags to multiple images.
+
+    REQ-3.3（R22-4 / R1-4）: ファイルごとに「実際に追加されたタグ」を持ち、
+    元からあったタグは undo で消さない。並び順は利用者の指定順を保つ（ソートしない）。
+    """
+    file_tags: list[tuple[Path, list[str]]]
     position: str  # "prepend" or "append"
-    
-    def undo(self) -> bool:
-        """Remove the added tags from all files."""
-        success_count = 0
-        for file_path in self.file_paths:
+
+    def __post_init__(self) -> None:
+        # REQ-3.6: 登録時点の絶対パスへ固定する（CWD 変更に影響されない）。
+        self.file_tags = [(Path(os.path.abspath(p)), list(t)) for p, t in self.file_tags]
+
+    def undo(self) -> UndoResult:
+        """Remove the tags this action actually added from every file."""
+        outcome = _Outcome()
+        for path, tags in self.file_tags:
             try:
-                if not file_path.exists():
-                    write_debug_log(f"Undo: File not found: {file_path}")
+                if not path.exists():
+                    write_debug_log(f"Undo: File not found: {path}")
+                    outcome.fail(path)
                     continue
-                
-                # Read current tags
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                
-                if not content:
-                    success_count += 1
+
+                content = read_text(path, encoding='utf-8').strip()
+                current = [t.strip() for t in content.split(',') if t.strip()] if content else []
+
+                remaining = list(current)
+                for tag in tags:
+                    if tag in remaining:
+                        remaining.remove(tag)
+
+                # REQ-3.7: 中身がこのアクションの追加分だけなら、空ファイルを残さず
+                # ファイルごと無かった状態へ戻す（冪等判定より先に評価する）。
+                if not remaining and all(tag in tags for tag in current):
+                    os.unlink(_long_path_str(path))
+                    outcome.ok()
                     continue
-                
-                tags = [tag.strip() for tag in content.split(',')]
-                
-                # Remove added tags
-                for tag in self.added_tags:
-                    if tag in tags:
-                        tags.remove(tag)
-                
+
+                if remaining == current:
+                    outcome.ok()  # 既に戻っている（冪等）
+                    continue
+
                 # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
-                
-                success_count += 1
-                
+                atomic_write_text(path, ', '.join(remaining), fsync=False, verify=False)
+                outcome.ok()
+
             except Exception as e:
-                write_debug_log(f"Undo BulkAddTags failed for {file_path}: {e}")
-        
-        write_debug_log(f"Undo BulkAddTags: Processed {success_count}/{len(self.file_paths)} files")
-        return success_count > 0
-    
-    def redo(self) -> bool:
-        """Re-add the tags to all files."""
-        success_count = 0
-        for file_path in self.file_paths:
+                write_debug_log(f"Undo BulkAddTags failed for {path}: {e}")
+                outcome.fail(path, e)
+
+        return self._apply(outcome)
+
+    def redo(self) -> UndoResult:
+        """Re-add the recorded tags to every file (recreates missing ones)."""
+        outcome = _Outcome()
+        for path, tags in self.file_tags:
             try:
-                if not file_path.exists():
-                    write_debug_log(f"Redo: File not found: {file_path}")
+                current: list[str] = []
+                if path.exists():
+                    content = read_text(path, encoding='utf-8').strip()
+                    current = [t.strip() for t in content.split(',') if t.strip()] if content else []
+
+                to_add = [tag for tag in tags if tag not in current]
+                if not to_add:
+                    outcome.ok()  # 既に追加済み（冪等）
                     continue
-                
-                # Read current tags
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                
-                tags = [tag.strip() for tag in content.split(',')] if content else []
-                
-                # Add tags based on position
+
                 if self.position == "prepend":
-                    # Add to beginning (avoid duplicates)
-                    for tag in reversed(self.added_tags):
-                        if tag not in tags:
-                            tags.insert(0, tag)
-                else:  # append
-                    # Add to end (avoid duplicates)
-                    for tag in self.added_tags:
-                        if tag not in tags:
-                            tags.append(tag)
-                
+                    new_tags = to_add + current
+                else:
+                    new_tags = current + to_add
+
                 # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
-                
-                success_count += 1
-                
+                atomic_write_text(path, ', '.join(new_tags), fsync=False, verify=False)
+                outcome.ok()
+
             except Exception as e:
-                write_debug_log(f"Redo BulkAddTags failed for {file_path}: {e}")
-        
-        write_debug_log(f"Redo BulkAddTags: Processed {success_count}/{len(self.file_paths)} files")
-        return success_count > 0
-    
+                write_debug_log(f"Redo BulkAddTags failed for {path}: {e}")
+                outcome.fail(path, e)
+
+        return self._apply(outcome)
+
     def description(self) -> str:
         """Return a localized description of this action."""
-        if len(self.added_tags) == 1:
-            return _desc("Undo_Desc_Bulk_Add_Tag", tag=self.added_tags[0],
-                         count=len(self.file_paths))
-        return _desc("Undo_Desc_Bulk_Add_Tags", tag_count=len(self.added_tags),
-                     count=len(self.file_paths))
+        tag_count = max((len(tags) for _, tags in self.file_tags), default=0)
+        if tag_count == 1:
+            first = next((tags[0] for _, tags in self.file_tags if tags), "")
+            return _desc("Undo_Desc_Bulk_Add_Tag", tag=first,
+                         count=len(self.file_tags))
+        return _desc("Undo_Desc_Bulk_Add_Tags", tag_count=tag_count,
+                     count=len(self.file_tags))
 
 
 @dataclass
 class BulkRemoveTagsAction(UndoAction):
-    """Action for removing a tag from multiple images."""
+    """Action for removing a tag from multiple images.
+
+    REQ-3.3（R5-5）: ファイルごとに「全出現位置」を持つ。undo は全ての位置へ戻し、
+    redo は全ての出現を消す。どちらも冪等（既にその状態なら書かない）。
+    """
     removed_tag: str
-    file_tag_positions: list[tuple[Path, int]]  # (file_path, original_index)
-    
-    def undo(self) -> bool:
-        """Re-insert the removed tag at its original position in each file."""
-        success_count = 0
-        for file_path, original_index in self.file_tag_positions:
+    file_positions: list[tuple[Path, list[int]]]  # (file_path, original_indexes)
+
+    def __post_init__(self) -> None:
+        # REQ-3.6: 登録時点の絶対パスへ固定する。
+        self.file_positions = [(Path(os.path.abspath(p)), list(i))
+                               for p, i in self.file_positions]
+
+    def undo(self) -> UndoResult:
+        """Re-insert the removed tag at every original position."""
+        outcome = _Outcome()
+        for path, positions in self.file_positions:
             try:
-                if not file_path.exists():
-                    write_debug_log(f"Undo: File not found: {file_path}")
+                if not path.exists():
+                    write_debug_log(f"Undo: File not found: {path}")
+                    outcome.fail(path)
                     continue
-                
-                # Read current tags
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                
-                tags = [tag.strip() for tag in content.split(',')] if content else []
-                
-                # Insert tag at original position
-                insert_pos = min(original_index, len(tags))
-                tags.insert(insert_pos, self.removed_tag)
-                
+
+                content = read_text(path, encoding='utf-8').strip()
+                tags = [t.strip() for t in content.split(',')] if content else []
+
+                if tags.count(self.removed_tag) >= len(positions):
+                    outcome.ok()  # 既に戻っている（冪等）
+                    continue
+
+                for index in sorted(positions):
+                    insert_pos = min(index, len(tags))
+                    tags.insert(insert_pos, self.removed_tag)
+
                 # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
-                
-                success_count += 1
-                
+                atomic_write_text(path, ', '.join(tags), fsync=False, verify=False)
+                outcome.ok()
+
             except Exception as e:
-                write_debug_log(f"Undo BulkRemoveTags failed for {file_path}: {e}")
-        
-        write_debug_log(f"Undo BulkRemoveTags: Processed {success_count}/{len(self.file_tag_positions)} files")
-        return success_count > 0
-    
-    def redo(self) -> bool:
-        """Remove the tag again from all files."""
-        success_count = 0
-        for file_path, _ in self.file_tag_positions:
+                write_debug_log(f"Undo BulkRemoveTags failed for {path}: {e}")
+                outcome.fail(path, e)
+
+        return self._apply(outcome)
+
+    def redo(self) -> UndoResult:
+        """Remove every occurrence of the tag again."""
+        outcome = _Outcome()
+        for path, positions in self.file_positions:
             try:
-                if not file_path.exists():
-                    write_debug_log(f"Redo: File not found: {file_path}")
+                if not path.exists():
+                    write_debug_log(f"Redo: File not found: {path}")
+                    outcome.fail(path)
                     continue
-                
-                # Read current tags
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                
+
+                content = read_text(path, encoding='utf-8').strip()
                 if not content:
-                    success_count += 1
+                    outcome.ok()
                     continue
-                
-                tags = [tag.strip() for tag in content.split(',')]
-                
-                # Remove tag
-                if self.removed_tag in tags:
-                    tags.remove(self.removed_tag)
-                
-                # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
-                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
-                
-                success_count += 1
-                
+
+                tags = [t.strip() for t in content.split(',')]
+                before = len(tags)
+                for _ in positions:
+                    if self.removed_tag in tags:
+                        tags.remove(self.removed_tag)
+
+                if len(tags) != before:
+                    # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+                    atomic_write_text(path, ', '.join(tags), fsync=False, verify=False)
+                outcome.ok()
+
             except Exception as e:
-                write_debug_log(f"Redo BulkRemoveTags failed for {file_path}: {e}")
-        
-        write_debug_log(f"Redo BulkRemoveTags: Processed {success_count}/{len(self.file_tag_positions)} files")
-        return success_count > 0
-    
+                write_debug_log(f"Redo BulkRemoveTags failed for {path}: {e}")
+                outcome.fail(path, e)
+
+        return self._apply(outcome)
+
     def description(self) -> str:
         """Return a localized description of this action."""
         return _desc("Undo_Desc_Bulk_Remove_Tag", tag=self.removed_tag,
-                     count=len(self.file_tag_positions))
+                     count=len(self.file_positions))
 
 
 class UndoManager:
@@ -584,6 +745,9 @@ class UndoManager:
         self.undo_stack: list[UndoAction] = []
         self.redo_stack: list[UndoAction] = []
         self.max_history = max_history
+        # REQ-3.1: 直近の undo/redo の結果と失敗対象（GUI が件数を出し、ログが対象を残す）。
+        self.last_result: UndoResult = UndoResult.FULL
+        self.last_failed_paths: list[Path] = []
         write_debug_log(f"UndoManager initialized with max_history={max_history}")
     
     def push(self, action: UndoAction) -> None:
@@ -612,53 +776,80 @@ class UndoManager:
         """Check if there are actions that can be redone."""
         return len(self.redo_stack) > 0
     
+    def _record(self, action: UndoAction, result: UndoResult) -> None:
+        """実行結果を記録する（部分成功を全成功と偽らない。NFR-10）。"""
+        self.last_result = result
+        self.last_failed_paths = list(getattr(action, "failed_paths", None) or [])
+        write_debug_log(
+            f"{type(action).__name__} -> {result.value} "
+            f"(failed: {len(self.last_failed_paths)})")
+
     def undo(self) -> bool:
         """
         Undo the most recent action.
-        
+
         Returns:
             True if successful, False otherwise.
         """
         if not self.can_undo():
             write_debug_log("Undo failed: No actions to undo")
             return False
-        
+
         action = self.undo_stack.pop()
         write_debug_log(f"Undoing: {action.description()}")
-        
-        if action.undo():
-            self.redo_stack.append(action)
-            write_debug_log(f"Undo successful (redo_stack size: {len(self.redo_stack)})")
-            return True
-        else:
+
+        result = as_undo_result(action.undo())
+        self._record(action, result)
+
+        if result is UndoResult.FAILED:
+            if getattr(action, "permanent_failure", False):
+                # U-2: 恒久失敗（対象と親フォルダの消失、権限拒否）だけなら履歴から外す。
+                # 先頭に戻し続けると以降の Undo が全て同じアクションで止まる（R11-11）。
+                write_debug_log(
+                    "Undo failed permanently; dropping the action from history: "
+                    f"{action.description()}")
+                return False
             # A transient file-system failure must not consume the only record of the
             # action.  Keep it at the top so the user can fix the cause and retry.
             self.undo_stack.append(action)
             write_debug_log("Undo failed, action restored to undo stack")
             return False
-    
+
+        # FULL / PARTIAL とも履歴は進める（部分成功は「戻せた分」を活かす）。
+        self.redo_stack.append(action)
+        write_debug_log(f"Undo successful ({result.value}; redo_stack size: {len(self.redo_stack)})")
+        return True
+
     def redo(self) -> bool:
         """
         Redo the most recently undone action.
-        
+
         Returns:
             True if successful, False otherwise.
         """
         if not self.can_redo():
             write_debug_log("Redo failed: No actions to redo")
             return False
-        
+
         action = self.redo_stack.pop()
         write_debug_log(f"Redoing: {action.description()}")
-        
-        if action.redo():
-            self.undo_stack.append(action)
-            write_debug_log(f"Redo successful (undo_stack size: {len(self.undo_stack)})")
-            return True
-        else:
+
+        result = as_undo_result(action.redo())
+        self._record(action, result)
+
+        if result is UndoResult.FAILED:
+            if getattr(action, "permanent_failure", False):
+                write_debug_log(
+                    "Redo failed permanently; dropping the action from history: "
+                    f"{action.description()}")
+                return False
             self.redo_stack.append(action)
             write_debug_log("Redo failed, action restored to redo stack")
             return False
+
+        self.undo_stack.append(action)
+        write_debug_log(f"Redo successful ({result.value}; undo_stack size: {len(self.undo_stack)})")
+        return True
     
     def get_undo_description(self) -> str:
         """

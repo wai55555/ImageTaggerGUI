@@ -1022,7 +1022,7 @@ class BulkTagWorker(QObject):
     """Worker to execute bulk tag editing (add/delete)"""
     log_message = Signal(str, str)
     finished = Signal()
-    bulk_add_completed = Signal(list, list, str)  # (file_paths, added_tags, position)
+    bulk_add_completed = Signal(list, list, str)  # (file_tags, added_tags, position)
     bulk_delete_completed = Signal(str, list)  # (removed_tag, file_tag_positions)
 
     def __init__(self, get_string: GetString | None = None):
@@ -1073,13 +1073,16 @@ class BulkTagWorker(QObject):
                     existing_tags = [t.strip() for t in read_text(txt, encoding="utf-8-sig").split(',') if t.strip()]
                     
                     if tag_to_delete in existing_tags:
-                        original_index = existing_tags.index(tag_to_delete)
-                        
+                        # REQ-3.3 / R5-5: 全出現位置を記録する（undo で全部戻す）。
+                        # 最初の 1 件だけだと重複タグが永久に失われる。
+                        original_indexes = [i for i, t in enumerate(existing_tags)
+                                            if t == tag_to_delete]
+
                         def delete_callback(tags: list[str]) -> list[str]:
                             return [t for t in tags if t != tag_to_delete]
 
                         if self._process_tag_file(txt, delete_callback):
-                            file_tag_positions.append((txt, original_index))
+                            file_tag_positions.append((txt, original_indexes))
                             count += 1
                 except Exception as e:
                     write_debug_log(f"Error processing {txt}: {e}", self.get_string)
@@ -1102,13 +1105,15 @@ class BulkTagWorker(QObject):
         write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Bulk_Add_Start", tags_to_add=tags_to_add)), self.get_string)
         count = 0
         modified_files: list[Path] = []
+        # REQ-3.3（R22-4）: ファイルごとに「実際に追加されたタグ」を記録する。
+        # 全体のタグ一覧だけだと、元からあったタグまで undo で消してしまう。
+        file_tags: list[tuple[Path, list[str]]] = []
         
         # REQ-H2: the same whitespace normalization/parsing as the other add entries.
         # REQ-H1: collapse duplicate spellings case-insensitively (existing tags are
         # compared the same way per file below).
-        new_tags_to_add = sorted(
-            tag_utils.filter_new_tags([], tag_utils.parse_tag_input(tags_to_add))
-        )
+        # REQ-3.3 / R1-4: 利用者が指定した順序を保つ（ソートしない）。
+        new_tags_to_add = tag_utils.filter_new_tags([], tag_utils.parse_tag_input(tags_to_add))
         if not new_tags_to_add:
             self.log_message.emit(self.get_string("Workers", "BulkTagWorker_Warning_No_Valid_Tags_To_Add"), "orange")
             self.finished.emit()
@@ -1120,16 +1125,23 @@ class BulkTagWorker(QObject):
                 if self.is_stopped():
                     break
                 
-                def add_callback(existing_tags: list[str]) -> list[str]:
+                added_here: list[str] = []
+
+                # 既定引数で束縛する（ループ変数を閉包が参照すると B023。
+                # 値はループごとに新しい list なので取り違えは起きない）。
+                def add_callback(existing_tags: list[str],
+                                 added_out: list[str] = added_here) -> list[str]:
                     # REQ-H1: `solo` and `Solo` are the same tag at the entry side.
                     tags_not_present = tag_utils.filter_new_tags(
                         existing_tags, new_tags_to_add)
+                    added_out[:] = tags_not_present
                     if prepend:
                         return tags_not_present + existing_tags
                     else:
                         return existing_tags + tags_not_present
 
                 if self._process_tag_file(txt, add_callback):
+                    file_tags.append((txt, list(added_here)))
                     modified_files.append(txt)
                     count += 1
 
@@ -1138,7 +1150,10 @@ class BulkTagWorker(QObject):
             # REQ-C1: 停止時も、既に書き換えたファイルの Undo 情報を失わないよう
             # 完了シグナルは出す（ワーカー側の他のループと揃える）。
             position = "prepend" if prepend else "append"
-            self.bulk_add_completed.emit(modified_files, new_tags_to_add, position)
+            # シグナル形状（arity / 型）は変えない。第 1 引数は [Path] ではなく
+            # [(Path, list[str])] を運ぶ（REQ-3.3 のファイル単位の記録。KEEP-2 の
+            # 接続契約はそのまま）。
+            self.bulk_add_completed.emit(file_tags, new_tags_to_add, position)
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Bulk_Add_Count", count=count)), self.get_string)
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Unexpected_Error_Bulk_Add", e=e)), self.get_string)

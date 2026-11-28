@@ -40,8 +40,9 @@ from vlm_worker import VlmCaptionWorker
 from locale_manager import LocaleManager, available_language_codes, normalize_language_code
 from ui_main_window import Ui_MainWindow
 from undo_manager import (
-    UndoManager, AddTagsAction, RemoveTagAction, BulkAddTagsAction, BulkRemoveTagsAction,
-    EditCaptionAction, OverwriteFileAction, AppendTagsActionV2, CompositeUndoAction,
+    UndoManager, UndoResult, AddTagsAction, RemoveTagAction, BulkAddTagsAction,
+    BulkRemoveTagsAction, EditCaptionAction, OverwriteFileAction,
+    AppendTagsActionV2, CompositeUndoAction,
 )
 from model_registry import ModelEntry, config_mapping, discover_models, get_model_entry
 from model_mode_controller import ModelModeController
@@ -1503,6 +1504,10 @@ class MainWindow(QMainWindow):
             write_debug_log(f"_handle_folder_drop rejected while processing: {folder_path}")
             self.update_log(self.locale_manager.get_string("MainWindow", "Busy_Processing_Active"), "orange")
             return
+        # REQ-3.5 / R20-2: フォルダをまたいだ Undo を防ぐ。履歴は切替時に消す
+        # （_batch_failed_paths の破棄と同じ方針。どの切替経路でもここを通る）。
+        self.undo_manager.clear()
+        self._update_undo_redo_buttons()
         # フォルダが変わったら「失敗のみ」用のセッション失敗集合は無効。破棄する
         # （前フォルダの失敗パスを別フォルダの実行対象にしないため。todo 5）。
         self._batch_failed_paths = []
@@ -2177,27 +2182,48 @@ class MainWindow(QMainWindow):
         self.reload_tags_only(preserve_page=True)
     
     @Slot(list, list, str)
-    def _on_bulk_add_completed(self, file_paths: list[Path], added_tags: list[str], position: str):
-        """Records bulk add operation for undo."""
-        if file_paths:
-            action = BulkAddTagsAction(file_paths=file_paths, added_tags=added_tags, position=position)
+    def _on_bulk_add_completed(self, file_tags: list[tuple[Path, list[str]]], added_tags: list[str], position: str):
+        """Records bulk add operation for undo.
+
+        REQ-3.3（R22-4）: 渡されるのはファイルごとの「実際に追加されたタグ」。
+        全体の added_tags はログ用で、undo は file_tags を使う。
+        """
+        if file_tags:
+            if len(file_tags) > constants.UNDO_BATCH_SNAPSHOT_LIMIT:
+                # REQ-3.8（R20-4）: バッチ側と同じ上限。超えたら今回の一括だけ
+                # Undo を作らない（既存履歴は保持する）。
+                self.update_log(self.locale_manager.get_string(
+                    "MainWindow", "Undo_Batch_Too_Large", count=len(file_tags)), "orange")
+                write_debug_log(
+                    f"bulk_add: {len(file_tags)} 件 > {constants.UNDO_BATCH_SNAPSHOT_LIMIT} のため Undo を作成しません")
+                return
+            action = BulkAddTagsAction(file_tags=file_tags, position=position)
             self.undo_manager.push(action)
             self._update_undo_redo_buttons()
             input_dir = Path(self.settings.paths.input_dir)
-            for fp in file_paths:
+            for fp, _tags in file_tags:
                 rel_path = str(fp.relative_to(input_dir))
                 self._update_tag_cache_entry(rel_path)
-            write_debug_log(f"Bulk add action recorded: {len(file_paths)} files, {len(added_tags)} tags")
+            write_debug_log(f"Bulk add action recorded: {len(file_tags)} files, {len(added_tags)} tags")
     
     @Slot(str, list)
-    def _on_bulk_delete_completed(self, removed_tag: str, file_tag_positions: list[tuple[Path, int]]):
-        """Records bulk delete operation for undo."""
+    def _on_bulk_delete_completed(self, removed_tag: str, file_tag_positions: list[tuple[Path, list[int]]]):
+        """Records bulk delete operation for undo.
+
+        REQ-3.3（R5-5）: 各ファイルの全出現位置を受け取り、undo で全部戻す。
+        """
         if file_tag_positions:
-            action = BulkRemoveTagsAction(removed_tag=removed_tag, file_tag_positions=file_tag_positions)
+            if len(file_tag_positions) > constants.UNDO_BATCH_SNAPSHOT_LIMIT:
+                self.update_log(self.locale_manager.get_string(
+                    "MainWindow", "Undo_Batch_Too_Large", count=len(file_tag_positions)), "orange")
+                write_debug_log(
+                    f"bulk_delete: {len(file_tag_positions)} 件 > {constants.UNDO_BATCH_SNAPSHOT_LIMIT} のため Undo を作成しません")
+                return
+            action = BulkRemoveTagsAction(removed_tag=removed_tag, file_positions=file_tag_positions)
             self.undo_manager.push(action)
             self._update_undo_redo_buttons()
             input_dir = Path(self.settings.paths.input_dir)
-            for fp, _ in file_tag_positions:
+            for fp, _positions in file_tag_positions:
                 rel_path = str(fp.relative_to(input_dir))
                 self._update_tag_cache_entry(rel_path)
             write_debug_log(f"Bulk delete action recorded: {len(file_tag_positions)} files")
@@ -2210,7 +2236,6 @@ class MainWindow(QMainWindow):
         self._update_undo_redo_buttons()
         write_debug_log(f"GridView add action recorded: {len(added_tags)} tags to {file_path.name}")
         self._build_tag_cache()
-        self.grid_view_widget.update_tag_cache(self._tag_cache)
     
     @Slot(Path, str, int)
     def _on_gridview_tag_removed(self, file_path: Path, removed_tag: str, original_index: int):
@@ -2220,7 +2245,6 @@ class MainWindow(QMainWindow):
         self._update_undo_redo_buttons()
         write_debug_log(f"GridView remove action recorded: '{removed_tag}' from {file_path.name}")
         self._build_tag_cache()
-        self.grid_view_widget.update_tag_cache(self._tag_cache)
 
     @Slot(Path, str, str, bool)
     def _on_gridview_caption_edited(self, file_path: Path, old_text: str, new_text: str, file_existed_before: bool):
@@ -2471,6 +2495,9 @@ class MainWindow(QMainWindow):
             txt_path = (input_dir / rel_path).with_suffix('.txt')
             tags = tag_utils.read_tags(txt_path)
             self._tag_cache[rel_path] = set(tags)
+        # REQ-3.7 / R2-10: ここは新しい dict を作るので、グリッドへも渡し直さないと
+        # 検索フィルタが古いキャッシュを参照し続ける（Undo/Redo・ローダ完了の共通経路）。
+        self.grid_view_widget.update_tag_cache(self._tag_cache)
 
     def _update_tag_cache_entry(self, rel_path: str) -> None:
         """指定ファイルのキャッシュエントリを更新する。"""
@@ -2536,10 +2563,21 @@ class MainWindow(QMainWindow):
             return
         if self.undo_manager.undo():
             self.update_log(self.locale_manager.get_string("MainWindow", "Undo_Success"), "green")
+            self._report_partial_undo()
             self._refresh_ui_after_undo_redo()
         else:
             self.update_log(self.locale_manager.get_string("MainWindow", "Undo_Failed"), "red")
         self._update_undo_redo_buttons()
+
+    def _report_partial_undo(self) -> None:
+        """部分成功を全成功として見せない（REQ-3.1 / NFR-10）。"""
+        if self.undo_manager.last_result is not UndoResult.PARTIAL:
+            return
+        failed = self.undo_manager.last_failed_paths
+        self.update_log(self.locale_manager.get_string(
+            "MainWindow", "Undo_Partial_Failure", count=len(failed)), "orange")
+        for path in failed[:10]:
+            write_debug_log(f"undo partial failure: {path}")
     
     @Slot()
     def _perform_redo(self):
@@ -2549,6 +2587,7 @@ class MainWindow(QMainWindow):
             return
         if self.undo_manager.redo():
             self.update_log(self.locale_manager.get_string("MainWindow", "Redo_Success"), "green")
+            self._report_partial_undo()
             self._refresh_ui_after_undo_redo()
         else:
             self.update_log(self.locale_manager.get_string("MainWindow", "Redo_Failed"), "red")
@@ -2563,6 +2602,7 @@ class MainWindow(QMainWindow):
             self._load_image_tags(image_path, preserve_page=True)
         
         # Rebuild tag cache to reflect undo/redo changes
+        # （グリッドへの反映は _build_tag_cache が行う。R2-10）
         self._build_tag_cache()
         
         # Refresh bulk tag list
