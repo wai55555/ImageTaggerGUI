@@ -39,7 +39,7 @@ CONFIG_PATH = BASE_DIR / "config.ini"
 from utils import config_mapping, log_dbg, GetString
 from app_settings import AppSettings, load_settings
 from onnx_providers import make_session
-from text_io import atomic_write_text
+from text_io import atomic_write_text, long_path_str, read_text
 
 
 # カテゴリ別の最大タグ数が1つも指定されていない場合に適用する出力上限。
@@ -1292,7 +1292,8 @@ def process_image_loop(
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
 
         try:
-            with Image.open(image_path) as opened_image:
+            # REQ-B2: 読み取りも書き込みと同じ正本の長パス変換を通す（260文字超・UNC）。
+            with Image.open(long_path_str(image_path)) as opened_image:
                 # REQ-A5: VLM 経路と同じく EXIF Orientation を適用してから推論する
                 # （横向きのまま推論して黙って精度が落ちるのを防ぐ）。alpha は
                 # exif_transpose 後も保持されるので、モデル側の合成にそのまま渡せる。
@@ -1343,7 +1344,8 @@ def process_image_loop(
         added_tags: tuple[str, ...] = ()
         if will_append:
             try:
-                previous_content = output_path.read_text(encoding='utf-8')
+                # REQ-B2 / REQ-B4: 長パス変換を通し、BOM 付きでも先頭タグを別タグ扱いしない。
+                previous_content = read_text(output_path, encoding='utf-8-sig')
             except Exception as e:
                 # 既存内容が読めないファイルは触らずスキップする（spec.md 3.3節）
                 log_dbg(f"append: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
@@ -1361,9 +1363,13 @@ def process_image_loop(
             new_content = ", ".join(merged)
         else:
             # 新規作成（previous_content=None）または上書き
-            if output_path.is_file():
+            # REQ-B2: 存在判定も長パス変換を通す。素の is_file() が 260 文字超で
+            # False になると、既存ファイルを「新規」と誤認して previous_content を
+            # 読まずに上書きし、undo で原本ごと削除してしまう。
+            if Path(long_path_str(output_path)).is_file():
                 try:
-                    previous_content = output_path.read_text(encoding='utf-8')
+                    # REQ-B2 / REQ-B4: APPEND 分岐と同じく長パス変換と BOM 除去を通す。
+                    previous_content = read_text(output_path, encoding='utf-8-sig')
                 except Exception as e:
                     # 既存だが読めないファイル（非UTF-8等）はここで previous_content=None
                     # のまま書くと「元は存在しなかった」と undo に誤認され、undo で

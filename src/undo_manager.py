@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import sys
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -284,6 +284,26 @@ class EditCaptionAction(UndoAction):
         return _desc("Undo_Desc_Edit_Caption")
 
 
+def _detect_newline(path: Path) -> str | None:
+    """書き戻し先ファイルの現行の改行規約を検出する（REQ-B3）。
+
+    スナップショットの previous_content / new_content は LF 正規化済みで規約を運ばない。
+    そのまま `newline=None` で書くと、Windows では元が LF のファイルが CRLF へ変換
+    されてしまう（`vlm_persistence.save_caption` が保持している規約と食い違う）。
+
+    `vlm_persistence.save_caption` と同じ判定（生読みで `\r\n` を含むか）を使う。
+    読めない・存在しない場合は `None`（現行どおり `open()` の既定）を返す。
+    アクション生成時点のファイルは直前に保存されたものなので、元の規約と一致する。
+    """
+    try:
+        with open(long_path_str(path), "r", encoding="utf-8", newline="") as handle:
+            raw = handle.read()
+    except (OSError, UnicodeDecodeError) as e:
+        write_debug_log(f"undo newline detection failed for {path}: {type(e).__name__}: {e}")
+        return None
+    return "\r\n" if "\r\n" in raw else "\n"
+
+
 @dataclass
 class _FileSnapshotAction(UndoAction):
     """全文スナップショットによる undo/redo の共通実装（PR#16 レビュー指摘: 従来
@@ -296,6 +316,9 @@ class _FileSnapshotAction(UndoAction):
     file_path: Path
     previous_content: str | None
     new_content: str
+    # REQ-B3: 生成時点で対象ファイルから検出した改行規約。None は現行どおり
+    # `newline=None`（プラットフォーム既定）で書く。
+    newline: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 作成時に絶対パスへ固定する。undo/redo はずっと後に走りうるので、
@@ -304,11 +327,15 @@ class _FileSnapshotAction(UndoAction):
         # 解決してしまい、別ファイルを書き換え／削除しかねない（PR#16 レビュー: coderabbit）。
         # `resolve()` ではなく `os.path.abspath()`: symlink を解決しない点を _long_path_str と揃える。
         self.file_path = Path(os.path.abspath(self.file_path))
+        self.newline = _detect_newline(self.file_path)
 
     def _write(self, text: str) -> bool:
         try:
             # REQ-2.3: 一時ファイル + os.replace で原子的に（(iii) 段）。
-            atomic_write_text(self.file_path, text, fsync=False, verify=False)
+            # REQ-B3: 生成時に検出した改行規約で書く（LF のファイルが Undo/Redo で
+            # CRLF へ化けるのを防ぐ）。検出できなければ現行どおり None。
+            atomic_write_text(self.file_path, text, fsync=False, verify=False,
+                              newline=self.newline)
             return True
         except Exception as e:
             write_debug_log(f"{type(self).__name__} write failed for {self.file_path}: {e}")

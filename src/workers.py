@@ -12,7 +12,7 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from utils import write_debug_log, calculate_sha256, GetString, default_get_string_fallback
 import tag_utils
-from text_io import atomic_write_text
+from text_io import atomic_write_text, read_text
 from constants import (
     DOWNLOAD_URLS, MODEL_PATH, TAGS_CSV_PATH, MODEL_POINTER_PATH
 )
@@ -1000,9 +1000,10 @@ class TagLoader(QObject):
                 if self.is_stopped():
                     break
                 try:
-                    with open(txt, "r", encoding="utf-8") as f:
-                        tags = [t.strip() for t in f.read().split(",") if t.strip()]
-                        counter.update(tags)
+                    # REQ-B4: BOM 付きの .txt でも先頭タグを別タグ扱いしない。
+                    content = read_text(txt, encoding="utf-8-sig")
+                    tags = [t.strip() for t in content.split(",") if t.strip()]
+                    counter.update(tags)
                 except Exception as e:
                     write_debug_log(str(self.get_string("Workers", "TagLoader_TXT_Load_Failed", txt_name=txt.name, e=e)), self.get_string)
             
@@ -1039,8 +1040,8 @@ class BulkTagWorker(QObject):
 
     def _process_tag_file(self, txt_file_path: Path, tag_operation_callback: Callable[[list[str]], list[str]]) -> bool:
         try:
-            with open(txt_file_path, "r", encoding="utf-8") as f:
-                existing_tags = [t.strip() for t in f.read().split(',') if t.strip()]
+            # REQ-B2 / REQ-B4: 読み取りにも長パス変換と BOM 除去を通す。
+            existing_tags = [t.strip() for t in read_text(txt_file_path, encoding="utf-8-sig").split(',') if t.strip()]
             
             modified_tags = tag_operation_callback(existing_tags)
             
@@ -1068,8 +1069,8 @@ class BulkTagWorker(QObject):
                 
                 # Record original position before deletion
                 try:
-                    with open(txt, "r", encoding="utf-8") as f:
-                        existing_tags = [t.strip() for t in f.read().split(',') if t.strip()]
+                    # REQ-B4: 一括削除の事前読みも BOM を剥がす。
+                    existing_tags = [t.strip() for t in read_text(txt, encoding="utf-8-sig").split(',') if t.strip()]
                     
                     if tag_to_delete in existing_tags:
                         original_index = existing_tags.index(tag_to_delete)
