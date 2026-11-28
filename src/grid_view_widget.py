@@ -685,11 +685,23 @@ class GridViewWidget(QWidget):
             self._image_viewer_dialog.activateWindow()
 
     # --- ADDED: Helper method to load/update the image in the dialog ---
+    def _dialog_image_paths(self) -> list[Path]:
+        """拡大表示が従う一覧（REQ-8B.1 / F）。
+
+        セルは `_filtered_image_paths`（検索フィルタ後）で作られるので、拡大と
+        前後ナビも同じリストを正とする。以前は未フィルタの `_image_paths` を
+        引いていたため、検索中に拡大すると別の画像が表示されていた。
+        フィルタが空（＝検索していない）ときは `_filtered_image_paths` が
+        `_image_paths` のコピーになっている。
+        """
+        return self._filtered_image_paths or self._image_paths
+
     def _load_image_into_dialog(self, index: int):
-        if not (0 <= index < len(self._image_paths)) or not self._image_viewer_dialog:
+        paths = self._dialog_image_paths()
+        if not (0 <= index < len(paths)) or not self._image_viewer_dialog:
             return
 
-        path = self._image_paths[index]
+        path = paths[index]
         pixmap = QPixmap(str(path))
         if pixmap.isNull():
             return
@@ -713,7 +725,7 @@ class GridViewWidget(QWidget):
     # --- ADDED: Slots for handling navigation signals from the dialog ---
     @Slot()
     def _navigate_dialog_image_next(self):
-        if self._current_dialog_image_index < len(self._image_paths) - 1:
+        if self._current_dialog_image_index < len(self._dialog_image_paths()) - 1:
             self._current_dialog_image_index += 1
             self._load_image_into_dialog(self._current_dialog_image_index)
 
