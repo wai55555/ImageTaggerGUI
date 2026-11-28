@@ -761,6 +761,10 @@ class TaggerThreadWorker(QObject):
         self.running_state_changed.emit(True)
         write_debug_log(str(self.get_string("Workers", "TaggerThreadWorker_Tagging_Process_Start")), self.get_string)
         failed: list[Path] = []
+        # REQ-C1: 致命的例外でループが中断しても、それまでに書いたファイルの Undo 情報を
+        # 失わないよう、書き込みごとにここへも FileChange が積まれる。
+        changed_files: list = []
+        completion_emitted = False
         try:
             tagger, settings_dict = setup_tagger_from_settings(self._settings, self.get_string)
             if not tagger or not settings_dict:
@@ -823,8 +827,10 @@ class TaggerThreadWorker(QObject):
                 get_string=self.get_string,
                 progress_cb=self.progress_update.emit,
                 failed_paths=failed,
+                changes_out=changed_files,
             )
             self.batch_completed.emit(changed_files)
+            completion_emitted = True
             self.batch_failed.emit(failed)
             
         except Exception as e:
@@ -832,6 +838,10 @@ class TaggerThreadWorker(QObject):
             error_message = self.get_string("Workers", "TaggerThreadWorker_Fatal_Exception", type_e_name=type(e).__name__, e=e, traceback_exc=traceback.format_exc())
             self.log_message.emit(error_message, "red")
             write_debug_log(str(self.get_string("Workers", "TaggerThreadWorker_Runtime_Exception", e=e, traceback_exc=traceback.format_exc())), self.get_string)
+            # REQ-C1: VLM ワーカーの finally 方式に揃え、致命的例外でも処理済み分の
+            # FileChanges を載せて完了シグナルを発行する（未処理分は完了扱いにしない）。
+            if not completion_emitted:
+                self.batch_completed.emit(changed_files)
             self.batch_failed.emit(failed)
         
         finally:
@@ -888,6 +898,9 @@ class CaptionerThreadWorker(QObject):
         write_debug_log(str(self.get_string("Workers", "TaggerThreadWorker_Start")), self.get_string)
         self.running_state_changed.emit(True)
         failed: list[Path] = []
+        # REQ-C1: 致命的例外でも処理済み分の Undo 情報を失わない（tagging 側と同じ）。
+        changed_files: list = []
+        completion_emitted = False
         try:
             captioner, settings_dict = caption_core.setup_captioner_from_settings(self._settings, self.get_string)
             if not captioner or not settings_dict:
@@ -935,8 +948,10 @@ class CaptionerThreadWorker(QObject):
                 get_string=self.get_string,
                 progress_cb=self.progress_update.emit,
                 failed_paths=failed,
+                changes_out=changed_files,
             )
             self.batch_completed.emit(changed_files)
+            completion_emitted = True
             self.batch_failed.emit(failed)
 
         except Exception as e:
@@ -944,6 +959,9 @@ class CaptionerThreadWorker(QObject):
             error_message = self.get_string("Workers", "TaggerThreadWorker_Fatal_Exception", type_e_name=type(e).__name__, e=e, traceback_exc=traceback.format_exc())
             self.log_message.emit(error_message, "red")
             write_debug_log(str(self.get_string("Workers", "TaggerThreadWorker_Runtime_Exception", e=e, traceback_exc=traceback.format_exc())), self.get_string)
+            # REQ-C1: 致命的例外でも処理済み分の FileChanges を載せて完了シグナルを発行する。
+            if not completion_emitted:
+                self.batch_completed.emit(changed_files)
             self.batch_failed.emit(failed)
 
         finally:
@@ -1068,8 +1086,9 @@ class BulkTagWorker(QObject):
             
             if not self.is_stopped():
                 self.log_message.emit(self.get_string("Workers", "BulkTagWorker_Bulk_Delete_Complete", count=count, tag_to_delete=tag_to_delete), "green")
-                # Emit signal with undo information
-                self.bulk_delete_completed.emit(tag_to_delete, file_tag_positions)
+            # REQ-C1: 停止時も、既に書き換えたファイルの Undo 情報を失わないよう
+            # 完了シグナルは出す（ワーカー側の他のループと揃える）。
+            self.bulk_delete_completed.emit(tag_to_delete, file_tag_positions)
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Bulk_Delete_Count", count=count)), self.get_string)
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Unexpected_Error_Bulk_Delete", e=e)), self.get_string)
@@ -1107,9 +1126,10 @@ class BulkTagWorker(QObject):
 
             if not self.is_stopped():
                 self.log_message.emit(self.get_string("Workers", "BulkTagWorker_Bulk_Add_Complete", count=count, tags_to_add=tags_to_add), "green")
-                # Emit signal with undo information
-                position = "prepend" if prepend else "append"
-                self.bulk_add_completed.emit(modified_files, new_tags_to_add, position)
+            # REQ-C1: 停止時も、既に書き換えたファイルの Undo 情報を失わないよう
+            # 完了シグナルは出す（ワーカー側の他のループと揃える）。
+            position = "prepend" if prepend else "append"
+            self.bulk_add_completed.emit(modified_files, new_tags_to_add, position)
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Bulk_Add_Count", count=count)), self.get_string)
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_Unexpected_Error_Bulk_Add", e=e)), self.get_string)

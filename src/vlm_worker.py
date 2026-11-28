@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 
 import constants
+from batch_runner import duplicate_output_indices
 from utils import GetString, default_get_string_fallback, write_debug_log
 from tagging_core import (
     ExistingFileMode, FileChange, OverwriteDecision,
@@ -314,6 +315,10 @@ class VlmCaptionWorker(QObject):
         self.running_state_changed.emit(True)
         changed: list[FileChange] = []
         failed: list[Path] = []
+        # REQ-C2: ループに入る前に早期 return した場合（ランタイム構築失敗・候補なし・
+        # 対象画像なし）は batch_failed を emit しない。MainWindow が「失敗分のみ」用に
+        # 保持している失敗一覧を空リストで消してしまうためである。
+        loop_started = False
         # REQ-G7: 実行中に使い回した HTTP Session をジョブ終了時に閉じる。
         executor: VlmExecutor | None = None
         try:
@@ -347,6 +352,11 @@ class VlmCaptionWorker(QObject):
             step = constants.progress_step_for(total)
             n_written = n_skipped = n_errors = n_unchanged = 0
             last_conn = ""
+            # REQ-C5: a.png と a.jpg は同じ a.txt を共有する。開始時に検出して
+            # 2 件目以降を理由付きでスキップし、タグ／キャプションを混ぜない。
+            # 停止で途中終了しても会計が閉じるよう、ループ到達前に skipped へ計上する。
+            duplicates = duplicate_output_indices(image_paths, lambda p: p.with_suffix(".txt"))
+            n_skipped += len(duplicates)
 
             self.log_message.emit(self.get_string("Vlm", "Batch_Start", count=total), "blue")
             # close 用に Optional で保持し、呼び出しは非 Optional の別名で行う
@@ -354,23 +364,42 @@ class VlmCaptionWorker(QObject):
             executor = rt["executor"]
             active_executor = rt["executor"]  # type: VlmExecutor
 
-            def remaining_failures(start: int) -> list[Path]:
-                """Return unprocessed inputs that would still require VLM work."""
-                pending = image_paths[start:]
-                if mode is ExistingFileMode.SKIP:
-                    return [p for p in pending if not p.with_suffix(".txt").is_file()]
-                return list(pending)
+            def stop_remaining(start: int) -> None:
+                """未処理ぶんを failed へ寄せ、要約の件数会計を閉じる（REQ-C3）。
+
+                SKIP モードで既存 .txt がある未処理分は failed ではなく skipped に数え、
+                残りは failed と n_errors の両方へ数える。これで
+                written+skipped+unchanged+errors == total が常に成り立つ。
+                """
+                nonlocal n_errors, n_skipped
+                for index in range(start, total):
+                    if index in duplicates:
+                        continue  # 開始時に skipped へ計上済み
+                    pending = image_paths[index]
+                    if mode is ExistingFileMode.SKIP and pending.with_suffix(".txt").is_file():
+                        n_skipped += 1
+                        continue
+                    failed.append(pending)
+                    n_errors += 1
 
             exhausted_logged = False
+            loop_started = True
             for i, image_path in enumerate(image_paths):
                 if self.is_stopped():
                     self.log_message.emit(self.get_string("Vlm", "Stopped_By_User"), "orange")
-                    failed.extend(remaining_failures(i))
+                    stop_remaining(i)
                     break
                 if (i + 1) % step == 0 or i == total - 1:
                     self.progress_update.emit(i + 1, total)
 
                 output_path = image_path.with_suffix(".txt")
+                if i in duplicates:
+                    write_debug_log(f"vlm: {image_path} shares {output_path.name} with an earlier "
+                                    f"image in this batch; skipping it.")
+                    self.log_message.emit(self.get_string(
+                        "Vlm", "Batch_Skipped_Duplicate_Output",
+                        output_path_name=output_path.name), "orange")
+                    continue
                 will_write, decision = self._resolve_existing(output_path, mode)
                 if not will_write:
                     n_skipped += 1
@@ -412,12 +441,12 @@ class VlmCaptionWorker(QObject):
                 result = active_executor.caption_one(spec_base, candidates.connection_ids)
                 if self.is_stopped() or result.stopped:
                     self.log_message.emit(self.get_string("Vlm", "Stopped_By_User"), "orange")
-                    failed.extend(remaining_failures(i))
+                    stop_remaining(i)
                     break
                 if result.stop_job:
                     reason = _error_reason_for_log(result.error) if result.error else "prompt_format_error"
                     self.log_message.emit(self.get_string("Vlm", "Job_Stopped", reason=reason), "red")
-                    failed.extend(remaining_failures(i))
+                    stop_remaining(i)
                     break
                 if not result.ok:
                     n_errors += 1
@@ -470,7 +499,9 @@ class VlmCaptionWorker(QObject):
             # 例外で途中終了しても、それまでに実書き込みしたファイルは Undo 対象にする。
             # 失敗画像パスも同様に部分結果で出す（成功時は空）。単体テスト側では出さない。
             self.batch_completed.emit(changed)
-            self.batch_failed.emit(failed)
+            # REQ-C2: 早期 return（ループ未到達）では失敗一覧を消さない。
+            if loop_started:
+                self.batch_failed.emit(failed)
             self.running_state_changed.emit(False)
             self.reload_image_list_signal.emit()
             self.finished.emit()

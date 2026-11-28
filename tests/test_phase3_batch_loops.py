@@ -252,7 +252,9 @@ def test_tagging_stop_at_loop_start_marks_remaining_failed(tmp_path: Path):
     changed, rec = _run_tagging(tmp_path, images, stop=lambda: True)
     assert changed == []
     assert rec.failed == images          # 並びも元の順序
-    assert rec.progress == [(1, 3)]      # 進捗は停止判定より先に 1 回出る
+    # REQ-C4（Phase C の意図的変更）: 進捗は各アイテムの処理後に発行する。停止判定で
+    # 抜けたアイテムは未処理なので、ここでは1件も発行されない（旧: [(1, 3)]）。
+    assert rec.progress == []
 
 
 def test_tagging_stop_before_ask_resolution_does_not_call_resolver(tmp_path: Path):

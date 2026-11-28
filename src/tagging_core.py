@@ -1222,6 +1222,7 @@ def process_image_loop(
     get_string: GetString | None,
     progress_cb: Callable[[int, int], None] | None = None,
     failed_paths: list[Path] | None = None,
+    changes_out: list[FileChange] | None = None,
 ) -> list[FileChange]:
     """設定に従って画像へタグを付け、既存 .txt の扱いを EXISTING_FILE_MODE で分岐する。
 
@@ -1232,11 +1233,15 @@ def process_image_loop(
     Undo エントリ（CompositeUndoAction）にまとめる（design.md 4.4節）。
 
     `progress_cb(done, total)` は全体で最大 constants.PROGRESS_SIGNAL_BUDGET 回
-    ＋最後の N/N（完了）だけ呼ぶ。
+    ＋最後の N/N（完了）だけ呼ぶ。REQ-C4: 発行は各アイテムの処理が終わってから
+    （処理前ではない）。
+
+    `changes_out` を渡すと、書き込みごとに FileChange がそこへも積まれる。致命的例外で
+    ループが中断しても、ワーカーが処理済み分の Undo 情報を emit できるようにするため
+    （REQ-C1）。
 
     REQ-3.1: 反復・進捗・停止・既存ファイル判定・失敗収集・サマリ集計・FileChange 収集は
     `batch_runner.run_batch()` に集約し、ここは「1 枚生成して書く」処理だけを持つ。
-    進捗発行→停止判定の順序（現行挙動）は `progress_before_stop=True` で保つ。
     """
 
     def core_log_gui(message: str, color: str = "black") -> None:
@@ -1258,6 +1263,15 @@ def process_image_loop(
         log_dbg(_get_string_internal(
             "TaggerCore", "Tag_Output_Skipped_Existing_File",
             current_index_str=index_str(context), relative_path=str(context.relative_path)))
+
+    def on_duplicate_skip(context: ItemContext) -> None:
+        # REQ-C5: 同じ .txt を共有する画像（a.png と a.jpg 等）。黙って処理済みに
+        # しないよう、理由をユーザーに見える形で出す。
+        log_dbg(f"tagging: {context.image_path} shares {context.output_path.name} with an "
+                f"earlier image in this batch; skipping it.")
+        core_log_gui(_get_string_internal(
+            "TaggerCore", "Tag_Skipped_Duplicate_Output",
+            current_index_str=index_str(context), output_path_name=context.output_path.name), "orange")
 
     def on_stop() -> None:
         core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
@@ -1359,6 +1373,12 @@ def process_image_loop(
                     core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
                     return ItemOutcome.error()
             new_content = formatted_tags
+            if previous_content is not None and new_content == previous_content:
+                # REQ-C7: OVERWRITE でも内容が同じなら書かない。毎回書くと mtime が
+                # 更新され、no-op の Undo エントリが履歴（最大50件）を消費する。
+                # APPEND 分岐と Florence（および VLM）と同じ形に揃える。
+                log_dbg(_get_string_internal("TaggerCore", "Log_No_New_Tags", current_index_str=current_index_str, file_name=output_path.name))
+                return ItemOutcome.unchanged()
 
         try:
             # REQ-2.3: 一時ファイル + os.replace で原子的に書く（REQ-2.7 の (iii) 段）。
@@ -1392,9 +1412,12 @@ def process_image_loop(
         failed_paths=failed_paths,
         on_item_start=on_item_start,
         on_existing_skip=on_existing_skip,
+        on_duplicate_skip=on_duplicate_skip,
         on_stop=on_stop,
-        # tagging/caption は「進捗発行 → 停止判定」の現行順（§3.1）。
-        progress_before_stop=True,
+        # REQ-C4: 進捗は各アイテムの処理が終わってから発行する（現行の「処理前」から
+        # 意図的に変更。§2.3）。停止チェックの順序自体は変えない。
+        progress_after_item=True,
+        changes_out=changes_out,
     )
     core_log_gui(_get_string_internal(
         "TaggerCore", "Batch_Summary",
