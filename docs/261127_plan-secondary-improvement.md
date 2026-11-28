@@ -795,7 +795,7 @@ Phase 5 のうちダイアログ側のもの。
 - REQ-6.8: 終了処理の等価性は既存テストで固定されている
   （`tests/test_gpu_main_window.py` の closeEvent/進捗ダイアログ、`tests/test_review_260922_fixes.py`
   の退避スレッド、`tests/test_phase2_write_path_locks.py` の再入）。全件通過を確認。
-- REQ-6.9: `src/main_window.py` は 2,689 行（ベースライン）→ **2,073 行**。残るのは
+- REQ-6.9: `src/main_window.py` は 2,689 行（ベースライン）→ **2,121 行**。残るのは
   画面の組み立て・結線、Qt イベントハンドラ、業務フローの調整であり、スレッド管理・
   起動プロンプト・スライダー同期・タグパネルは各モジュールが持つ。
 - §9.1: `pytest` **1073 passed / 2 skipped**、`ruff` 421（増加なし）、`pyright` 80。
