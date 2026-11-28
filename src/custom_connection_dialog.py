@@ -5,6 +5,7 @@ vlm_secrets 経由でのみ扱い、返す dict には含めない。
 """
 from __future__ import annotations
 
+import copy
 from typing import Callable
 from urllib.parse import urlparse
 
@@ -62,7 +63,11 @@ class CustomConnectionDialog(QDialog):
         self.setWindowTitle(get_string("Vlm", "Custom_Dialog_Title"))
         self.setMinimumWidth(460)
         self._build()
+        # REQ-5.1 / R2-3: None（未設定）と数値の往復を保つための状態。
+        self._had_max_edge_none = False
+        self._max_edge_touched = False
         self._load(self._existing)
+        self.max_edge.valueChanged.connect(self._mark_max_edge_touched)
 
     # --- UI ---
     def _build(self) -> None:
@@ -162,6 +167,10 @@ class CustomConnectionDialog(QDialog):
         self.persist_key_check.setEnabled(atype != "none" and vlm_secrets.keyring_available())
 
     # --- data ---
+    def _mark_max_edge_touched(self, *_args) -> None:
+        """スピンを利用者が動かしたか（REQ-5.1 / R2-3 の None 往復判定）。"""
+        self._max_edge_touched = True
+
     def _load(self, data: dict) -> None:
         self.name_edit.setText(str(data.get("display_name", "")))
         _select(self.protocol_combo, data.get("protocol", "openai_chat_completions"))
@@ -172,13 +181,21 @@ class CustomConnectionDialog(QDialog):
         self.auth_header_edit.setText(str(auth.get("header_name", "Authorization")))
         self.auth_query_edit.setText(str(auth.get("query_param", "key")))
         retry = data.get("retry", {}) if isinstance(data.get("retry"), dict) else {}
-        self.connect_timeout.setValue(_int(retry.get("connect_timeout_s"), 10))
-        self.read_timeout.setValue(_int(retry.get("read_timeout_s"), int(RetryPolicy().read_timeout_s)))
-        self.retry_same.setValue(_int(retry.get("retry_same_max"), 1))
+        # REQ-5.8 / R13-4: 手編集で範囲外の値が入っていても、読み込み時に黙って
+        # 丸めない（丸めた値がそのまま保存されて設定が変わる）。範囲を広げて往復させる。
+        for spin, raw, default in (
+                (self.connect_timeout, retry.get("connect_timeout_s"), 10),
+                (self.read_timeout, retry.get("read_timeout_s"), int(RetryPolicy().read_timeout_s)),
+                (self.retry_same, retry.get("retry_same_max"), 1)):
+            value = _int(raw, default)
+            spin.setMaximum(max(spin.maximum(), value))
+            spin.setMinimum(min(spin.minimum(), value))
+            spin.setValue(value)
         resp = data.get("response", {}) if isinstance(data.get("response"), dict) else {}
         self.text_path_edit.setText(str(resp.get("text_path", "") or data.get("text_path", "")))
         self.verify_tls_check.setChecked(bool(data.get("verify_tls", True)))
         img = data.get("image", {}) if isinstance(data.get("image"), dict) else {}
+        self._had_max_edge_none = img.get("max_long_edge") is None
         self.max_edge.setValue(_int(img.get("max_long_edge"), 1536))
         kind_raw = str(data.get("kind", "")).lower()
         if kind_raw == "custom_local":
@@ -255,6 +272,9 @@ class CustomConnectionDialog(QDialog):
         # entered/stored key or constructing the worker, so declining sends nothing.
         if not self._confirm_external_http(conn.base_url, conn.kind):
             return
+        # REQ-5.8 / R13-1: 取得開始時点の ID を覚えておき、完了時に手入力が
+        # 変わっていたら上書きしない。
+        self._model_fetch_requested_id = self.model_edit.currentText().strip()
         self.model_status.setText(self._t("Vlm", "Settings_Route_FetchModels_Busy"))
         self.model_fetch_btn.setEnabled(False)
         self._save_button.setEnabled(False)
@@ -279,10 +299,15 @@ class CustomConnectionDialog(QDialog):
         vlm_ids = [entry.model_id for entry in filter_vlm_catalog(
             entries, exclude_disabled_markers=False)]
         current = self.model_edit.currentText().strip()
+        requested = getattr(self, "_model_fetch_requested_id", "")
+        typed_while_loading = current != requested
         self.model_edit.blockSignals(True)
         self.model_edit.clear()
         self.model_edit.addItems(vlm_ids)
         if current in vlm_ids:
+            self.model_edit.setCurrentText(current)
+        elif current and (typed_while_loading or requested):
+            # REQ-5.8 / R13-1: 手入力のモデル ID を一覧の先頭で黙って差し替えない。
             self.model_edit.setCurrentText(current)
         elif vlm_ids:
             self.model_edit.setCurrentIndex(0)
@@ -329,6 +354,17 @@ class CustomConnectionDialog(QDialog):
             QMessageBox.warning(self, self._t("Vlm", "Custom_Dialog_Title"),
                                 self._t("Vlm", "Custom_Validation_Required"))
             return
+        # REQ-5.7 / R13-2: スキーム無しの入力が平文 http の同意ゲートをすり抜けない
+        # よう、保存時に形式を検証する（実行時の解決規則と同じ見方）。
+        try:
+            parsed_url = urlparse(base_url)
+        except ValueError:
+            parsed_url = None
+        if (parsed_url is None or parsed_url.scheme.lower() not in ("http", "https")
+                or not parsed_url.hostname):
+            QMessageBox.warning(self, self._t("Vlm", "Custom_Dialog_Title"),
+                                self._t("Vlm", "Custom_Validation_Url"))
+            return
 
         cid = self._existing.get("connection_id") or new_connection_id()
         locality = self.locality_combo.currentData()
@@ -341,6 +377,17 @@ class CustomConnectionDialog(QDialog):
         # than a blanket runtime ban; explicitly trusted external HTTP remains usable.
         if not self._confirm_external_http(base_url, kind):
             return
+
+        # REQ-5.7 / R3-S2: 証明書検証を切る設定は無言で保存しない。外部 http の同意と
+        # 同じ水準の確認を取る（拒否すると保存しない）。
+        if not self.verify_tls_check.isChecked():
+            answer = QMessageBox.warning(
+                self, self._t("Vlm", "Custom_Dialog_Title"),
+                self._t("Vlm", "Custom_Verify_Tls_Warning"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
 
         if atype != "none":
             key = self.api_key_edit.text().strip()
@@ -367,7 +414,11 @@ class CustomConnectionDialog(QDialog):
             if old_ref:
                 vlm_secrets.delete_secret(old_ref)
 
-        self._result = {
+        # REQ-5.1 / R2-2: 読み込んだ dict への差分適用にする。表示していないキー
+        # （request_headers, request_body, provider_id, response.error_path 等）と、
+        # 行の無いネストのキーを保存で落とさない。
+        result = copy.deepcopy(self._existing) if self._existing else {}
+        result.update({
             "connection_id": cid,
             "display_name": name,
             "kind": kind.value,
@@ -379,20 +430,55 @@ class CustomConnectionDialog(QDialog):
             # UI からは編集させないが、保存済みの値は往復で失わないよう持ち越す
             # （実行時に効果は無いが、編集のたびに 1 へ落ちるのを防ぐ）。
             "concurrency": self._existing.get("concurrency", 1),
-            "auth": {
-                "type": atype,
-                "secret_ref": secret_ref,
-                "header_name": self.auth_header_edit.text().strip() or "Authorization",
-                "query_param": self.auth_query_edit.text().strip() or "key",
-            },
-            "retry": {
-                "connect_timeout_s": self.connect_timeout.value(),
-                "read_timeout_s": self.read_timeout.value(),
-                "retry_same_max": self.retry_same.value(),
-            },
-            "response": {"text_path": self.text_path_edit.text().strip()},
-            "image": {"max_long_edge": self.max_edge.value()},
-        }
+        })
+
+        auth: dict[str, object] = {}
+        existing_auth = result.get("auth")
+        if isinstance(existing_auth, dict):
+            auth.update(existing_auth)
+        auth.update({
+            "type": atype,
+            "secret_ref": secret_ref,
+            "header_name": self.auth_header_edit.text().strip() or "Authorization",
+            "query_param": self.auth_query_edit.text().strip() or "key",
+        })
+        # REQ-5.2 / R13-3: 認証を none にしたら secret_ref も残さない（keyring だけ
+        # 消して dict に古い参照が残る非対称をなくす）。
+        if atype == "none":
+            auth["secret_ref"] = ""
+        result["auth"] = auth
+
+        retry: dict[str, object] = {}
+        existing_retry = result.get("retry")
+        if isinstance(existing_retry, dict):
+            retry.update(existing_retry)
+        retry.update({
+            "connect_timeout_s": self.connect_timeout.value(),
+            "read_timeout_s": self.read_timeout.value(),
+            "retry_same_max": self.retry_same.value(),
+        })
+        result["retry"] = retry
+
+        response: dict[str, object] = {}
+        existing_response = result.get("response")
+        if isinstance(existing_response, dict):
+            response.update(existing_response)
+        response["text_path"] = self.text_path_edit.text().strip()
+        result["response"] = response
+
+        image: dict[str, object] = {}
+        existing_image = result.get("image")
+        if isinstance(existing_image, dict):
+            image.update(existing_image)
+        # REQ-5.1 / R2-3: `max_long_edge: null`（未設定）は表示上 1536 だが、
+        # 利用者がスピンを触っていないなら null のまま保存する。触ったときだけ数値化。
+        if self._max_edge_touched or not self._had_max_edge_none:
+            image["max_long_edge"] = self.max_edge.value()
+        else:
+            image["max_long_edge"] = None
+        result["image"] = image
+
+        self._result = result
         self.accept()
 
     def result_connection(self) -> dict | None:

@@ -396,5 +396,21 @@ BUILTIN_CONNECTION_TEMPLATES: list[dict] = [
 ]
 
 
+# REQ-5.9 / R18-7: 内蔵プロバイダの secret_ref はここが単一の正本。
+# 設定ダイアログ側で同じ表を複製しない（vlm_settings_dialog はこれを参照する）。
+BUILTIN_SECRET_REFS: dict[str, str] = {
+    "builtin-gemini": "vlm/gemini/api_key",
+    "builtin-openrouter": "vlm/openrouter/api_key",
+    "builtin-cloudflare": "vlm/cloudflare/api_token",
+    "builtin-groq": "vlm/groq/api_key",
+    "builtin-nvidia": "vlm/nvidia/api_key",
+    "builtin-huggingface": "vlm/huggingface/api_token",
+    "builtin-vercel": "vlm/vercel/api_key",
+    "builtin-openai": "vlm/openai/api_key",
+    "builtin-anthropic": "vlm/anthropic/api_key",
+    "builtin-xai": "vlm/xai/api_key",
+}
+
+
 def default_builtin_connections() -> list[VlmConnection]:
     return [VlmConnection.from_mapping(t) for t in BUILTIN_CONNECTION_TEMPLATES]

@@ -726,7 +726,11 @@ class GridViewWidget(QWidget):
     # --- ADDED: Cleanup slot for when the dialog is closed ---
     @Slot()
     def _on_image_viewer_closed(self):
+        # REQ-5.6 / R6-1: 参照を落とすだけでなく破棄する（pixmap を保持し続けない）。
+        dialog = self._image_viewer_dialog
         self._image_viewer_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
 
 
     # ... (rest of the file is unchanged) ...

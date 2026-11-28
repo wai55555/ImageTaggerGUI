@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import copy
+
 from typing import Callable
 
 from PySide6.QtCore import QThread, Slot
@@ -235,22 +237,42 @@ class ProfileEditorDialog(QDialog):
             # An unchanged persisted binding was catalog-validated when it was
             # created. Discovery is process-local, so requiring it again after a
             # restart would make an otherwise untouched profile impossible to save.
-            if mid != original_mid and not vlm_models.is_vlm_model_id(probe, prov, mid):
-                QMessageBox.warning(
-                    self, self.windowTitle(),
-                    self._t("Vlm", "ProfileEdit_Model_Not_Vlm", provider=prov, model=mid))
-                return
-            bindings[prov] = {"model_id": mid, "vlm_capable": True}
+            if mid != original_mid:
+                if not vlm_models.is_vlm_model_id(probe, prov, mid):
+                    QMessageBox.warning(
+                        self, self.windowTitle(),
+                        self._t("Vlm", "ProfileEdit_Model_Not_Vlm", provider=prov, model=mid))
+                    return
+                # カタログで VLM と確認できた（= 証明できた）ときだけ永続化する。
+                capable = True
+            elif "vlm_capable" in original:
+                # REQ-5.2 / R24-2: 変更の無い行は、記録済みの証明だけを引き継ぐ。
+                # 明示的に False（未証明）の binding を保存のついでに昇格させない。
+                capable = bool(original.get("vlm_capable"))
+            else:
+                # フラグ導入前の既存 binding は作成時にカタログ検証済み（NFR-2 互換）。
+                capable = True
+            bindings[prov] = {"model_id": mid, "vlm_capable": capable}
         if not bindings:
             QMessageBox.warning(self, self.windowTitle(), self._t("Vlm", "ProfileEdit_Need_Route"))
             return
         pid = self._src.get("profile_id") or vlm_config.new_profile_id(name)
-        self._result = {
+        # REQ-5.1 / R4-9: 読み込んだ dict への差分適用。表示していないキー
+        # （family / base_model / aliases 等）と、行の無いプロバイダの binding を残す。
+        result = copy.deepcopy(self._src) if self._src else {}
+        merged_bindings = dict(src_bindings)
+        for prov in list(merged_bindings):
+            row = self._rows.get(prov)
+            if row is not None and not row["inc"].isChecked():
+                merged_bindings.pop(prov, None)   # 利用者が外した行だけ消す
+        merged_bindings.update(bindings)
+        result.update({
             "profile_id": pid,
             "display_name": name,
             "canonical_model_id": self.canon_edit.text().strip() or name,
-            "bindings": bindings,
-        }
+            "bindings": merged_bindings,
+        })
+        self._result = result
         self.accept()
 
     def result_profile(self) -> dict | None:

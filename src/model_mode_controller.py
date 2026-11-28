@@ -26,12 +26,19 @@ class ModelModeController:
     def __init__(self, main_window: "MainWindow") -> None:
         self.mw = main_window
 
-    def on_model_changed(self, entry: ModelEntry) -> None:
+    def on_model_changed(self, entry: ModelEntry, *, seed_defaults: bool = True) -> None:
+        """Apply the model's UI state.
+
+        `seed_defaults=False` は「モデルは変わっていないが表示だけ切り替える」経路
+        （VLM トグルの ON/OFF）用。カテゴリ既定値や captioner の既定タスクを
+        再シード＆永続化しない（REQ-5.10 / R33-1）。
+        """
         write_debug_log(f"ModelModeController: switching to model_id={entry.model_id} ({entry.model_type})")
         self._apply_character_ui_visibility(entry)
         self._reload_translation_map()
-        self._apply_threshold_defaults(entry)
-        self._apply_model_type_ui(entry)
+        if seed_defaults:
+            self._apply_threshold_defaults(entry)
+        self._apply_model_type_ui(entry, seed_defaults=seed_defaults)
         self.mw._check_model_status_and_update_ui()
 
     def _apply_character_ui_visibility(self, entry: ModelEntry) -> None:
@@ -94,18 +101,27 @@ class ModelModeController:
         threshold_touched = app_settings.parse_touched(thresholds.touched)
         limit_touched = app_settings.parse_touched(limits.touched)
 
+        changed = False
         for category in categories:
             if not hasattr(thresholds, category):
                 continue
             if category not in threshold_touched:
-                setattr(thresholds, category, self._model_default_threshold(ui_cfg, category))
+                value = self._model_default_threshold(ui_cfg, category)
+                if getattr(thresholds, category) != value:
+                    setattr(thresholds, category, value)
+                    changed = True
             if category not in limit_touched:
-                setattr(limits, category, self._model_default_limit(ui_cfg, category))
+                value = self._model_default_limit(ui_cfg, category)
+                if getattr(limits, category) != value:
+                    setattr(limits, category, value)
+                    changed = True
 
         self.mw._sync_settings_sliders()
-        self.mw.save_current_config()
+        # REQ-5.5 / R9-3: 実際に変わったときだけ保存する（毎回の無条件保存をやめる）。
+        if changed:
+            self.mw.save_current_config()
 
-    def _apply_model_type_ui(self, entry: ModelEntry) -> None:
+    def _apply_model_type_ui(self, entry: ModelEntry, *, seed_defaults: bool = True) -> None:
         """design.md 8.5節 / spec.md 8.3節: switch the tag-button grid <-> caption text editor,
         and hide tag-only bulk-edit/Undo controls that make no sense for free-text captions.
 
@@ -175,10 +191,11 @@ class ModelModeController:
         # どこにも無い）。「そのファイルに書くか」を決めるだけで、実際の組み合わせ方は
         # caption placement が担当するため（combine_caption）、特別扱いは不要。
 
-        if model_is_captioner:
+        if model_is_captioner and seed_defaults:
             # Default to the model's verbose task (MORE_DETAILED_CAPTION) on every switch
             # to a captioner - the shorter caption levels are rarely what's wanted
             # (2026-08-31 user decision). The user can still pick another level per session.
+            # REQ-5.10 / R33-1: モデルが変わっていない経路（VLM トグル）では触らない。
             default_task = config_mapping(entry.config, "captioner").get("default_task", "MORE_DETAILED_CAPTION")
             if mw.settings.caption.task != default_task:
                 mw.settings.caption.task = default_task

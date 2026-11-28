@@ -21,10 +21,12 @@ from PySide6.QtWidgets import (
 )
 
 import vlm_config
+import vlm_connections
 import vlm_models
 import vlm_profiles
 import vlm_secrets
 import app_settings
+from utils import write_debug_log
 from custom_connection_dialog import CustomConnectionDialog
 from vlm_connections import ConnectionKind, VlmConnection
 from vlm_diagnostics import DiagStatus, format_report_lines, status_label
@@ -90,20 +92,8 @@ _DIALOG_MIN_WIDTH = 520
 _DIALOG_MIN_HEIGHT = 400
 _SCREEN_MARGIN = 80
 
-_BUILTIN_SECRET_REF = {
-    "builtin-gemini": "vlm/gemini/api_key",
-    "builtin-openrouter": "vlm/openrouter/api_key",
-    "builtin-cloudflare": "vlm/cloudflare/api_token",
-    "builtin-groq": "vlm/groq/api_key",
-    "builtin-nvidia": "vlm/nvidia/api_key",
-    # "builtin-mistral": "vlm/mistral/api_key",  # Pixtral内蔵経路は一時停止
-    "builtin-huggingface": "vlm/huggingface/api_token",
-    "builtin-vercel": "vlm/vercel/api_key",
-    "builtin-openai": "vlm/openai/api_key",
-    "builtin-anthropic": "vlm/anthropic/api_key",
-    # "builtin-ovhcloud": "vlm/ovhcloud/api_key",
-}
-
+# REQ-5.9 / R18-7: 正本は vlm_connections.BUILTIN_SECRET_REFS（二重定義しない）。
+_BUILTIN_SECRET_REF = vlm_connections.BUILTIN_SECRET_REFS
 # 各サービスの「APIキー取得ページ」。key_url が直接キー作成ページ、login_url は
 # 未ログイン時に案内する入口。instructions_key は locale の説明文キー。
 _PROVIDER_KEY_INFO = {
@@ -969,7 +959,12 @@ class VlmSettingsDialog(QDialog):
         _select(self.sentence_combo, self._vlm.sentence_mode)
         _select(self.charname_combo, self._vlm.character_name_mode)
         _select(self.markdown_combo, self._vlm.markdown)
-        _select(self.language_combo, self._vlm.language or "en")
+        # REQ-5.8 / R5-6: ダイアログが知らない言語（手編集された値）は、選択肢に
+        # 足して往復させる。保存のついでに "en" へ戻さない。
+        _wanted_language = self._vlm.language or "en"
+        if self.language_combo.findData(_wanted_language) < 0:
+            self.language_combo.addItem(str(_wanted_language), _wanted_language)
+        _select(self.language_combo, _wanted_language)
         self.max_tokens.setValue(int(self._vlm.max_output_tokens))
         self._on_prompt_mode_changed()
         # 経路行の有効状態は _rebuild_routes -> _apply_route_states で反映済み。
@@ -1068,11 +1063,52 @@ class VlmSettingsDialog(QDialog):
             idx = self.custom_select.findData(self._vlm.selected_connection_id)
             if idx >= 0:
                 self.custom_select.setCurrentIndex(idx)
+            else:
+                # REQ-5.8 / R7-11: 一覧に無い id を先頭項目へ黙って差し替えない。
+                # 選択なしのままにし、保存時に検証で止める（利用者に明示される）。
+                self.custom_select.setCurrentIndex(-1)
+
+    def _snapshot_secret(self, *connections: dict | None) -> None:
+        """REQ-5.3 / R4-3: 子ダイアログが keyring へ書く前の値を控える。
+
+        親をキャンセルしたら元へ戻せるようにする（子の OK 時点で確定した鍵が
+        親のキャンセルで宙に浮く不整合を防ぐ）。
+        """
+        if not hasattr(self, "_secret_snapshots"):
+            self._secret_snapshots: dict[str, tuple[str | None, bool]] = {}
+        for connection in connections:
+            if not isinstance(connection, dict):
+                continue
+            auth = connection.get("auth")
+            ref = str(auth.get("secret_ref") or "") if isinstance(auth, dict) else ""
+            if not ref or ref in self._secret_snapshots:
+                continue
+            self._secret_snapshots[ref] = (
+                vlm_secrets.get_secret(ref),
+                vlm_secrets.secret_status(ref) == "keyring",
+            )
+
+    def _restore_touched_secrets(self) -> None:
+        """キャンセル時に、子ダイアログが触った secret_ref を元へ戻す（R4-3）。"""
+        for ref, (value, persisted) in getattr(self, "_secret_snapshots", {}).items():
+            try:
+                if value is None:
+                    vlm_secrets.delete_secret(ref)
+                else:
+                    vlm_secrets.set_secret(ref, value, persist=persisted)
+            except Exception as e:  # noqa: BLE001 - 後始末は失敗しても続行する
+                write_debug_log(f"vlm settings: could not restore secret {ref}: {e}")
+        self._secret_snapshots = {}
 
     def _add_custom(self) -> None:
         dlg = CustomConnectionDialog(self._t, None, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_connection():
-            self._custom_connections.append(dlg.result_connection())
+        added = None
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            added = dlg.result_connection()
+        if added:
+            # REQ-5.3 / R4-3: 親の確定前に keyring へ入るので、直前の状態を控える。
+            self._snapshot_secret(added)
+            self._custom_connections.append(added)
             self._refresh_custom_list()
 
     def _edit_custom(self) -> None:
@@ -1083,8 +1119,12 @@ class VlmSettingsDialog(QDialog):
         if current is None:
             return
         dlg = CustomConnectionDialog(self._t, current, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_connection():
+        updated = None
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             updated = dlg.result_connection()
+        if updated:
+            # REQ-5.3 / R4-3: 変更前の secret を控えておく（キャンセルで戻す）。
+            self._snapshot_secret(current, updated)
             self._custom_connections = [updated if c["connection_id"] == cid else c
                                         for c in self._custom_connections]
             self._refresh_custom_list()
@@ -1307,18 +1347,6 @@ class VlmSettingsDialog(QDialog):
             QMessageBox.warning(self, self._t("Vlm", "Settings_Exec_Mode"),
                                 self._t("Vlm", "Settings_Custom_Select_Required"))
             return
-        v.model_profile_id = self.profile_combo.currentData() or v.model_profile_id
-        v.execution_mode = "custom_single" if custom_mode else "builtin_fallback"
-        v.selected_connection_id = (
-            (selected_custom_id or "") if custom_mode else v.selected_connection_id)
-        v.strict_identity = self.strict_check.isChecked()
-        v.prompt_mode = self.prompt_mode_combo.currentData() or "standard"
-        v.detail_level = self.detail_combo.currentData()
-        v.sentence_mode = self.sentence_combo.currentData()
-        v.character_name_mode = self.charname_combo.currentData()
-        v.markdown = self.markdown_combo.currentData()
-        v.language = self.language_combo.currentData() or "en"
-        v.max_output_tokens = int(self.max_tokens.value())
         # 経路の順序＝有効集合。▲▼ で決めた self._route_order のうち、有効チェックが
         # 入っている provider だけを、その順で connection_order に書く。
         enabled_providers = [self._route_rows[cid]["conn"].provider_id
@@ -1328,16 +1356,39 @@ class VlmSettingsDialog(QDialog):
             QMessageBox.warning(self, self._t("Vlm", "Settings_Routes"),
                                 self._t("Vlm", "Settings_Route_Select_Required"))
             return
+
+        # REQ-5.3 / R7-10・R11-9: 検証が全て通るまで共有オブジェクトを変更しない。
+        # 変更はすべてローカルの pending に溜め、保存成功時にだけ適用する。
+        pending = {
+            "model_profile_id": self.profile_combo.currentData() or v.model_profile_id,
+            "execution_mode": "custom_single" if custom_mode else "builtin_fallback",
+            "selected_connection_id": (
+                (selected_custom_id or "") if custom_mode else v.selected_connection_id),
+            "strict_identity": self.strict_check.isChecked(),
+            "prompt_mode": self.prompt_mode_combo.currentData() or "standard",
+            "detail_level": self.detail_combo.currentData(),
+            "sentence_mode": self.sentence_combo.currentData(),
+            "character_name_mode": self.charname_combo.currentData(),
+            "markdown": self.markdown_combo.currentData(),
+            "language": self.language_combo.currentData() or "en",
+            "max_output_tokens": int(self.max_tokens.value()),
+        }
         if enabled_providers:
-            v.connection_order = ",".join(enabled_providers)
+            pending["connection_order"] = ",".join(enabled_providers)
         # API キーは「APIキー登録」ボタン経由で即時保存されるので、ここでは扱わない。
 
+        before = {name: getattr(v, name) for name in pending}
+        for name, value in pending.items():
+            setattr(v, name, value)
         saved = vlm_config.save_settings_transaction(
             self._custom_connections,
             config_path=app_settings.CONFIG_PATH,
             save_config_callback=lambda: app_settings.save_config(self._settings),
         )
         if not saved:
+            # ファイル側はトランザクションが巻き戻す。メモリ側も同じ状態へ戻す。
+            for name, value in before.items():
+                setattr(v, name, value)
             QMessageBox.critical(self, self._t("Vlm", "Settings_Title"),
                                  self._t("Vlm", "Settings_Save_Failed"))
             return
@@ -1348,7 +1399,9 @@ class VlmSettingsDialog(QDialog):
         """Close/Cancelでダイアログだけの変更を元へ戻す。
 
         APIキー登録・接続確認は即時保存の操作なので、その結果を保持する。
+        REQ-5.3 / R4-3: 子ダイアログが keyring へ書いた分は、ここで元へ戻す。
         """
+        self._restore_touched_secrets()
         immediate = {"verified_bindings", "cloudflare_account_id", "anthropic_workspace_id"}
         ordered_profiles = vlm_config.all_profiles()
         valid_profile_ids = {p.profile_id for p in ordered_profiles}

@@ -1,6 +1,7 @@
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Protocol
+import copy
 import functools
 import sys
 import time
@@ -325,6 +326,9 @@ class MainWindow(QMainWindow):
         # Set True while pushing model-default / dialog values into the main sliders so
         # their valueChanged handler doesn't mis-flag those as user edits ("touched").
         self._suppress_slider_touch: bool = False
+        # True の間はスライダーの値変更で設定を保存しない（プログラム的同期。
+        # REQ-5.5 / R7-6）。
+        self._suppress_slider_save: bool = False
         # False while a download/tagging run holds the UI lock; consulted by
         # _update_undo_redo_buttons so a mid-run action push cannot re-enable Undo.
         self._controls_enabled: bool = True
@@ -1081,8 +1085,9 @@ class MainWindow(QMainWindow):
         write_debug_log(f"use_vlm -> {checked}")
         self.vlm_settings_button.setVisible(checked)
         self.vlm_single_test_button.setVisible(checked)
-        # タグ欄 <-> テキスト欄など UI 表示を更新。
-        self._model_mode.on_model_changed(self._current_model_entry())
+        # タグ欄 <-> テキスト欄など UI 表示を更新。モデル自体は変わっていないので、
+        # カテゴリ既定値や captioner の既定タスクを再シード＆永続化しない（R33-1）。
+        self._model_mode.on_model_changed(self._current_model_entry(), seed_defaults=False)
 
     def _on_use_gpu_toggled(self, checked: bool):
         """タガーの実行プロバイダーをGPU(CUDA)/CPUで切り替える。「VLM接続を使う」行の
@@ -1135,7 +1140,7 @@ class MainWindow(QMainWindow):
         self._update_ui_for_processing(True, 'tagging')
         self._tagger_thread = QThread()
         self._tagger_worker = VlmCaptionWorker(
-            self.settings, self._make_decision_requester(), self.locale_manager.get_string,
+            self._settings_snapshot(), self._make_decision_requester(), self.locale_manager.get_string,
             selected_file_path=selected_path, single_test=True)
         self._tagger_worker.moveToThread(self._tagger_thread)
         self._tagger_worker.log_message.connect(self.update_log)
@@ -1220,9 +1225,24 @@ class MainWindow(QMainWindow):
         self.display_current_tag_page()
         self._build_tag_cache()
 
+    def _tag_display_grid_dims(self) -> tuple[int, int]:
+        """タグ表示の (cols, rows)。config.ini の不正値（0 以下）でも落ちない（R28-1）。
+
+        読み側の意味は変えない（正の値はそのまま）。0 以下のときだけ既定へ倒す。
+        """
+        window = self.settings.window
+        cols = window.tag_display_cols if isinstance(window.tag_display_cols, int) else 0
+        rows = window.tag_display_rows if isinstance(window.tag_display_rows, int) else 0
+        if cols <= 0:
+            window.tag_display_cols = 5
+        if rows <= 0:
+            window.tag_display_rows = 6
+        return max(1, window.tag_display_cols), max(1, window.tag_display_rows)
+
     def _get_image_tags_per_page(self) -> int:
         """Returns the number of tags to display per page for the current image."""
-        return max(1, self.settings.window.tag_display_cols * self.settings.window.tag_display_rows)
+        cols, rows = self._tag_display_grid_dims()
+        return max(1, cols * rows)
 
     def _get_total_image_tag_pages(self) -> int:
         """Returns the total number of tag pages for the current image."""
@@ -1303,7 +1323,7 @@ class MainWindow(QMainWindow):
             button.deleteLater()
         self.tag_buttons_for_image.clear()
 
-        cols = self.settings.window.tag_display_cols
+        cols, _rows = self._tag_display_grid_dims()
         tags_per_page = self._get_image_tags_per_page()
 
         total_tags = len(self._current_image_tags)
@@ -1879,6 +1899,11 @@ class MainWindow(QMainWindow):
                 # _start_download_thread() logs "Starting_Model_Download" itself.
                 self._start_download_thread()
 
+    def _settings_snapshot(self):
+        """REQ-5.4 / R8-3: 実行中の UI 変更が走行中バッチへ混入しないよう、
+        開始時点の設定の複製をワーカーへ渡す（次回開始から新しい値が効く）。"""
+        return copy.deepcopy(self.settings)
+
     def _start_tagging_thread(self):
         """Initializes and starts the TaggerThreadWorker."""
         if self._is_processing():
@@ -1921,18 +1946,19 @@ class MainWindow(QMainWindow):
         failed_paths = list(self._batch_failed_paths)
 
         self._tagger_thread = QThread()
+        snapshot = self._settings_snapshot()
         if use_vlm:
             self._tagger_worker = VlmCaptionWorker(
-                self.settings, self._make_decision_requester(), self.locale_manager.get_string,
+                snapshot, self._make_decision_requester(), self.locale_manager.get_string,
                 selected_file_path=selected_path, failed_paths=failed_paths)
             self._tagger_worker.single_test_result.connect(self._on_vlm_single_test_result)
             self._tagger_worker.binding_verified.connect(self._on_vlm_binding_verified)
             self._tagger_thread.started.connect(self._tagger_worker.run_captioning)
         elif is_captioner:
-            self._tagger_worker = CaptionerThreadWorker(self.settings, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
+            self._tagger_worker = CaptionerThreadWorker(snapshot, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
             self._tagger_thread.started.connect(self._tagger_worker.run_captioning)
         else:
-            self._tagger_worker = TaggerThreadWorker(self.settings, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
+            self._tagger_worker = TaggerThreadWorker(snapshot, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
             self._tagger_thread.started.connect(self._tagger_worker.run_tagging)
         self._tagger_worker.moveToThread(self._tagger_thread)
 
@@ -2464,9 +2490,14 @@ class MainWindow(QMainWindow):
                     # A hand move marks the category "touched" so a later model switch
                     # won't overwrite it with that model's default (see _apply_threshold_defaults).
                     s.touched = app_settings.add_touched(s.touched, k)
-                self.save_current_config() # Save settings whenever a slider value changes
+                # REQ-5.5 / R7-6: つまみ 1 目盛りごとに全設定を書かない。保存は
+                # ドラッグ完了後にまとめる（プログラム的同期ではそもそも呼ばない）。
+                if not self._suppress_slider_save:
+                    self._save_config_soon()
 
             slider.valueChanged.connect(update_value)
+            # ドラッグ完了時（キーボード操作は valueChanged 側）に確定保存する。
+            slider.sliderReleased.connect(self.save_current_config)
 
             layout.addWidget(label, row_index, 0)
             layout.addWidget(slider, row_index, 1)
@@ -2480,10 +2511,20 @@ class MainWindow(QMainWindow):
         cats_set = set(cats)
         return [c for c in app_settings.TAG_CATEGORY_NAMES if c in cats_set]
 
+    def _save_config_soon(self) -> None:
+        """スライダー操作の保存をまとめる（既定 400ms。REQ-5.5 / R7-6）。"""
+        if not hasattr(self, "_config_save_timer"):
+            self._config_save_timer = QTimer(self)
+            self._config_save_timer.setSingleShot(True)
+            self._config_save_timer.setInterval(400)
+            self._config_save_timer.timeout.connect(self.save_current_config)
+        self._config_save_timer.start()
+
     def _sync_settings_sliders(self):
         """Refresh the four main-window sliders (general/character threshold & max) from
         self.settings without their valueChanged handler flagging them as user-touched."""
         self._suppress_slider_touch = True
+        self._suppress_slider_save = True
         try:
             for key, (slider, value_label) in self._sliders.items():
                 section_name, cat = key.split('_', 1)
@@ -2494,6 +2535,7 @@ class MainWindow(QMainWindow):
                 value_label.setText(f"{value:.2f}" if is_float else str(int(value)))
         finally:
             self._suppress_slider_touch = False
+            self._suppress_slider_save = False
 
     @Slot()
     def _open_category_settings_dialog(self):
@@ -2810,8 +2852,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _image_viewer_dialog_closed(self):
-        """Slot to clean up the reference to the image viewer dialog when it closes."""
+        """Slot to clean up the reference to the image viewer dialog when it closes.
+
+        REQ-5.6 / R6-1: 参照を落とすだけでなく破棄する（閉じるたびに親の子として
+        残り、フル解像度 pixmap を抱えたまま蓄積していた）。順序を制御するため
+        WA_DeleteOnClose ではなく finished 起点で deleteLater する。
+        """
+        dialog = self._image_viewer_dialog
         self._image_viewer_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
 
     @Slot()
     def _show_grid_view(self):
@@ -2927,6 +2977,9 @@ class MainWindow(QMainWindow):
 
         msg.exec()
         clicked = msg.clickedButton()
+        # REQ-5.6 / R20-3: ファイルごとに作るので、使い終わったら破棄する
+        # （親の子として残り続け、大量ファイルで蓄積していた）。
+        msg.deleteLater()
 
         if clicked == btn_yes_all:
             self._session_mode_override = ExistingFileMode.OVERWRITE

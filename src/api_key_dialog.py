@@ -326,7 +326,11 @@ class ApiKeyDialog(QDialog):
             self._show_service_warning(msg)
             self.accept()
             return
-        if model_warn:
+        if model_warn and not getattr(self, "_pending_key_is_new", True):
+            # REQ-5.11 / R9-1: 既存キーの再確認では何も保存していないのに
+            # 「セッションに保存した」と名乗らない（警告文を実態に合わせる）。
+            msg = self._t("Vlm", "ApiKey_Model_Warning_Existing", detail=model_warn)
+        elif model_warn:
             where = self._t("Vlm", "ApiKey_Stored_Keyring" if persisted else "ApiKey_Stored_Session")
             msg = self._t("Vlm", "ApiKey_Saved_Model_Warning", where=where, detail=model_warn)
         else:
