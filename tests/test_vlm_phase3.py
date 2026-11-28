@@ -10,17 +10,9 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-# isolate config.ini: test_settings_dialog_roundtrip calls VlmSettingsDialog._on_save,
-# which persists via save_config(). Without this it overwrites the real config.ini.
-import app_settings as _A
-_A.CONFIG_PATH = Path(tempfile.mkdtemp()) / "config.ini"
-import constants as _C
-_C.CONFIG_PATH = _A.CONFIG_PATH
-# isolate vlm_connections.json / vlm_profiles.json too (the dialog reads/writes them).
-import vlm_config as _VC
-_vcdir = Path(tempfile.mkdtemp())
-_VC.VLM_CONNECTIONS_PATH = _vcdir / "vlm_connections.json"
-_VC.VLM_PROFILES_PATH = _vcdir / "vlm_profiles.json"
+# config.ini / vlm_connections.json / vlm_profiles.json の隔離は tests/conftest.py が
+# 全テストに autouse fixture で与える（REQ-1.1）。ここで import 時にモジュール定数を
+# 書き換えると、その値が pytest セッション全体へ漏れて順序依存の温床になる。
 
 from PySide6.QtWidgets import QApplication
 from PIL import Image
@@ -356,19 +348,19 @@ def test_custom_connection_persists_routes_and_executes(monkeypatch):
     assert raw["auth"]["type"] == "bearer"
     assert "api_key" not in raw
     assert stored_secret[raw["auth"]["secret_ref"]] == "LOCALKEY"
-    assert _VC.save_custom_connections([raw]) is True
+    assert vlm_config.save_custom_connections([raw]) is True
 
-    loaded = _VC.load_custom_connections()
+    loaded = vlm_config.load_custom_connections()
     assert loaded == [raw]
     settings = A.load_settings(A.get_default_config())
     settings.vlm.execution_mode = "custom_single"
     settings.vlm.selected_connection_id = raw["connection_id"]
-    connections = _VC.build_connection_map(settings.vlm, M.GEMMA_4_31B_IT)
+    connections = vlm_config.build_connection_map(settings.vlm, M.GEMMA_4_31B_IT)
     conn = connections[raw["connection_id"]]
     assert conn.kind is ConnectionKind.CUSTOM_LOCAL
     assert conn.model_id == "local-gemma-vision"
 
-    policy = _VC.build_router_policy(settings.vlm)
+    policy = vlm_config.build_router_policy(settings.vlm)
     candidates = select_candidates(
         M.GEMMA_4_31B_IT, connections, policy,
         has_auth={raw["connection_id"]: True})

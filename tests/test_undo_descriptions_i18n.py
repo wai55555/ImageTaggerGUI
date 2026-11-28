@@ -21,7 +21,9 @@ import app_settings
 import undo_manager as U
 from locale_manager import LocaleManager
 
-LANGS = ["en", "ja", "de", "es", "fr", "ko", "ru", "zh_CN", "zh_TW"]
+LANGS = sorted(path.stem for path in (ROOT / "lang").glob("*.ini"))
+# R11-7: 言語一覧は lang/*.ini の走査から得る（テスト側にハードコードしない）。
+assert LANGS, "lang/*.ini が見つからない"
 
 # 日本語（ひらがな・カタカナ・漢字）。コメント／docstring は日本語のままで良いので、
 # 判定は description() の戻り値に対してだけ行う。

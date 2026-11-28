@@ -265,8 +265,15 @@ def test_req_a3_bundled_manifests_all_build(tmp_path):
     # PixAI v0.9 はディスク上の model_config.json を持たない疑似エントリだが、
     # 同じ検証を通ること（同梱10モデル ＝ マニフェスト9件 ＋ 疑似エントリ1件）。
     assert tagging_core.build_inference_config(model_registry._PIXAI_CONFIG).layout == "nchw"
-    assert len(_bundled_manifest_paths()) == 9
-    assert len(configs) + 2 == 10
+    # REQ-1.7: 件数（9/10）を直書きしない。カタログの増減に追随できるよう、
+    # ディスク上のマニフェストと擬似エントリの整合で固定する。
+    manifest_ids = [json.loads(path.read_text(encoding="utf-8"))["model_id"]
+                    for path in _bundled_manifest_paths()]
+    assert manifest_ids, "同梱マニフェストが見つからない"
+    assert len(manifest_ids) == len(set(manifest_ids)), f"model_id が重複している: {manifest_ids}"
+    assert model_registry._PIXAI_MODEL_ID not in manifest_ids, "擬似エントリと ID が衝突"
+    discovered = {entry.model_id for entry in model_registry.discover_models()}
+    assert discovered <= {model_registry._PIXAI_MODEL_ID, *manifest_ids}, discovered
 
 
 # --- REQ-A4: ONNX ファイル名の正本 ------------------------------------------------

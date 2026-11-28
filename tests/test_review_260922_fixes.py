@@ -8,7 +8,6 @@ Offline only - no network. Run:  rtk pytest tests/test_review_260922_fixes.py -q
 """
 import os
 import sys
-import types
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,18 +22,15 @@ _APP = QApplication.instance() or QApplication([])
 
 
 def _vlm_settings(profile_id="gemma-4-31b-it", connection_order="gemini,openai"):
-    """config.ini を触らずに VlmSettings 相当を組み立てる。"""
-    s = types.SimpleNamespace(
-        model_profile_id=profile_id, cloudflare_account_id="", anthropic_workspace_id="",
-        verified_bindings="", model_id_overrides="", vlm_capable_overrides="",
-        connection_order=connection_order)
-    s.verified_set = lambda: {t.strip() for t in s.verified_bindings.split(",") if t.strip()}
-    s.order_list = lambda: [p for p in s.connection_order.split(",") if p]
-    s.model_id_override_map = lambda: {
-        k.strip(): v.strip()
-        for k, _, v in (t.partition("=") for t in s.model_id_overrides.split(","))
-        if k.strip() and v.strip()}
-    return s
+    """config.ini を触らずに、本物の Vlm 設定 dataclass を組み立てる（REQ-1.8）。
+
+    order_list / verified_set / model_id_override_map をテスト側で再実装すると、
+    本物のパーサが壊れてもテストが通ってしまう。
+    """
+    import app_settings
+
+    return app_settings.Vlm(model_profile_id=profile_id,
+                            connection_order=connection_order)
 
 
 # --- [P1] 退避済みスレッドの寿命 ----------------------------------------------------

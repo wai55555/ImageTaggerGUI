@@ -15,9 +15,12 @@ import pytest
 
 LANG_DIR = Path(__file__).resolve().parent.parent / "lang"
 
+# 比較対象の言語は lang/*.ini の走査から得る（R11-7。テスト側に言語一覧を
+# ハードコードしない——言語を追加したときに自動で対象へ入る）。
+# en.ini は「基準」という役割があるので、比較対象からは外して別に扱う。
+ALL_LANGS = sorted(path.stem for path in LANG_DIR.glob("*.ini"))
 BASE_LANG = "en"
-OTHER_LANGS = ["de", "es", "fr", "ja", "ko", "ru", "zh_CN", "zh_TW"]
-ALL_LANGS = [BASE_LANG] + OTHER_LANGS
+OTHER_LANGS = [lang for lang in ALL_LANGS if lang != BASE_LANG]
 
 # 意図的に許容する差異（現時点では想定なし）。
 ALLOWED_EXTRA: set[tuple[str, str, str]] = set()
@@ -49,6 +52,11 @@ def _load_ini(lang: str, problems: list[str]) -> configparser.ConfigParser | Non
 
 def test_lang_files_are_consistent_with_en():
     problems: list[str] = []
+
+    # 走査結果の健全性（空振りしていないこと）。
+    assert len(ALL_LANGS) >= 2, f"lang/*.ini が見つからない: {LANG_DIR}"
+    assert BASE_LANG in ALL_LANGS, "基準の en.ini が無い"
+    assert len(OTHER_LANGS) == len(ALL_LANGS) - 1
 
     parsed: dict[str, configparser.ConfigParser] = {}
     for lang in ALL_LANGS:

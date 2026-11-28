@@ -607,13 +607,14 @@ def test_failed_undo_and_redo_remain_retryable():
 
 
 def test_verified_binding_promotion():
-    import types
     import dataclasses
+    import app_settings as A
     import vlm_config as CFG
 
     prof_id = M.GEMMA_4_26B_A4B_IT.profile_id
-    vlm = types.SimpleNamespace(model_profile_id=prof_id, verified_bindings="",
-                                verified_set=lambda: {t.strip() for t in vlm.verified_bindings.split(",") if t.strip()})
+    # REQ-1.8: 本物の設定 dataclass を使う（verified_set 等のパースをテスト側で
+    # 再実装しない。再実装すると本物のパーサが壊れてもテストは通ってしまう）。
+    vlm = A.Vlm(model_profile_id=prof_id)
 
     # mark: adds a token, idempotent, keyed by profile:provider
     assert CFG.mark_binding_verified(vlm, "gemini", profile_id=prof_id) is True
@@ -634,7 +635,7 @@ def test_verified_binding_promotion():
 
 
 def test_multi_provider_profiles():
-    import types
+    import app_settings as A
     import vlm_config as CFG
 
     ids = {p.profile_id for p in M.default_registry().all_profiles()}
@@ -654,21 +655,10 @@ def test_multi_provider_profiles():
     assert not ({"openai-gpt-4o", "openai-gpt-4o-mini", "grok-4-3"} & ids)
 
     def _s(profile_id):
-        s = types.SimpleNamespace(model_profile_id=profile_id,
-                                  cloudflare_account_id="", verified_bindings="", model_id_overrides="")
-        s.verified_set = lambda: set()
-        s.order_list = lambda: ["gemini", "openrouter", "cloudflare"]
-
-        def _ov():
-            out = {}
-            for tok in s.model_id_overrides.split(","):
-                if "=" in tok:
-                    k, _, v = tok.strip().partition("=")
-                    if k.strip() and v.strip():
-                        out[k.strip()] = v.strip()
-            return out
-        s.model_id_override_map = _ov
-        return s
+        # REQ-1.8: order_list / model_id_override_map のパースをテスト側で
+        # 書き直さず、本物の Vlm dataclass をそのまま渡す。
+        return A.Vlm(model_profile_id=profile_id,
+                     connection_order="gemini,openrouter,cloudflare")
 
     s = _s("qwen3.8-27b")
     prof = CFG.resolve_model_profile(s)
@@ -826,20 +816,13 @@ def test_validated_override_route_is_executable_not_just_checkable():
     不一致になっていた。
     """
     import dataclasses
-    import types
+    import app_settings as A
 
     import vlm_config as CFG
 
-    settings = types.SimpleNamespace(
-        model_profile_id="gemma-4-31b-it", cloudflare_account_id="",
-        verified_bindings="", model_id_overrides="", connection_order="gemini,openai")
-    settings.verified_set = lambda: {
-        t.strip() for t in settings.verified_bindings.split(",") if t.strip()}
-    settings.order_list = lambda: [p for p in settings.connection_order.split(",") if p]
-    settings.model_id_override_map = lambda: {
-        k.strip(): v.strip()
-        for k, _, v in (tok.partition("=") for tok in settings.model_id_overrides.split(","))
-        if k.strip() and v.strip()}
+    # REQ-1.8: 本物の設定 dataclass を使う（override のパースを再実装しない）。
+    settings = A.Vlm(model_profile_id="gemma-4-31b-it",
+                     connection_order="gemini,openai")
 
     profile = CFG.resolve_model_profile(settings)
     assert profile.binding_for("openai") is None, "このプロファイルに openai binding は無い"
@@ -1023,11 +1006,8 @@ def test_vlm_only_model_guard():
     bad_profile = M.VlmModelProfile(
         profile_id="user-bad", display_name="bad", canonical_model_id="groq/compound-mini",
         bindings={"groq": M.ModelBinding("groq", "groq/compound-mini")})
-    import types
-    bad_settings = types.SimpleNamespace(
-        model_profile_id="user-bad", cloudflare_account_id="",
-        anthropic_workspace_id="", verified_bindings="", model_id_overrides="",
-        model_id_override_map=lambda: {}, order_list=lambda: ["groq"])
+    import app_settings as A
+    bad_settings = A.Vlm(model_profile_id="user-bad", connection_order="groq")
     import vlm_config as CFG
     bad_map = CFG.build_connection_map(bad_settings, bad_profile)
     assert bad_map["builtin-groq"].enabled is False
@@ -1083,69 +1063,73 @@ def test_catalog_capability_classification_covers_all_builtin_providers():
     print("  capability catalog: all enabled providers + metadata: OK")
 
 
-def test_user_defined_profiles():
-    import tempfile
+def test_user_defined_profiles(monkeypatch):
     import vlm_config as CFG
-    old = CFG.VLM_PROFILES_PATH
-    CFG.VLM_PROFILES_PATH = Path(tempfile.mkdtemp()) / "vp.json"
-    try:
-        # 22 -> 19 after removing openai-gpt-4o / openai-gpt-4o-mini / grok-4-3
-        # (older models priced the same as their newer replacements, 2026-09-22).
-        assert len(CFG.all_profiles()) == 19 and not CFG.is_user_profile("x")
 
-        CFG.save_user_profiles([{
-            "profile_id": "user-g3", "display_name": "My Gemma 3 27B",
-            "canonical_model_id": "gemma-3-27b-it",
-            "bindings": {
-                "gemini": {"model_id": "gemma-3-27b-it"},
-                "openrouter": {"model_id": "google/gemma-3-27b-it:free"},
-            }}])
-        aps = {p.profile_id: p for p in CFG.all_profiles()}
-        assert "user-g3" in aps and CFG.is_user_profile("user-g3")
-        p = aps["user-g3"]
-        assert set(p.bindings) == {"gemini", "openrouter"}
-        assert p.bindings["gemini"].identity_status is M.ModelIdentityStatus.UNKNOWN
-        assert p.bindings["gemini"].vlm_capable is True
-        # Capability persisted in a user profile remains usable even when the
-        # process-local discovered-model cache is empty after restart.
-        custom = M.VlmModelProfile(
-            profile_id="user-live", display_name="Live", canonical_model_id="vendor/new-vlm",
-            bindings={"groq": M.ModelBinding(
-                "groq", "vendor/new-vlm", vlm_capable=True)})
-        assert M.is_vlm_model_id(custom, "groq", "vendor/new-vlm")
+    # REQ-1.7: 出荷カタログの件数（19/20）を直書きしない。件数はカタログ変更ごとに
+    # 変わるので、スキーマ・整合性（ID 集合の一致・重複なし）で検証する。
+    monkeypatch.setattr(CFG, "VLM_PROFILES_PATH", Path(tempfile.mkdtemp()) / "vp.json")
+    shipped_ids = {p.profile_id for p in M.default_registry().all_profiles()}
+    shipped_now = [p.profile_id for p in CFG.all_profiles()]
+    assert len(shipped_now) == len(set(shipped_now)), "duplicate shipped profile ids"
+    assert set(shipped_now) == shipped_ids, "all_profiles() が出荷 registry とずれている"
+    assert not CFG.is_user_profile("x")
 
-        CFG.save_user_profiles([{
-            "profile_id": "user-bad-flag", "display_name": "Bad flag",
-            "canonical_model_id": "vendor/text-only",
-            "bindings": {"groq": {
-                "model_id": "vendor/text-only", "vlm_capable": "false"}},
-        }])
-        bad_flag = CFG.user_profile_objects()[0]
-        assert bad_flag.bindings["groq"].vlm_capable is False
-        assert not M.is_vlm_model_id(bad_flag, "groq", "vendor/text-only")
+    CFG.save_user_profiles([{
+        "profile_id": "user-g3", "display_name": "My Gemma 3 27B",
+        "canonical_model_id": "gemma-3-27b-it",
+        "bindings": {
+            "gemini": {"model_id": "gemma-3-27b-it"},
+            "openrouter": {"model_id": "google/gemma-3-27b-it:free"},
+        }}])
+    aps = {p.profile_id: p for p in CFG.all_profiles()}
+    assert "user-g3" in aps and CFG.is_user_profile("user-g3")
+    p = aps["user-g3"]
+    assert set(p.bindings) == {"gemini", "openrouter"}
+    assert p.bindings["gemini"].identity_status is M.ModelIdentityStatus.UNKNOWN
+    assert p.bindings["gemini"].vlm_capable is True
+    # Capability persisted in a user profile remains usable even when the
+    # process-local discovered-model cache is empty after restart.
+    custom = M.VlmModelProfile(
+        profile_id="user-live", display_name="Live", canonical_model_id="vendor/new-vlm",
+        bindings={"groq": M.ModelBinding(
+            "groq", "vendor/new-vlm", vlm_capable=True)})
+    assert M.is_vlm_model_id(custom, "groq", "vendor/new-vlm")
 
-        batch = M.VlmModelProfile(
-            profile_id="user-batch", display_name="Batch", canonical_model_id="vendor/vlm:batch",
-            bindings={"openrouter": M.ModelBinding(
-                "openrouter", "vendor/vlm:batch", vlm_capable=True)})
-        assert not M.is_vlm_model_id(batch, "openrouter", "vendor/vlm:batch")
+    CFG.save_user_profiles([{
+        "profile_id": "user-bad-flag", "display_name": "Bad flag",
+        "canonical_model_id": "vendor/text-only",
+        "bindings": {"groq": {
+            "model_id": "vendor/text-only", "vlm_capable": "false"}},
+    }])
+    bad_flag = CFG.user_profile_objects()[0]
+    assert bad_flag.bindings["groq"].vlm_capable is False
+    assert not M.is_vlm_model_id(bad_flag, "groq", "vendor/text-only")
 
-        # a user profile with the same id as a shipped one overrides it
-        CFG.save_user_profiles([
-            {"profile_id": "user-g3", "display_name": "My Gemma 3 27B",
-             "canonical_model_id": "gemma-3-27b-it",
-             "bindings": {
-                 "gemini": {"model_id": "gemma-3-27b-it"},
-                 "openrouter": {"model_id": "google/gemma-3-27b-it:free"}}},
-            {"profile_id": "gemma-4-26b-a4b-it", "display_name": "Gemma (mine)",
-             "canonical_model_id": "gemma-3-27b-it",
-             "bindings": {"gemini": {"model_id": "gemma-3-27b-it"}}},
-        ])
-        aps = {p.profile_id: p for p in CFG.all_profiles()}
-        assert aps["gemma-4-26b-a4b-it"].display_name == "Gemma (mine)"
-        assert len(CFG.all_profiles()) == 20  # 19 shipped (one overridden in place) + user-g3
-    finally:
-        CFG.VLM_PROFILES_PATH = old
+    batch = M.VlmModelProfile(
+        profile_id="user-batch", display_name="Batch", canonical_model_id="vendor/vlm:batch",
+        bindings={"openrouter": M.ModelBinding(
+            "openrouter", "vendor/vlm:batch", vlm_capable=True)})
+    assert not M.is_vlm_model_id(batch, "openrouter", "vendor/vlm:batch")
+
+    # a user profile with the same id as a shipped one overrides it
+    CFG.save_user_profiles([
+        {"profile_id": "user-g3", "display_name": "My Gemma 3 27B",
+         "canonical_model_id": "gemma-3-27b-it",
+         "bindings": {
+             "gemini": {"model_id": "gemma-3-27b-it"},
+             "openrouter": {"model_id": "google/gemma-3-27b-it:free"}}},
+        {"profile_id": "gemma-4-26b-a4b-it", "display_name": "Gemma (mine)",
+         "canonical_model_id": "gemma-3-27b-it",
+         "bindings": {"gemini": {"model_id": "gemma-3-27b-it"}}},
+    ])
+    aps = {p.profile_id: p for p in CFG.all_profiles()}
+    assert aps["gemma-4-26b-a4b-it"].display_name == "Gemma (mine)"
+    merged_ids = [p.profile_id for p in CFG.all_profiles()]
+    assert len(merged_ids) == len(set(merged_ids)), "duplicate profile ids after merge"
+    # 出荷 ID は同じ ID のユーザー定義で上書きされ（件数は増えない）、
+    # 新しい user-g3 だけが増える。
+    assert set(merged_ids) == shipped_ids | {"user-g3"}
     print("  user-defined profiles: json round-trip, merge, same-id override: OK")
 
 
