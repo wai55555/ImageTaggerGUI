@@ -28,7 +28,10 @@ from locale_manager import (
     normalize_language_code,
 )
 
-LANGS = ["en", "ja", "de", "es", "fr", "ko", "ru", "zh_CN", "zh_TW"]
+LANGS = sorted(path.stem for path in (ROOT / "lang").glob("*.ini"))
+# 言語一覧をテスト側にハードコードしない（R11-7）。lang/*.ini の走査から得た一覧と
+# アプリ側の定数が一致することは test_available_language_codes_* で別途固定している。
+assert LANGS, "lang/*.ini が見つからない"
 # 日本語（ひらがな・カタカナ・漢字）。他言語に混ざっていたらハードコード残り。
 _JA = re.compile(r"[぀-ヿ]")
 

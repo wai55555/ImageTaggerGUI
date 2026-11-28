@@ -6,22 +6,15 @@ Run:  rtk pytest tests/test_vlm_phase4_integration.py -q
 """
 import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-# isolate config.ini so MainWindow.closeEvent's save doesn't pollute the real one
-import app_settings as _A
-_A.CONFIG_PATH = Path(tempfile.mkdtemp()) / "config.ini"
-import constants as _C
-_C.CONFIG_PATH = _A.CONFIG_PATH
-import vlm_config as _VC
-_vcdir = Path(tempfile.mkdtemp())
-_VC.VLM_CONNECTIONS_PATH = _vcdir / "vlm_connections.json"
-_VC.VLM_PROFILES_PATH = _vcdir / "vlm_profiles.json"
+# config.ini / vlm_connections.json / vlm_profiles.json の隔離は tests/conftest.py が
+# 全テストに autouse fixture で与える（REQ-1.1〜1.2）。ここで import 時にモジュール定数を
+# 書き換えると、その値が pytest セッション全体へ漏れて順序依存の温床になる。
 
 import pytest
 from PySide6.QtWidgets import QApplication
@@ -552,15 +545,20 @@ def test_api_key_dialog_close_is_deferred_without_blocking(monkeypatch):
     assert dialog2.saved() is False
 
 
-def test_dotenv_loading():
+def test_dotenv_loading(monkeypatch, tmp_path):
     """A .env next to the app feeds the enabled provider keys via the env-var tier,
-    without overwriting anything already set."""
-    import importlib
+    without overwriting anything already set.
+
+    REQ-1.1 / REQ-1.3: 実 ``BASE_DIR/.env`` と実 cwd の ``.env`` を rename して退避
+    しない。``constants.BASE_DIR`` と cwd をテンポラリへ向け（``monkeypatch`` が
+    必ず戻す）、``_load_dotenv()`` を直接呼んで本来の読み込み経路を通す。
+    """
     import os
-    import shutil
+    import constants
     import vlm_secrets
-    from constants import BASE_DIR
-    d = Path(tempfile.mkdtemp())
+
+    d = tmp_path / "cwd"
+    d.mkdir()
     (d / ".env").write_text(
         'GEMINI_API_KEY=g_key\n# note\nexport MISTRAL_API_KEY="m_key"\n'
         'HF_TOKEN=hf_key\n'
@@ -568,7 +566,13 @@ def test_dotenv_loading():
         'ANTHROPIC_API_KEY=anthropic_key\n'
         'CLOUDFLARE_ACCOUNT_ID=acct-x\n',
         encoding="utf-8")
-    cwd = os.getcwd()
+    # (e) .env の探索先は BASE_DIR/.env と cwd/.env の2か所。両方ともテンポラリへ
+    # 向ける（実ファイルがあっても読まれない）。
+    empty_base = tmp_path / "app"
+    empty_base.mkdir()
+    monkeypatch.setattr(constants, "BASE_DIR", empty_base)
+    monkeypatch.chdir(d)
+
     # (d) every env name get_secret() can consult: all _ENV_ALIASES values, the
     # generic PIXAI_* fallbacks for the refs asserted below, plus the
     # CLOUDFLARE_ACCOUNT_ID asserted via os.environ directly.
@@ -577,59 +581,27 @@ def test_dotenv_loading():
         | set(vlm_secrets._env_candidates("vlm/gemini/api_key"))
         | set(vlm_secrets._env_candidates("vlm/mistral/api_key"))
         | {"CLOUDFLARE_ACCOUNT_ID"})
-    saved = {k: os.environ.pop(k, None) for k in env_keys}
-    os.environ["GROQ_API_KEY"] = "preset"
-    # (b)+(c) snapshot module state clobbered below / by the reload.
-    saved_session = dict(vlm_secrets._session_store)
-    vlm_secrets._session_store.clear()
-    saved_probe = vlm_secrets._keyring_probe
-    # (e) pin both .env candidates (vlm_secrets.py:30: BASE_DIR/.env + cwd/.env):
-    # a real file at either spot would feed real keys and shadow the temp-.env.
-    # Move each aside, restore in finally.
-    _moved = []
-    for _p in (Path(BASE_DIR) / ".env", Path(cwd) / ".env"):
-        if _p.is_file() and all(str(_p) != m[0] for m in _moved):
-            _bak = str(_p) + ".wave3t6bak"
-            shutil.move(str(_p), _bak)
-            _moved.append((str(_p), _bak))
-    # reload exercises startup loading itself; preserve the function object because
-    # importlib.reload mutates the shared module outside pytest's fixture machinery.
-    saved_get_secret = vlm_secrets.get_secret
-    os.chdir(d)
-    try:
-        importlib.reload(vlm_secrets)
-        # (a) keyring tier wins over env: force a FALSY answer so the temp-.env
-        # values show through even with a REAL key in Credential Manager.
-        # A truthy dummy stub is FORBIDDEN (it would shadow env the same way).
-        _kr = vlm_secrets.keyring
-        _orig_get = _kr.get_password if _kr is not None else None
-        if _kr is not None:
-            _kr.get_password = lambda *a, **k: None  # type: ignore[method-assign]
-        try:
-            vlm_secrets._load_dotenv()
-            assert vlm_secrets.get_secret("vlm/gemini/api_key") == "g_key"
-            assert vlm_secrets.get_secret("vlm/mistral/api_key") == "m_key"      # quotes stripped
-            assert vlm_secrets.get_secret("vlm/huggingface/api_token") == "hf_key"
-            assert vlm_secrets.get_secret("vlm/vercel/api_key") == "vercel_key"
-            assert vlm_secrets.get_secret("vlm/openai/api_key") == "openai_key"
-            assert vlm_secrets.get_secret("vlm/anthropic/api_key") == "anthropic_key"
-            assert os.environ["CLOUDFLARE_ACCOUNT_ID"] == "acct-x"
-            assert os.environ["GROQ_API_KEY"] == "preset"                        # not overwritten
-        finally:
-            if _kr is not None:
-                _kr.get_password = _orig_get  # type: ignore[method-assign]
-            vlm_secrets.get_secret = saved_get_secret
-            vlm_secrets._session_store.clear()
-            vlm_secrets._session_store.update(saved_session)
-            vlm_secrets._keyring_probe = saved_probe
-            for k in env_keys:
-                os.environ.pop(k, None)
-                if saved.get(k) is not None:
-                    os.environ[k] = saved[k]
-    finally:
-        os.chdir(cwd)
-        for _p, _bak in _moved:
-            shutil.move(_bak, _p)
+    for key in env_keys:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "preset")
+    # (b)+(c) session store is replaced for the duration of the test (never mutated in place).
+    monkeypatch.setattr(vlm_secrets, "_session_store", {})
+
+    # (a) keyring tier wins over env: force a FALSY answer so the temp-.env
+    # values show through even with a REAL key in Credential Manager.
+    # A truthy dummy stub is FORBIDDEN (it would shadow env the same way).
+    if vlm_secrets.keyring is not None:
+        monkeypatch.setattr(vlm_secrets.keyring, "get_password", lambda *a, **k: None)
+
+    vlm_secrets._load_dotenv()
+    assert vlm_secrets.get_secret("vlm/gemini/api_key") == "g_key"
+    assert vlm_secrets.get_secret("vlm/mistral/api_key") == "m_key"      # quotes stripped
+    assert vlm_secrets.get_secret("vlm/huggingface/api_token") == "hf_key"
+    assert vlm_secrets.get_secret("vlm/vercel/api_key") == "vercel_key"
+    assert vlm_secrets.get_secret("vlm/openai/api_key") == "openai_key"
+    assert vlm_secrets.get_secret("vlm/anthropic/api_key") == "anthropic_key"
+    assert os.environ["CLOUDFLARE_ACCOUNT_ID"] == "acct-x"
+    assert os.environ["GROQ_API_KEY"] == "preset"                        # not overwritten
     print("  .env loading: enabled provider aliases, quotes/export handled, preset wins: OK")
 
 
@@ -669,7 +641,7 @@ def test_lang_files_parse_and_expose_vlm_keys():
     print("  lang/*.ini parse; [Vlm] mode/apikey/option keys present: OK")
 
 
-def test_keyring_available_needs_a_real_backend():
+def test_keyring_available_needs_a_real_backend(monkeypatch):
     """import keyring succeeding is not enough - a 'fail' backend (priority<=0)
     must report unavailable, or the key dialog lies about OS storage."""
     import types
@@ -687,17 +659,15 @@ def test_keyring_available_needs_a_real_backend():
         def get_password(self, *a):
             return None
 
-    orig_kr, orig_probe = vs.keyring, vs._keyring_probe
-    try:
-        for backend, expected in ((_FailKR(), False), (_RealKR(), True)):
-            vs._keyring_probe = None
-            vs.keyring = types.SimpleNamespace(get_keyring=lambda b=backend: b)
-            assert vs.keyring_available() is expected, (type(backend).__name__, expected)
-        vs._keyring_probe = None
-        vs.keyring = None
-        assert vs.keyring_available() is False
-    finally:
-        vs.keyring, vs._keyring_probe = orig_kr, orig_probe
+    # REQ-1.1: 手動の退避ではなく monkeypatch で差し替える（失敗しても必ず戻る）。
+    monkeypatch.setattr(vs, "_keyring_probe", None)
+    for backend, expected in ((_FailKR(), False), (_RealKR(), True)):
+        monkeypatch.setattr(vs, "keyring",
+                            types.SimpleNamespace(get_keyring=lambda b=backend: b))
+        assert vs.keyring_available() is expected, (type(backend).__name__, expected)
+        monkeypatch.setattr(vs, "_keyring_probe", None)
+    monkeypatch.setattr(vs, "keyring", None)
+    assert vs.keyring_available() is False
     print("  keyring_available(): fail-backend -> False, real -> True, no module -> False: OK")
 
 
