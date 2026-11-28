@@ -244,9 +244,27 @@ _ATOMIC_WRITE_MODULES = [
 
 @pytest.mark.parametrize("module_name", _ATOMIC_WRITE_MODULES)
 def test_non_vlm_sites_do_not_override_newline(module_name):
-    """非 VLM 経路は `newline` を渡さない（＝open() 既定＝現行の直接書きと同じ翻訳）。"""
+    """非 VLM 経路は `newline` を渡さない（＝open() 既定＝現行の直接書きと同じ翻訳）。
+
+    例外は `undo_manager._FileSnapshotAction._write` だけ（REQ-B3）。Undo/Redo の
+    全文スナップショットは、アクション生成時に検出した改行規約で書き戻さないと
+    Windows で LF のファイルが CRLF へ化ける。他の undo/redo 書き戻し（8 箇所）は
+    従来どおり `newline` を渡さない。
+    """
     source_path = Path(text_io.__file__).with_name(f"{module_name}.py")
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    allowed_newline_calls: set[int] = set()
+    if module_name == "undo_manager":
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "_FileSnapshotAction":
+                for member in node.body:
+                    if isinstance(member, ast.FunctionDef) and member.name == "_write":
+                        for inner in ast.walk(member):
+                            if (isinstance(inner, ast.Call)
+                                    and getattr(inner.func, "id", None) == "atomic_write_text"):
+                                allowed_newline_calls.add(id(inner))
+
     calls = [
         node
         for node in ast.walk(tree)
@@ -254,7 +272,9 @@ def test_non_vlm_sites_do_not_override_newline(module_name):
     ]
     assert calls, f"{module_name}: atomic_write_text 呼び出しが見つからない"
     for call in calls:
-        assert not [kw for kw in call.keywords if kw.arg == "newline"], (
+        if not [kw for kw in call.keywords if kw.arg == "newline"]:
+            continue
+        assert id(call) in allowed_newline_calls, (
             f"{module_name}:{call.lineno}: 非 VLM 経路で newline を上書きしてはならない"
         )
 

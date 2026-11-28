@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
 import constants
-from text_io import atomic_write_text
+from text_io import atomic_write_text, long_path_str, read_text
 from utils import log_dbg, GetString
 from app_settings import AppSettings
 from batch_types import ExistingFileMode, FileChange, OverwriteDecision
@@ -426,7 +426,8 @@ def process_caption_loop(
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
 
         try:
-            with open(image_path, "rb") as f:
+            # REQ-B2: 画像の読み取りも正本の長パス変換を通す。
+            with open(long_path_str(image_path), "rb") as f:
                 with Image.open(f) as opened_image:
                     # alpha を落とさずに保持し、EXIF 回転と背景合成は _preprocess_image
                     # へ任せる（REQ-A5 / A9）。
@@ -461,9 +462,11 @@ def process_caption_loop(
             return ItemOutcome.error()
 
         previous_content: str | None = None
-        if output_path.is_file():
+        # REQ-B2: 存在判定も長パス変換を通す（誤って新規扱いにしない）。
+        if Path(long_path_str(output_path)).is_file():
             try:
-                previous_content = output_path.read_text(encoding="utf-8")
+                # REQ-B2 / REQ-B4: 長パス変換と BOM 除去を通す。
+                previous_content = read_text(output_path, encoding="utf-8-sig")
             except Exception as e:
                 # 既存だが読めないファイルはここで previous_content=None のまま書くと
                 # 「元は存在しなかった」と undo に誤認され、undo でファイルごと削除して

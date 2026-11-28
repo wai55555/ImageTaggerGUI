@@ -68,6 +68,25 @@ def long_path_str(path: PathLike) -> str:
     return "\\\\?\\" + p
 
 
+def read_text(
+    path: PathLike,
+    *,
+    encoding: str = "utf-8",
+    newline: str | None = None,
+) -> str:
+    """拡張長パス変換を通してテキストを読む（REQ-B2）。
+
+    書き込み（`atomic_write_text`）は既に `long_path_str()` を通しているが、読み取り側が
+    素の `open()` / `Path.read_text()` のままだと、書き込めたファイルを読めない
+    （またはその逆）という非対称が残る。読み取りも同じ正本を通す。
+
+    BOM を剥がしたい .txt サイドカーの読み取りは `encoding="utf-8-sig"` を渡す
+    （REQ-B4。utf-8-sig は BOM 無しのファイルもそのまま読める）。
+    """
+    with open(long_path_str(path), "r", encoding=encoding, newline=newline) as handle:
+        return handle.read()
+
+
 def is_link_target(path: PathLike) -> bool:
     """対象が symlink、または hardlink（link count > 1）か。存在しなければ False。"""
     try:

@@ -69,6 +69,22 @@ MODELS_DIR = BASE_DIR / "models"
 MODELS_RESOURCE_DIR = RESOURCE_DIR / "models"
 
 
+def _log_seed_failure(src: Path, dest: Path, error: Exception) -> None:
+    """同梱ファイルのシード失敗を debug log に残す（REQ-B5）。
+
+    constants は起動時に import されるため、utils の import が循環しないよう遅延 import
+    する（utils は constants の BASE_DIR を読むだけで、この時点では既に定義済み）。
+    ログ自体の失敗でシードを止めてはならないので例外は握り潰す。
+    """
+    try:
+        from utils import write_debug_log
+        write_debug_log(
+            f"bundled seed: failed to copy {src} -> {dest}: {type(error).__name__}: {error}"
+        )
+    except Exception:
+        pass
+
+
 def _seed_bundled_dir(resource_dir: Path, dest_root: Path) -> None:
     """Copy bundled files out of `_internal/` into the user-visible directory next to
     the executable.
@@ -92,17 +108,24 @@ def _seed_bundled_dir(resource_dir: Path, dest_root: Path) -> None:
         dest = dest_root / src.relative_to(resource_dir)
         if dest.exists():
             continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        # Copy to a sibling temp file and rename into place: os.replace() is atomic on the
-        # same volume, so an interrupted startup can never leave a truncated file behind.
-        # A partial file would otherwise satisfy the `dest.exists()` check above forever.
-        tmp = dest.with_name(dest.name + ".part")
+        # REQ-B5: 1ファイルの失敗で残り全部（および別ディレクトリ lang/ のシード）を
+        # 打ち切らない。毎起動同じ場所で止まり続けるのを防ぐため、ファイル単位で隔離する。
+        # コピー方式（.part + os.replace の原子性）は変えない。
         try:
-            shutil.copy2(src, tmp)
-            os.replace(tmp, dest)
-        finally:
-            if tmp.exists():
-                tmp.unlink(missing_ok=True)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Copy to a sibling temp file and rename into place: os.replace() is atomic on the
+            # same volume, so an interrupted startup can never leave a truncated file behind.
+            # A partial file would otherwise satisfy the `dest.exists()` check above forever.
+            tmp = dest.with_name(dest.name + ".part")
+            try:
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dest)
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+        except (OSError, shutil.Error) as e:
+            _log_seed_failure(src, dest, e)
+            continue
 
 
 try:

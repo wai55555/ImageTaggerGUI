@@ -1,7 +1,7 @@
 from pathlib import Path
 import csv
 
-from text_io import atomic_write_text
+from text_io import atomic_write_text, read_text
 from utils import write_debug_log
 
 def get_txt_path(image_path: Path) -> Path:
@@ -13,7 +13,9 @@ def read_tags(txt_path: Path) -> list[str]:
     if not txt_path.is_file():
         return []
     try:
-        content = txt_path.read_text(encoding='utf-8').strip()
+        # REQ-B4: BOM 付きの .txt でも先頭タグが "\ufefffoo" にならないよう
+        # utf-8-sig で読む（BOM 無しはそのまま）。REQ-B2: 長パス変換も通す。
+        content = read_text(txt_path, encoding='utf-8-sig').strip()
         if not content:
             return []
         # Remove leading/trailing whitespace from tags and exclude empty tags

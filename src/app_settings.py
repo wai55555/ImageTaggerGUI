@@ -1,6 +1,7 @@
 import configparser
 import io
 import os
+import threading
 from typing import Any
 from dataclasses import dataclass, field, is_dataclass, fields
 from pathlib import Path
@@ -296,6 +297,24 @@ class AppSettings:
 # --- Config Utilities (from config_utils.py) ---
 from constants import BASE_DIR, CONFIG_PATH, MODEL_DIR_NAME
 
+# REQ-B6(a): config.ini の read-modify-write（読む→変える→書く）を1つの
+# クリティカルセクションとして直列化するプロセス内ロック。粒度は config.ini 単位で、
+# 推論・DL 等の無関係な処理はブロックしない。RLock なので、ロックを保持したまま
+# save_config()（自身も同じロックを取る）を呼べる。
+_CONFIG_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True)
+class _VerificationBaseline:
+    """load_settings() 時点のモデル検証状態（REQ-B6(b) の3方向マージの基準）。
+
+    「メモリ側の値が古いだけ（ワーカーがディスクを更新済み）」と「利用者が意図的に
+    変えた」を区別するために控える。dataclass のフィールドではないので保存対象外。
+    """
+    verified_models: dict[str, bool]
+    verified_bindings: frozenset[str]
+
+
 def get_default_config() -> configparser.ConfigParser:
     """Returns a ConfigParser object with default settings."""
     config = configparser.ConfigParser()
@@ -340,18 +359,21 @@ def _write_config_atomically(config: configparser.ConfigParser) -> None:
 
 def load_config() -> configparser.ConfigParser:
     """Loads the config.ini file, creating it from defaults if it doesn't exist."""
-    config = get_default_config()
-    if CONFIG_PATH.is_file():
-            
-        config.read(CONFIG_PATH, encoding='utf-8')
-        write_debug_log(_get_string("ConfigUtils", "Config_File_Load_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
-    else:
-        try:
-            _write_config_atomically(config)
-            write_debug_log(_get_string("ConfigUtils", "Config_File_NotFound_Create_Default", CONFIG_PATH=CONFIG_PATH), _get_string)
-        except Exception as e:
-            write_debug_log(_get_string("ConfigUtils", "Config_File_Creation_Failed", e=e), _get_string)
-    return config
+    # REQ-B6: save_config / update_model_verification_status と同じロックで読み、
+    # 書き込み途中のファイルや read-modify-write の途中を読まないようにする。
+    with _CONFIG_LOCK:
+        config = get_default_config()
+        if CONFIG_PATH.is_file():
+
+            config.read(CONFIG_PATH, encoding='utf-8')
+            write_debug_log(_get_string("ConfigUtils", "Config_File_Load_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
+        else:
+            try:
+                _write_config_atomically(config)
+                write_debug_log(_get_string("ConfigUtils", "Config_File_NotFound_Create_Default", CONFIG_PATH=CONFIG_PATH), _get_string)
+            except Exception as e:
+                write_debug_log(_get_string("ConfigUtils", "Config_File_Creation_Failed", e=e), _get_string)
+        return config
 
 def _parse_verified_models(config: configparser.ConfigParser) -> dict[str, bool]:
     """
@@ -387,7 +409,7 @@ def _parse_verified_models(config: configparser.ConfigParser) -> dict[str, bool]
 def load_settings(config: configparser.ConfigParser) -> AppSettings:
     """Loads settings from a ConfigParser object into an AppSettings dataclass."""
 
-    return AppSettings(
+    settings = AppSettings(
         paths=Paths(
             input_dir=config.get('Paths', 'input_dir', fallback=str(BASE_DIR / "inputs")),
             model_dir=config.get('Paths', 'model_dir', fallback=MODEL_DIR_NAME),
@@ -450,6 +472,14 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
         ),
         language_code=config.get('General', 'language_code', fallback="")
     )
+    # REQ-B6(b): 保存時に「メモリ側が古いだけか、利用者が意図的に変えたか」を
+    # 判別するための基準を控える。dataclass のフィールドではないので保存対象外。
+    settings._verification_baseline = _VerificationBaseline(  # type: ignore[attr-defined]
+        verified_models=dict(settings.model.verified_models),
+        verified_bindings=frozenset(settings.vlm.verified_set()),
+    )
+    return settings
+
 
 def _load_vlm(config: configparser.ConfigParser) -> Vlm:
     """[Vlm] セクションを読み込む。欠けているキーは Vlm の既定値へフォールバック。"""
@@ -534,6 +564,82 @@ def _merge_unknown_config_entries(config: configparser.ConfigParser) -> bool:
     return True
 
 
+def _read_verification_from_disk() -> tuple[dict[str, bool] | None, str | None] | None:
+    """書き込み直前の config.ini からモデル検証状態だけを読む（REQ-B6(b)）。
+
+    Returns:
+        `(verified_models, verified_bindings)`。それぞれキーが無ければ `None`。
+        ファイルが無い・読めない場合は全体が `None`（ディスク優先を適用しない）。
+    """
+    if not CONFIG_PATH.is_file():
+        return None
+    disk = configparser.ConfigParser(interpolation=None)
+    try:
+        disk.read(CONFIG_PATH, encoding='utf-8')
+    except Exception as e:
+        write_debug_log(
+            f"config.ini could not be parsed for verification-state preservation "
+            f"({type(e).__name__}: {e})"
+        )
+        return None
+    models: dict[str, bool] | None = None
+    if disk.has_option('Model', 'verified') or disk.has_option('Model', 'verified_models'):
+        try:
+            models = _parse_verified_models(disk)
+        except (TypeError, ValueError) as e:
+            write_debug_log(f"Model.verified_models could not be read from disk: {e}")
+    bindings = disk.get('Vlm', 'verified_bindings', fallback=None)
+    return models, bindings
+
+
+def _merge_verification_state(config: configparser.ConfigParser, settings: AppSettings) -> None:
+    """モデル検証状態だけを「ディスク優先 + メモリ側の意図的変更」でマージする（REQ-B6(b)）。
+
+    GUI は `self.settings` というメモリ上のコピーを丸ごと保存するため、ワーカーが
+    `update_model_verification_status()` でディスクへ書いた検証結果を、GUI が保持する
+    古い値で上書き（stale-write）してしまう。ロック（(a)）だけでは閉じられない。
+
+    そこで3方向マージにする:
+    - `load_settings()` 時点の基準（baseline）と同じ値は「メモリ側が古いだけ」とみなし、
+      書き込み直前のディスク上の値を正とする。
+    - baseline から変わっている値は利用者／ワーカーの意図的な変更とみなし、メモリ側を正とする。
+      これにより、ワーカー自身が直前に読み直した上で加えた変更（mem != baseline）も潰れない。
+    - baseline が無い（load_settings を通らないで組み立てた設定）場合はディスク優先。
+    """
+    disk = _read_verification_from_disk()
+    if disk is None:
+        return
+    disk_models, disk_bindings = disk
+    baseline = getattr(settings, "_verification_baseline", None)
+
+    if disk_models is not None:
+        memory_models = dict(settings.model.verified_models)
+        if baseline is None:
+            merged_models = dict(disk_models)
+        else:
+            base_models = baseline.verified_models
+            merged_models = dict(disk_models)
+            for model_id, flag in memory_models.items():
+                if model_id not in base_models or base_models[model_id] != flag:
+                    merged_models[model_id] = flag
+            for model_id in base_models:
+                if model_id not in memory_models:
+                    merged_models.pop(model_id, None)
+        config.set('Model', 'verified_models',
+                   ",".join(f"{model_id}:{flag}" for model_id, flag in merged_models.items()))
+
+    if disk_bindings is not None:
+        memory_bindings = settings.vlm.verified_set()
+        if baseline is None:
+            merged_bindings = {t.strip() for t in disk_bindings.split(",") if t.strip()}
+        else:
+            base_bindings = baseline.verified_bindings
+            merged_bindings = (({t.strip() for t in disk_bindings.split(",") if t.strip()}
+                                - (base_bindings - memory_bindings))
+                               | (memory_bindings - base_bindings))
+        config.set('Vlm', 'verified_bindings', ",".join(sorted(merged_bindings)))
+
+
 def save_config(settings: AppSettings) -> bool:
     """Saves the AppSettings object to the config.ini file.
 
@@ -589,8 +695,13 @@ def save_config(settings: AppSettings) -> bool:
         # REQ-5.2: 未知キー／未知セクションを保持する（壊れた config でも保存は続行）。
         # 取り込みで予期しない失敗をしても、保存 API の契約どおり False を返して
         # 例外を漏らさないよう try の内側で行う（PR#38 レビュー指摘）。
-        _merge_unknown_config_entries(config)
-        _write_config_atomically(config)
+        # REQ-B6(a): 既存 config の読み込み→マージ→書き込みを config.ini 単位の
+        # ロックで直列化する。ワーカーの update_model_verification_status も同じ
+        # ロックを保持するため、その read-modify-write と交錯しない。
+        with _CONFIG_LOCK:
+            _merge_unknown_config_entries(config)
+            _merge_verification_state(config, settings)
+            _write_config_atomically(config)
         write_debug_log(_get_string("ConfigUtils", "Config_File_Save_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
         return True
     except Exception as e:
@@ -603,14 +714,19 @@ def update_model_verification_status(model_id: str, is_verified: bool, get_strin
     GUI thread may have changed concurrently (config is reloaded fresh from disk).
     """
     try:
-        config = load_config()
-        settings = load_settings(config)
-        if settings.model.verified_models.get(model_id) != is_verified:
-            settings.model.verified_models[model_id] = is_verified
-            save_config(settings)
-            if is_verified:
-                write_debug_log(get_string("ConfigUtils", "ModelVerified_Success_Debug"), get_string)
-            else:
-                write_debug_log(get_string("ConfigUtils", "ModelUnverified_Debug"), get_string)
+        # REQ-B6(a): 「読む→変える→書く」全体を config.ini 単位のロックで守る。
+        # ロックの内側で直前に読み直すため、メモリ側の変更（この関数の verified 更新）は
+        # 正であり、save_config のディスク優先マージ（(b)）でも baseline との差分として
+        # 残る。
+        with _CONFIG_LOCK:
+            config = load_config()
+            settings = load_settings(config)
+            if settings.model.verified_models.get(model_id) != is_verified:
+                settings.model.verified_models[model_id] = is_verified
+                save_config(settings)
+                if is_verified:
+                    write_debug_log(get_string("ConfigUtils", "ModelVerified_Success_Debug"), get_string)
+                else:
+                    write_debug_log(get_string("ConfigUtils", "ModelUnverified_Debug"), get_string)
     except Exception as e:
         write_debug_log(get_string("ConfigUtils", "ModelVerification_Update_Failed_Debug", e=e), get_string)

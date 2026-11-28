@@ -12,7 +12,7 @@ from pathlib import Path
 
 # REQ-2.2: 原子的書き込みと拡張長パス変換は VLM 非依存の共通部品（src/text_io.py）へ移した。
 # ここは従来どおり (i) fsync + 読み直し検証 + replace、親ディレクトリ作成ありで呼ぶ。
-from text_io import atomic_write_text, long_path_str
+from text_io import atomic_write_text, long_path_str, read_text
 
 
 VLM_PLACEMENTS = ("PREPEND", "APPEND", "OVERWRITE")
@@ -95,8 +95,9 @@ def save_caption(output_path: Path, caption: str, placement: str) -> SaveOutcome
     fs_output_path = Path(long_path_str(output_path))
     if fs_output_path.is_file():
         # 読めない既存ファイルは新規扱いにしない（undo での破壊防止。PR#16 と同方針）。
-        with open(long_path_str(output_path), "r", encoding="utf-8", newline="") as f:
-            raw_previous = f.read()
+        # REQ-B4: 読み取りの BOM は剥がす（BOM 付きでも先頭キャプションを別物扱いしない）。
+        # newline="" は生の改行を保ったまま受け取り、改行規約の検出に使う。
+        raw_previous = read_text(output_path, encoding="utf-8-sig", newline="")
         output_newline = "\r\n" if "\r\n" in raw_previous else "\n"
         previous_content = raw_previous.replace("\r\n", "\n").replace("\r", "\n")
 
