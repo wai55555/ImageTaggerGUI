@@ -1,12 +1,86 @@
 from pathlib import Path
+from typing import Sequence
 import csv
 
+import constants
 from text_io import atomic_write_text
 from utils import write_debug_log
 
 def get_txt_path(image_path: Path) -> Path:
     """Return the path to the txt file corresponding to the image path."""
     return image_path.with_suffix('.txt')
+
+def normalize_tag_whitespace(value: str) -> str:
+    """Collapse every whitespace run (including the full-width space) to one space.
+
+    REQ-H2: the single-tag add used to normalize whitespace while the grid and bulk
+    add did not, so "long  hair" and "long hair" were stored as different tags and
+    one of them was invisible to search. Every add entry point now uses this helper.
+    """
+    return ' '.join(value.split())
+
+def parse_tag_input(raw: str) -> list[str]:
+    """Split comma-separated user input into whitespace-normalized, non-empty tags.
+
+    REQ-H2: shared by the single add, the grid add and the bulk add so the same
+    typed text becomes the same tag no matter which entry point is used.
+    """
+    tags: list[str] = []
+    for part in normalize_tag_whitespace(raw).split(','):
+        tag = normalize_tag_whitespace(part)
+        if tag:
+            tags.append(tag)
+    return tags
+
+def filter_new_tags(existing_tags: Sequence[str], tags_to_add: Sequence[str]) -> list[str]:
+    """Return the tags that are not already present, comparing case-insensitively.
+
+    REQ-H1: tag merging (tagging_core.merge_tags) already treats `solo` and `Solo` as
+    the same tag; the manual entry points compared them exactly and could therefore
+    create a duplicate that no later aggregation/deletion operation could remove
+    (CUT-1 leaves those comparison rules alone). This is the shared entry-side gate.
+    """
+    seen = {tag.lower() for tag in existing_tags}
+    new_tags: list[str] = []
+    for tag in tags_to_add:
+        key = tag.lower()
+        if key in seen:
+            continue
+        seen.add(key)          # duplicate spellings inside the input collapse to one
+        new_tags.append(tag)
+    return new_tags
+
+def get_tag_translations(mapping: dict[str, list[str]], tag: str) -> list[str] | None:
+    """Look up a tag's translations, retrying with the map's normalized key form.
+
+    REQ-H5: the map keys are normalized (`_` -> ' ') by load_tag_translation_map(),
+    but the display side looked tags up verbatim. With underscore conversion off the
+    three tag views silently lost translations. The map normalization itself is
+    intentionally unchanged; this is only the read-side fallback.
+    """
+    translations = mapping.get(tag)
+    if translations is None:
+        translations = mapping.get(tag.replace('_', ' '))
+    return translations
+
+def is_image_sidecar(txt_path: Path) -> bool:
+    """Return True when `txt_path` is the .txt sidecar of an existing image.
+
+    REQ-H3: bulk add/delete and TagLoader used to edit/aggregate every *.txt in the
+    folder, including unrelated text files. This matches the app's existing target
+    definition (constants.IMAGE_EXTENSIONS + same-stem sidecar).
+    """
+    if txt_path.suffix.lower() != '.txt':
+        return False
+    return any(txt_path.with_suffix(ext).is_file() for ext in constants.IMAGE_EXTENSIONS)
+
+def get_sidecar_txt_paths(base_dir: Path) -> list[Path]:
+    """Return the sorted .txt sidecars of images under `base_dir`.
+
+    REQ-H3/REQ-H4: the bulk workers and TagLoader share this target set, and the
+    sorted order makes aggregation independent of the OS directory enumeration order.
+    """
+    return sorted(path for path in base_dir.rglob('*.txt') if is_image_sidecar(path))
 
 def read_tags(txt_path: Path) -> list[str]:
     """Read tags from a txt file and return them as a list."""
@@ -115,7 +189,26 @@ def load_tag_translation_map(model_dir: Path, *fallback_dirs: Path | None) -> di
     if english_csv_path is None:
         return mapping
 
-    language_paths = [_find(f"selected_tags_{suffix}.csv") for suffix in _TRANSLATION_LANGUAGE_SUFFIXES]
+    # REQ-H6: resolve translations per generation (directory), not per file. The
+    # English CSV defines the generation; each language is taken from the same
+    # directory when present. Only a language missing there falls back to the old
+    # file-level search, and that mixing is recorded because the row counts can
+    # coincidentally match while the translations belong to another generation.
+    english_dir = english_csv_path.parent
+
+    def _find_language(file_name: str) -> Path | None:
+        same_generation = english_dir / file_name
+        if same_generation.is_file():
+            return same_generation
+        fallback = _find(file_name)
+        if fallback is not None:
+            write_debug_log(
+                f"tag translations: {file_name} was not found in {english_dir}; using "
+                f"{fallback.parent} instead (generations may be mixed)"
+            )
+        return fallback
+
+    language_paths = [_find_language(f"selected_tags_{suffix}.csv") for suffix in _TRANSLATION_LANGUAGE_SUFFIXES]
     if not any(p is not None for p in language_paths):
         # このモデルには翻訳ファイルが一切無い（PixAI以外の全モデルはこちらに該当する）。
         # 呼び出し側は空辞書に対して英語タグへフォールバックするので、これ以上何もしなくてよい。

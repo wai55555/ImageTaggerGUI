@@ -11,6 +11,7 @@ from collections import Counter
 from PySide6.QtCore import QObject, Signal, Slot
 
 from utils import write_debug_log, calculate_sha256, GetString, default_get_string_fallback
+import tag_utils
 from text_io import atomic_write_text
 from constants import (
     DOWNLOAD_URLS, MODEL_PATH, TAGS_CSV_PATH, MODEL_POINTER_PATH
@@ -742,10 +743,10 @@ class TaggerThreadWorker(QObject):
         self._stop_event.set()
 
     def is_stopped(self) -> bool:
-        is_set = self._stop_event.is_set()
-        if is_set:
-            write_debug_log(f"DEBUG: {type(self).__name__}.is_stopped() returning True.")
-        return is_set
+        # REQ-H7: this is polled once per item and after a stop request; logging every
+        # poll spams the debug log and contends the log lock. `stop()` already records
+        # the transition once, so the polling path stays silent like the other workers.
+        return self._stop_event.is_set()
 
     def _mark_model_as_unverified(self):
         try:
@@ -986,15 +987,14 @@ class TagLoader(QObject):
         self._stop_event.set()
 
     def is_stopped(self):
-        is_set = self._stop_event.is_set()
-        if is_set:
-            write_debug_log(f"DEBUG: {type(self).__name__}.is_stopped() returning True.")
-        return is_set
+        # REQ-H7: no per-poll debug log (see TaggerThreadWorker.is_stopped).
+        return self._stop_event.is_set()
 
     def run(self):
         write_debug_log(str(self.get_string("Workers", "TagLoader_Start", folder=self.folder)), self.get_string)
         counter: Counter[str] = Counter()
-        files = list(self.folder.rglob("*.txt"))
+        # REQ-H3/REQ-H4: only image sidecars, in a stable (sorted) order.
+        files = tag_utils.get_sidecar_txt_paths(self.folder)
         try:
             for txt in files:
                 if self.is_stopped():
@@ -1034,10 +1034,8 @@ class BulkTagWorker(QObject):
         self._stop_event.set()
 
     def is_stopped(self):
-        is_set = self._stop_event.is_set()
-        if is_set:
-            write_debug_log(f"DEBUG: {type(self).__name__}.is_stopped() returning True.")
-        return is_set
+        # REQ-H7: no per-poll debug log (see TaggerThreadWorker.is_stopped).
+        return self._stop_event.is_set()
 
     def _process_tag_file(self, txt_file_path: Path, tag_operation_callback: Callable[[list[str]], list[str]]) -> bool:
         try:
@@ -1063,7 +1061,8 @@ class BulkTagWorker(QObject):
         file_tag_positions: list[tuple[Path, int]] = []
         
         try:
-            for txt in input_dir.rglob("*.txt"):
+            # REQ-H3: only .txt sidecars of existing images, matching the app's target set.
+            for txt in tag_utils.get_sidecar_txt_paths(input_dir):
                 if self.is_stopped():
                     break
                 
@@ -1103,22 +1102,31 @@ class BulkTagWorker(QObject):
         count = 0
         modified_files: list[Path] = []
         
-        new_tags_to_add = sorted(list(set([t.strip() for t in tags_to_add.split(',') if t.strip()])))
+        # REQ-H2: the same whitespace normalization/parsing as the other add entries.
+        # REQ-H1: collapse duplicate spellings case-insensitively (existing tags are
+        # compared the same way per file below).
+        new_tags_to_add = sorted(
+            tag_utils.filter_new_tags([], tag_utils.parse_tag_input(tags_to_add))
+        )
         if not new_tags_to_add:
             self.log_message.emit(self.get_string("Workers", "BulkTagWorker_Warning_No_Valid_Tags_To_Add"), "orange")
             self.finished.emit()
             return
 
         try:
-            for txt in input_dir.rglob("*.txt"):
+            # REQ-H3: only .txt sidecars of existing images, matching the app's target set.
+            for txt in tag_utils.get_sidecar_txt_paths(input_dir):
                 if self.is_stopped():
                     break
                 
                 def add_callback(existing_tags: list[str]) -> list[str]:
+                    # REQ-H1: `solo` and `Solo` are the same tag at the entry side.
+                    tags_not_present = tag_utils.filter_new_tags(
+                        existing_tags, new_tags_to_add)
                     if prepend:
-                        return [tag for tag in new_tags_to_add if tag not in existing_tags] + existing_tags
+                        return tags_not_present + existing_tags
                     else:
-                        return existing_tags + [tag for tag in new_tags_to_add if tag not in existing_tags]
+                        return existing_tags + tags_not_present
 
                 if self._process_tag_file(txt, add_callback):
                     modified_files.append(txt)

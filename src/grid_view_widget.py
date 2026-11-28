@@ -302,10 +302,12 @@ class ImageEditCellWidget(QWidget):
             display_text = tag
             
             # 英語以外かつ、辞書にタグが存在する場合
-            if lang_index != -1 and tag in self.tag_translation_map:
+            if lang_index != -1:
                 try:
-                    translations = self.tag_translation_map[tag]
-                    if len(translations) > lang_index:
+                    # REQ-H5: 生タグで外れたら正規化キー（'_'->' '）でも引く
+                    translations = tag_utils.get_tag_translations(
+                        self.tag_translation_map, tag)
+                    if translations is not None and len(translations) > lang_index:
                         display_text = translations[lang_index]
                 except IndexError:
                     pass # エラー時は英語のまま
@@ -335,15 +337,14 @@ class ImageEditCellWidget(QWidget):
             return
         tags_to_add_str = self.add_tag_line.text().strip()
         if not tags_to_add_str: return
-        tags_to_add = [t.strip() for t in tags_to_add_str.split(',') if t.strip()]
+        # REQ-H2: the same whitespace normalization as the single and bulk add.
+        tags_to_add = tag_utils.parse_tag_input(tags_to_add_str)
         if not tags_to_add: return
         txt_path = tag_utils.get_txt_path(self._image_path)
         existing_tags = tag_utils.read_tags(txt_path)
-        actually_new_tags: list[str] = []; any_duplicates = False
-        for tag in tags_to_add:
-            if tag in existing_tags: any_duplicates = True
-            else:
-                if tag not in actually_new_tags: actually_new_tags.append(tag)
+        # REQ-H1: compare case-insensitively, matching tagging_core.merge_tags.
+        actually_new_tags = tag_utils.filter_new_tags(existing_tags, tags_to_add)
+        any_duplicates = len(actually_new_tags) < len(tags_to_add)
         self.add_tag_line.clear()
         if any_duplicates:
             tooltip_message = self.locale_manager.get_string("GridView", "Tooltip_Duplication")
