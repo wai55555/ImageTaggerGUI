@@ -1,53 +1,101 @@
-from pathlib import Path
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Mapping, Protocol
-import copy
-import functools
 import sys
 import time
-import webbrowser
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Mapping, Protocol
 
 from PySide6.QtCore import (
-    Qt, QThread, QObject, Signal, Slot, QTimer, QPoint, QEvent,
-    QMetaObject, Q_ARG, Q_RETURN_ARG
-)
-from PySide6.QtWidgets import (
-    QMainWindow, QWidget,
-    QGridLayout, QLabel, QLineEdit, QPushButton,
-    QSlider, QTextEdit, QFileDialog, QMessageBox, QDialog,
-    QStackedWidget, QApplication, QSplitter, QListWidgetItem, QComboBox, QButtonGroup,
-    QCheckBox, QProgressDialog
+    Q_ARG,
+    Q_RETURN_ARG,
+    QEvent,
+    QMetaObject,
+    QObject,
+    QPoint,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
 )
 from PySide6.QtGui import (
-    QPixmap, QImage, QKeyEvent, QResizeEvent, QDragEnterEvent,
-    QDropEvent, QCloseEvent, QWheelEvent,
-    QPalette
+    QCloseEvent,
+    QDragEnterEvent,
+    QDropEvent,
+    QImage,
+    QKeyEvent,
+    QPalette,
+    QPixmap,
+    QResizeEvent,
+    QWheelEvent,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QSlider,
+    QSplitter,
+    QStackedWidget,
+    QTextEdit,
+    QWidget,
 )
 
-from utils import write_debug_log
+import app_settings  # Added import
 import constants
-import vlm_config
-import app_settings # Added import
-from app_settings import load_config, load_settings, save_config # Updated import
-from custom_widgets import PathLineEdit, TagListWidget
 import tag_utils
-from text_io import atomic_write_text
+import vlm_config
+from app_settings import load_config, load_settings, save_config  # Updated import
+from custom_dialogs import ClickableLabel, ImageViewerDialog
+from custom_widgets import PathLineEdit, TagListWidget
+from grid_view_widget import GridViewWidget
+from locale_manager import (
+    LocaleManager,
+    available_language_codes,
+    normalize_language_code,
+)
+from model_mode_controller import ModelModeController
+from model_registry import ModelEntry, config_mapping, discover_models, get_model_entry
+from settings_binding import SettingsBinding
+from startup_prompts import StartupPrompts
+from tag_panel import TagPanel
 from tag_utils import load_tag_translation_map
 from tagging_core import ExistingFileMode, OverwriteDecision
-from custom_dialogs import ClickableLabel, ImageViewerDialog, CategoryTagSettingsDialog
-from grid_view_widget import GridViewWidget
-from workers import DownloaderWorker, TaggerThreadWorker, CaptionerThreadWorker, TagLoader, BulkTagWorker, GpuRuntimeDownloadWorker, UpdateCheckWorker
-from vlm_worker import VlmCaptionWorker
-from locale_manager import LocaleManager, available_language_codes, normalize_language_code
+from text_io import atomic_write_text
 from ui_main_window import Ui_MainWindow
 from undo_manager import (
-    UndoManager, UndoResult, AddTagsAction, RemoveTagAction, BulkAddTagsAction,
-    BulkRemoveTagsAction, EditCaptionAction, OverwriteFileAction,
-    AppendTagsActionV2, CompositeUndoAction,
+    AddTagsAction,
+    AppendTagsActionV2,
+    BulkAddTagsAction,
+    BulkRemoveTagsAction,
+    CompositeUndoAction,
+    EditCaptionAction,
+    OverwriteFileAction,
+    RemoveTagAction,
+    UndoManager,
+    UndoResult,
 )
-from model_registry import ModelEntry, config_mapping, discover_models, get_model_entry
-from model_mode_controller import ModelModeController
-from startup_prompts import StartupPrompts
+from utils import write_debug_log
+from vlm_worker import VlmCaptionWorker
+from worker_host import WorkerHost
+from workers import (
+    BulkTagWorker,
+    CaptionerThreadWorker,
+    DownloaderWorker,
+    GpuRuntimeDownloadWorker,
+    TaggerThreadWorker,
+    TagLoader,
+    UpdateCheckWorker,
+)
 
 # GetUserDefaultUILanguage() の primary language ID → 言語コード。
 # LCIDToLocaleName() が使えなかったときだけ使う保険なので、同梱している9言語ぶん。
@@ -95,66 +143,20 @@ def _os_language_raw() -> str:
     except (ImportError, ValueError, IndexError) as e:
         write_debug_log(f"Failed to get OS language via locale: {e}")
         return ""
+# 退避スレッドの置き場は worker_host へ移した（REQ-6.1）。既存の参照名は
+# モジュール属性として再公開する（下の __getattr__）。
+# 更新チェックのリリースページを開くのに使う（実装は startup_prompts）。
+# 既存テストが main_window.webbrowser.open を差し替えるため、ここでも束縛する。
+import webbrowser  # noqa: F401
+import worker_host
 
 
-# 停止要求に応じなかったスレッドを、実際に終了するまで保持する置き場。通常は空。
-#
-# MainWindow のインスタンス属性ではなく**モジュール変数**に置くのが要点。
-# ウィンドウが破棄されるとインスタンス属性のリストも一緒に消え、稼働中の QThread に
-# 対する最後の Python 参照が失われる。PySide6 は親を持たない QThread を Python 側の
-# 所有物として扱うため、そこで C++ オブジェクトが破棄され、Qt の
-# 「Deleting a running QThread」経路でプロセスが fail-fast する
-# （最小再現で終了コード 0xC0000409 を確認、260922 レビュー指摘）。
-# `finished → deleteLater` の配線だけでは、finished より前に参照が消えるこの経路を
-# 防げない。
-_detached_threads: list[QThread] = []
-
-
-def detached_thread_count() -> int:
-    """まだ終了していない退避済みスレッドの数（テスト・終了処理用）。"""
-    _prune_detached_threads()
-    return len(_detached_threads)
-
-
-def _prune_detached_threads() -> None:
-    """終了済み／既に破棄済みのぶんをリストから外す。"""
-    global _detached_threads
-    alive: list[QThread] = []
-    for thread in _detached_threads:
-        try:
-            if not thread.isFinished():
-                alive.append(thread)
-        except RuntimeError:  # 既に C++ 側が破棄済み
-            pass
-    _detached_threads = alive
-
-
-def wait_for_detached_threads(timeout_ms: int = 5000) -> bool:
-    """退避済みスレッドの終了を待つ。全て終了できたら True。
-
-    終了処理から呼ぶ。待ちきれなくても強制破棄はしない（稼働中の QThread を
-    破棄する方がクラッシュとして重い）。プロセス終了まで参照を持ち続けるため、
-    ここで False を返してもリストからは外さない。
-    """
-    _prune_detached_threads()
-    if not _detached_threads:
-        return True
-    deadline = time.monotonic() + max(0.0, timeout_ms / 1000.0)
-    for thread in list(_detached_threads):
-        try:
-            if thread.isFinished():
-                continue
-            remaining = max(0.0, deadline - time.monotonic())
-            thread.quit()
-            thread.wait(int(remaining * 1000))
-        except RuntimeError:
-            continue
-    _prune_detached_threads()
-    if _detached_threads:
-        write_debug_log(
-            f"{len(_detached_threads)} detached thread(s) still running at shutdown; "
-            "keeping the references alive instead of destroying them")
-    return not _detached_threads
+def __getattr__(name):
+    """Phase 6: 退避リスト関連は worker_host が正本（既存の参照を壊さない）。"""
+    if name in {"_detached_threads", "detached_thread_count",
+                "wait_for_detached_threads", "_prune_detached_threads"}:
+        return getattr(worker_host, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_os_language() -> str:
@@ -347,6 +349,12 @@ class MainWindow(QMainWindow):
         self._model_mode = ModelModeController(self)
         # 起動時プロンプト（GPU 導入提案・更新チェック）の判定と状態（REQ-6.2）。
         self._startup = StartupPrompts(self)
+        # タグ表示・編集パネル（REQ-6.4）。ロック判定の正本は MainWindow のまま。
+        self._tag_panel = TagPanel(self)
+        # スライダー同期・touched・設定保存（REQ-6.3）。
+        self._settings_binding = SettingsBinding(self)
+        # スレッド・ワーカーの生成/停止/後始末（REQ-6.1）。
+        self._workers = WorkerHost(self)
         
         self.tag_translation_map: dict[str, list[str]] = {}
         # REQ-4.7 / R31-1: 翻訳 CSV の「正本」が現れたかを判定するためのスタンプ。
@@ -808,7 +816,7 @@ class MainWindow(QMainWindow):
         try:
             if self._current_model_entry().model_type == "captioner":
                 return True
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return bool(self.settings.vlm.enabled)
 
@@ -951,167 +959,30 @@ class MainWindow(QMainWindow):
             self._image_viewer_dialog.close()
 
     def _update_bulk_tag_buttons(self, all_tags: list[tuple[str, int]]):
-        """Updates the bulk tag deletion buttons with new tag data."""
-        if self.loading_timer:
-            self.loading_timer.stop()
-        # REQ-2.4: ローダ完了は「読む側」の完了であって、書く側の錠を解く理由ではない。
-        # ここで _is_bulk_deleting を落とすと、一括処理中でもガードが外れる（R12-6）。
-        self._all_tags = all_tags
-
-        saved_page = getattr(self, '_saved_bulk_page', None)
-        if saved_page is not None:
-            total_pages = max(1, (len(all_tags) + constants.TAGS_PER_PAGE - 1) // constants.TAGS_PER_PAGE)
-            self._current_page = min(saved_page, total_pages - 1)
-        else:
-            self._current_page = 0
-        self._saved_bulk_page = None
-
-        self.display_current_tag_page()
-        self._build_tag_cache()
+        return self._tag_panel._update_bulk_tag_buttons(all_tags)
 
     def _tag_display_grid_dims(self) -> tuple[int, int]:
-        """タグ表示の (cols, rows)。config.ini の不正値（0 以下）でも落ちない（R28-1）。
-
-        読み側の意味は変えない（正の値はそのまま）。0 以下のときだけ既定へ倒す。
-        """
-        window = self.settings.window
-        cols = window.tag_display_cols if isinstance(window.tag_display_cols, int) else 0
-        rows = window.tag_display_rows if isinstance(window.tag_display_rows, int) else 0
-        if cols <= 0:
-            window.tag_display_cols = 5
-        if rows <= 0:
-            window.tag_display_rows = 6
-        return max(1, window.tag_display_cols), max(1, window.tag_display_rows)
+        return self._tag_panel._tag_display_grid_dims()
 
     def _get_image_tags_per_page(self) -> int:
-        """Returns the number of tags to display per page for the current image."""
-        cols, rows = self._tag_display_grid_dims()
-        return max(1, cols * rows)
+        return self._tag_panel._get_image_tags_per_page()
 
     def _get_total_image_tag_pages(self) -> int:
-        """Returns the total number of tag pages for the current image."""
-        tags_per_page = self._get_image_tags_per_page()
-        return max(1, (len(self._current_image_tags) + tags_per_page - 1) // tags_per_page)
+        return self._tag_panel._get_total_image_tag_pages()
 
     # ヘルパーメソッドを追加（クラス内に追加してください）
     def _get_translation_index(self, language: str) -> int:
-        """言語名からリストのインデックスを返す"""
-        lang_map = {
-            "日本語": 0,
-            "Français": 1,
-            "Deutsch": 2,
-            "Español": 3,
-            "Русский": 4,
-            "简体中文": 5,
-            "繁體中文": 6,
-            "한국어": 7
-        }
-        return lang_map.get(language, -1)
+        return self._tag_panel._get_translation_index(language)
 
     def display_current_tag_page(self):
-        """Displays the current page of bulk tags."""
-        for button in self.tag_buttons:
-            button.deleteLater()
-        self.tag_buttons.clear()
-
-        total_tags = len(self._all_tags)
-        start_index = self._current_page * constants.TAGS_PER_PAGE
-        end_index = min(start_index + constants.TAGS_PER_PAGE, total_tags)
-        
-        if total_tags == 0:
-            self.loading_label.setText(self.locale_manager.get_string("MainWindow", "Tag_File_Txt_Not_Found"))
-        else:
-            self.loading_label.setText(self.locale_manager.get_string("MainWindow", "Displaying_Tags_Count_And_Click_Delete", total_tags=total_tags, start_index=start_index + 1, end_index=end_index))
-            
-            current_page_tags = self._all_tags[start_index:end_index]
-            
-            # 翻訳リストのインデックスを取得
-            lang_index = self._get_translation_index(self._tag_display_language)
-
-            for i, (tag_name, count) in enumerate(current_page_tags):
-                display_text = tag_name
-                
-                # 英語以外かつ、辞書にタグが存在する場合
-                if lang_index != -1:
-                    try:
-                        # 指定した言語の翻訳を取得（REQ-H5: `_`->' ' 正規化キーへ
-                        # フォールバックし、アンダースコア変換オフでも引けるようにする）
-                        translations = tag_utils.get_tag_translations(
-                            self.tag_translation_map, tag_name)
-                        if translations is not None and len(translations) > lang_index:
-                            display_text = translations[lang_index]
-                    except IndexError:
-                        pass # エラー時は英語のまま
-
-                button = QPushButton(f"{display_text} ({count})")
-                # ... (以下のコードはそのまま) ...
-                button.setMinimumWidth(self._tag_button_min_width)
-                button.setFixedHeight(self._tag_button_min_height)
-                button.setToolTip(tag_name) # Tooltip always shows English tag
-                button.setProperty("original_tag", tag_name)
-                button.clicked.connect(functools.partial(self.delete_tag_all, tag_name))
-                button.installEventFilter(self)
-                self.tag_button_grid.addWidget(button, i // 4, i % 4)
-                self.tag_buttons.append(button)
-
-        self.prev_page_btn.setEnabled(self._current_page > 0)
-        self.next_page_btn.setEnabled(end_index < total_tags)
-        # REQ-2.4: 表示更新で錠を開けない。解除は処理の終了経路（_set_main_controls_enabled）
-        # だけが行う（R7-4。以前はここで無条件に True にしていた）。
-        self._set_bulk_controls_enabled(self._controls_enabled)
-        QTimer.singleShot(0, self.update_all_button_alignments)
+        return self._tag_panel.display_current_tag_page()
         
     def _display_image_tag_page(self):
-        """Displays the current page of tags for the selected image."""
-        for button in self.tag_buttons_for_image:
-            button.deleteLater()
-        self.tag_buttons_for_image.clear()
-
-        cols, _rows = self._tag_display_grid_dims()
-        tags_per_page = self._get_image_tags_per_page()
-
-        total_tags = len(self._current_image_tags)
-        start = self._current_image_tag_page * tags_per_page
-        end = min(start + tags_per_page, total_tags)
-        
-        lang_index = self._get_translation_index(self._tag_display_language)
-
-        for i, tag_name in enumerate(self._current_image_tags[start:end]):
-            display_text = tag_name
-            
-            # 翻訳処理
-            if lang_index != -1:
-                try:
-                    # REQ-H5: 生タグで外れたら正規化キーでも引く
-                    translations = tag_utils.get_tag_translations(
-                        self.tag_translation_map, tag_name)
-                    if translations is not None and len(translations) > lang_index:
-                        display_text = translations[lang_index]
-                except IndexError:
-                    pass
-
-            button = QPushButton(display_text)
-            button.setMinimumSize(self._tag_button_min_width, self._tag_button_min_height)
-            # 生成時点の錠状態を引き継ぐ（実行中に再描画されてもチップが書けない）。
-            button.setEnabled(self._controls_enabled)
-            button.setToolTip(tag_name) # Tooltip always shows English tag
-            button.setProperty("original_tag", tag_name)
-            button.clicked.connect(functools.partial(self._delete_image_tag, tag_name))
-            button.installEventFilter(self)
-            self.tag_display_grid.addWidget(button, i // cols, i % cols)
-            self.tag_buttons_for_image.append(button)
-
-        self.image_tag_prev_page_btn.setEnabled(self._current_image_tag_page > 0)
-        self.image_tag_next_page_btn.setEnabled(end < total_tags)
-        QTimer.singleShot(0, self.update_all_button_alignments)
+        return self._tag_panel._display_image_tag_page()
 
     @Slot(int)
     def toggle_tag_language(self, index: int):
-        """Toggles the display language of tags between English and Japanese."""
-        self._tag_display_language = self.language_combo.currentText()
-        self.display_current_tag_page()
-        self._display_image_tag_page()
-        self.grid_view_widget.set_tag_display_language(self._tag_display_language, self.tag_translation_map)
+        return self._tag_panel.toggle_tag_language(index)
 
     # .txt を書きうる実行が 1 つでも進行中か（REQ-2.2 の正本）。各ハンドラは
     # 自前の部分的なガードではなくこの判定を見る。ダウンロードは .txt を書かないが、
@@ -1279,7 +1150,7 @@ class MainWindow(QMainWindow):
         # プロセスがクラッシュしうる状態だった（260922 レビュー指摘）。
         # 待ちきれなくても terminate はしない: 参照はモジュール変数が持ち続けるので、
         # 破棄されてクラッシュすることはない。
-        if not wait_for_detached_threads(5000):
+        if not worker_host.wait_for_detached_threads(5000):
             write_debug_log(
                 "DEBUG: closeEvent: detached thread(s) outlived the wait; "
                 "references are kept for the remaining process lifetime")
@@ -1446,25 +1317,10 @@ class MainWindow(QMainWindow):
         self.update_all_button_alignments()
 
     def update_button_text_alignment(self, button: QPushButton):
-        # write_debug_log(f"DEBUG: update_button_text_alignment - button text: {button.text()}")
-        font_metrics = button.fontMetrics()
-        text_width = font_metrics.horizontalAdvance(button.text())
-        
-        button_text_space = button.contentsRect().width()
-
-        if text_width > button_text_space:
-            button.setStyleSheet("QPushButton { text-align: left; padding-left: 5px; }")
-        else:
-            button.setStyleSheet("QPushButton { text-align: center; }")
+        return self._tag_panel.update_button_text_alignment(button)
 
     def update_all_button_alignments(self):
-        write_debug_log("DEBUG: update_all_button_alignments called.")
-        for button in self.tag_buttons:
-            if button.isVisible():
-                self.update_button_text_alignment(button)
-        for button in self.tag_buttons_for_image:
-            if button.isVisible():
-                self.update_button_text_alignment(button)
+        return self._tag_panel.update_all_button_alignments()
 
 
     def navigate_image_list(self, delta: int):
@@ -1496,138 +1352,19 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _add_single_tag(self):
-        """Adds a new tag to the currently selected image's tag file."""
-        # REQ-2.3 / R25-1: 入力欄とボタンは錠で閉じるが、ハンドラ側でも同じ判定で
-        # 止める（片方だけに依存しない）。
-        if self._is_processing():
-            write_debug_log("_add_single_tag ignored while processing")
-            return
-        current_item = self.image_list.currentItem()
-        if not current_item:
-            return
-
-        tags_raw = self.add_single_tag_line.text().strip()
-        if not tags_raw:
-            return
-
-        # REQ-H2: whitespace normalization is shared with the grid and bulk add so
-        # "long  hair" cannot become a different tag depending on the entry point.
-        new_tags = tag_utils.parse_tag_input(tags_raw)
-        if not new_tags:
-            return
-
-        image_path = Path(self.settings.paths.input_dir) / current_item.data(Qt.ItemDataRole.UserRole + 1)
-        txt_path = image_path.with_suffix('.txt')
-
-        try:
-            existing_tags = []
-            if txt_path.is_file():
-                existing_tags = [t.strip() for t in txt_path.read_text('utf-8').split(',') if t.strip()]
-            
-            # Filter out tags that already exist (REQ-H1: case-insensitive, like
-            # tagging_core.merge_tags, so `Solo` is not added next to `solo`).
-            tags_to_add = tag_utils.filter_new_tags(existing_tags, new_tags)
-            
-            if not tags_to_add:
-                self.update_log(self.locale_manager.get_string("MainWindow", "Tag_Already_Exists"), "orange")
-                return
-            
-            for tag in tags_to_add:
-                existing_tags.append(tag)
-            
-            atomic_write_text(txt_path, ', '.join(existing_tags), fsync=False, verify=False)
-            
-            # Record action for undo
-            action = AddTagsAction(file_path=txt_path, added_tags=tags_to_add)
-            self.undo_manager.push(action)
-            self._update_undo_redo_buttons()
-            
-            self.update_log(self.locale_manager.get_string("MainWindow", "Tags_Added_To_File", txt_path_name=txt_path.name), "green")
-            self.add_single_tag_line.clear()
-            self._load_image_tags(image_path, preserve_page=True)
-            rel_path = current_item.data(Qt.ItemDataRole.UserRole + 1)
-            self._update_tag_cache_entry(rel_path)
-            self.reload_tags_only()
-        except Exception as e:
-            self.update_log(self.locale_manager.get_string("MainWindow", "Error_Adding_Tags", txt_path_name=txt_path.name, e=e), "red")
+        return self._tag_panel._add_single_tag()
 
     def _delete_image_tag(self, tag_to_delete: str):
-        """Deletes a tag from the currently selected image's tag file."""
-        # REQ-2.3 / R19-6: 表示中のタグチップからの削除経路も処理中は通さない。
-        if self._is_processing():
-            write_debug_log(f"_delete_image_tag ignored while processing: {tag_to_delete}")
-            return
-        write_debug_log(f"[_delete_image_tag] Attempting to delete tag: {tag_to_delete}")
-        current_item = self.image_list.currentItem()
-        if not current_item:
-            write_debug_log("[_delete_image_tag] No image item selected.")
-            return
-
-        image_path = Path(self.settings.paths.input_dir) / current_item.data(Qt.ItemDataRole.UserRole + 1)
-        txt_path = image_path.with_suffix('.txt')
-        
-        write_debug_log(f"[_delete_image_tag] Image path: {image_path}, TXT path: {txt_path}")
-
-        if not txt_path.is_file():
-            write_debug_log(f"[_delete_image_tag] TXT file not found: {txt_path}")
-            return
-        
-        try:
-            tags = [t.strip() for t in txt_path.read_text('utf-8').split(',') if t.strip()]
-            write_debug_log(f"[_delete_image_tag] Existing tags before deletion: {tags}")
-
-            if tag_to_delete in tags:
-                # Record original index for undo
-                original_index = tags.index(tag_to_delete)
-                
-                tags.remove(tag_to_delete)
-                write_debug_log(f"[_delete_image_tag] Tags after removal: {tags}")
-                atomic_write_text(txt_path, ', '.join(tags), fsync=False, verify=False)
-                write_debug_log(f"[_delete_image_tag] Successfully wrote tags to file: {txt_path.name}")
-                
-                # Record action for undo
-                action = RemoveTagAction(file_path=txt_path, removed_tag=tag_to_delete, original_index=original_index)
-                self.undo_manager.push(action)
-                self._update_undo_redo_buttons()
-                
-                self.update_log(self.locale_manager.get_string("MainWindow", "Tag_Deleted_From_File", tag_name=tag_to_delete, file_name=txt_path.name), "green")
-                self._load_image_tags(image_path, preserve_page=True)
-                rel_path = current_item.data(Qt.ItemDataRole.UserRole + 1)
-                self._update_tag_cache_entry(rel_path)
-                write_debug_log("[_delete_image_tag] UI updated after tag deletion.")
-            else:
-                write_debug_log(f"[_delete_image_tag] Tag '{tag_to_delete}' not found in file: {txt_path}")
-        except Exception as e:
-            write_debug_log(f"[_delete_image_tag] Error during tag deletion: {e}")
-            self.update_log(self.locale_manager.get_string("MainWindow", "Error_Deleting_Tag", tag_name=tag_to_delete, file_name=txt_path.name, e=e), "red")
+        return self._tag_panel._delete_image_tag(tag_to_delete)
     
     def _copy_tag_to_clipboard(self, tag_name: str):
-        """Copies the tag with a trailing comma to clipboard."""
-        clipboard = QApplication.clipboard()
-        clipboard.setText(tag_name + ", ")
-        self.update_log(self.locale_manager.get_string("MainWindow", "Tag_Copied_To_Clipboard", tag_name=tag_name), "blue")
-        write_debug_log(f"Tag copied to clipboard: {tag_name}")
+        return self._tag_panel._copy_tag_to_clipboard(tag_name)
 
     def add_tag_all(self, prepend: bool):
-        # REQ-2.3: 一括追加も .txt を書く経路。処理中は開始できない（自前の
-        # _is_bulk_deleting ではなく一本化した判定を見る）。
-        if self._is_processing():
-            write_debug_log("add_tag_all ignored while processing")
-            return
-        tags_to_add = (self.add_tag_line if prepend else self.add_tag_line_append).text().strip()
-        if not tags_to_add:
-            return
-        
-        if QMessageBox.question(self, self.locale_manager.get_string("MainWindow", "Bulk_Add_Confirmation"), self.locale_manager.get_string("MainWindow", "Confirm_Bulk_Add_Tag", tags_to_add=tags_to_add)) == QMessageBox.StandardButton.Yes:
-            self._start_bulk_tag_worker('add', input_dir=Path(self.settings.paths.input_dir), tags=tags_to_add, prepend=prepend)
+        return self._tag_panel.add_tag_all(prepend)
     
     def delete_tag_all(self, tag_to_delete: str):
-        """Starts a bulk process to delete a tag from all .txt files."""
-        if self._is_processing():
-            write_debug_log("delete_tag_all ignored while processing")
-            return
-        if QMessageBox.question(self, self.locale_manager.get_string("MainWindow", "Bulk_Delete_Confirmation"), self.locale_manager.get_string("MainWindow", "Confirm_Bulk_Delete_Tag", tag_to_delete=tag_to_delete)) == QMessageBox.StandardButton.Yes:
-            self._start_bulk_tag_worker('delete', input_dir=Path(self.settings.paths.input_dir), tag=tag_to_delete)
+        return self._tag_panel.delete_tag_all(tag_to_delete)
 
     # --- Thread and Process Management ---
 
@@ -1649,78 +1386,10 @@ class MainWindow(QMainWindow):
                 self._start_download_thread()
 
     def _settings_snapshot(self):
-        """REQ-5.4 / R8-3: 実行中の UI 変更が走行中バッチへ混入しないよう、
-        開始時点の設定の複製をワーカーへ渡す（次回開始から新しい値が効く）。"""
-        return copy.deepcopy(self.settings)
+        return self._workers._settings_snapshot()
 
     def _start_tagging_thread(self):
-        """Initializes and starts the TaggerThreadWorker."""
-        if self._is_processing():
-            # REQ-2.3: 一括処理中などに開始経路が生きていても、ここで止まる。
-            write_debug_log("_start_tagging_thread ignored while processing")
-            return
-        if self._tagger_thread and self._tagger_thread.isRunning():
-            self.update_log(self.locale_manager.get_string("MainWindow", "Warning_Tagging_Already_Running"), "orange")
-            return
-
-        self._cleanup_tagger_thread()
-
-        # 「選択画像のみ」で画像が未選択なら空実行。専用の1行ログを出して即戻る
-        # （既存の「画像がありません」を流用しない。260903_vlm-gap-fix.md todo 5）。
-        if str(self.settings.behavior.target_mode).upper() == "SELECTED" and self.image_list.currentItem() is None:
-            self.update_log(self.locale_manager.get_string("MainWindow", "Target_No_Selected"), "orange")
-            return
-
-        self._session_mode_override = None
-        self._progress_last_shown_at = 0.0
-
-        self._update_ui_for_processing(True, 'tagging')
-
-        # Get selected file to prioritize it
-        selected_path: Path | None = None
-        current_item = self.image_list.currentItem()
-        if current_item:
-            relative_path = current_item.data(Qt.ItemDataRole.UserRole + 1)
-            selected_path = Path(self.settings.paths.input_dir) / relative_path
-
-        # Which worker class to instantiate is the one piece of model_type branching that
-        # lives outside ModelModeController: it's a thread/worker-startup decision, not a
-        # UI display-state one (design.md 6.8節 "スコープ外の明記").
-        # 「VLM接続を使う」が ON ならネットワーク VLM（ローカルモデル不要、tagger でも
-        # captioner でも VLM が担当）。OFF なら従来どおりモデル種別で分岐。
-        use_vlm = bool(self.settings.vlm.enabled)
-        is_captioner = (not use_vlm) and self._current_model_entry().model_type == "captioner"
-
-        # 「失敗のみ」モード用のセッション失敗集合を渡す（他モードでは無視される）。
-        failed_paths = list(self._batch_failed_paths)
-
-        self._tagger_thread = QThread()
-        snapshot = self._settings_snapshot()
-        if use_vlm:
-            self._tagger_worker = VlmCaptionWorker(
-                snapshot, self._make_decision_requester(), self.locale_manager.get_string,
-                selected_file_path=selected_path, failed_paths=failed_paths)
-            self._tagger_worker.single_test_result.connect(self._on_vlm_single_test_result)
-            self._tagger_worker.binding_verified.connect(self._on_vlm_binding_verified)
-            self._tagger_thread.started.connect(self._tagger_worker.run_captioning)
-        elif is_captioner:
-            self._tagger_worker = CaptionerThreadWorker(snapshot, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
-            self._tagger_thread.started.connect(self._tagger_worker.run_captioning)
-        else:
-            self._tagger_worker = TaggerThreadWorker(snapshot, self._make_decision_requester(), self.locale_manager.get_string, selected_file_path=selected_path, failed_paths=failed_paths)
-            self._tagger_thread.started.connect(self._tagger_worker.run_tagging)
-        self._tagger_worker.moveToThread(self._tagger_thread)
-
-        self._tagger_worker.log_message.connect(self.update_log)
-        self._tagger_worker.batch_completed.connect(self._on_batch_completed)
-        self._tagger_worker.batch_failed.connect(self._on_batch_failed)
-        self._tagger_worker.progress_update.connect(self._on_tagging_progress)
-        self._tagger_worker.model_status_changed.connect(self._on_model_status_changed)
-        self._tagger_worker.finished.connect(self._on_tagger_finished)
-        # 正常終了時は worker の finished シグナルから QThread も終了させる。
-        self._tagger_worker.finished.connect(self._tagger_thread.quit)
-
-        self._tagger_thread.start()
+        return self._workers._start_tagging_thread()
 
     @Slot(int, int)
     def _on_tagging_progress(self, done: int, total: int):
@@ -1780,171 +1449,27 @@ class MainWindow(QMainWindow):
         write_debug_log(f"batch_completed: {len(actions)} 件のファイル変更を1つのUndoエントリにまとめました")
 
     def _wait_for_tagger_thread_stop(self, thread: QThread, timeout: float = 5.0) -> bool:
-        """tagging スレッドの停止待ちだけを切り出したもの（REQ-2.6）。
-
-        `processEvents()` を挟む以上、待機中に新しい実行が始まりうる。呼び出し側は
-        待機対象をローカルに固定し、`self._tagger_thread` が差し替わっていないかを
-        戻り値と併せて確認する。素朴な wait(5000) はメインスレッドのイベントループを
-        丸ごと止めてしまい、同じ finished シグナルから2本目に繋がっている thread.quit
-        や、ワーカースレッド側の後始末が必要とするメインスレッドとのやり取りが処理される
-        機会を奪う。ここで小刻みに processEvents() を挟みながら待つことで、その機会を
-        与えつつ、合計の待ち時間の上限（既定 5 秒）は変えない。
-        """
-        deadline = time.monotonic() + timeout
-        while thread.isRunning() and time.monotonic() < deadline:
-            QApplication.processEvents()
-            thread.wait(50)
-        return not thread.isRunning()
+        # インスタンス状態を使わない（self=None でも呼べる。既存テスト互換）。
+        return worker_host.wait_for_thread_stop(thread, timeout)
 
     def _cleanup_tagger_thread(self):
-        """Safely cleans up the existing tagger thread and worker."""
-        # 待機中に self._tagger_thread が差し替わりうるので、対象はローカルに固定する
-        # （REQ-2.6 / R35-1）。
-        thread = self._tagger_thread
-        worker = self._tagger_worker
-        if thread is None:
-            if worker is not None:
-                worker.deleteLater()
-                self._tagger_worker = None
-            return
-
-        if thread.isRunning():
-            # worker.finished は _on_tagger_finished（これがこの cleanup を呼ぶ）と
-            # thread.quit の両方に connect されており（この順）、この cleanup 自体が
-            # その1本目の帰結として、2本目の thread.quit がまだ処理される前に走る
-            # ことがある——「異常経路だけ」という想定は正確ではなく、正常完了でも
-            # 普通に起こりうる経路。
-            write_debug_log("tagger thread still running during cleanup; waiting")
-            thread.quit()
-            stopped = self._wait_for_tagger_thread_stop(thread)
-            if self._tagger_thread is not thread:
-                # 待機中に新しい処理が始まり、窓口が新しいスレッドへ差し替わった。
-                # 外側の後始末が新しいスレッド・状態に触れてはいけない（R35-1）。
-                write_debug_log("cleanup: a new run started during the wait; "
-                                "leaving the new thread and worker attached")
-                return
-            if not stopped:
-                write_debug_log("tagger thread did not finish within cleanup timeout; "
-                                 "detaching without terminate()")
-                self.update_log(self.locale_manager.get_string(
-                    "MainWindow", "Thread_Shutdown_Slow"), "orange")
-                # QThread.terminate()（Windows では TerminateThread 相当）は危険:
-                # HTTPS ソケット処理などネイティブコードの最中に強制終了すると、
-                # ヒープ/ローダーロックを保持したまま死に、以後プロセス全体が
-                # ハングしうることを実機（オフスクリーン一括テスト）で確認した
-                # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
-                # スレッド自身は自分のイベントループが処理される限り、いずれ
-                # 自然に終了する。
-                self._detach_running_thread(thread, worker)
-                self._tagger_thread = None
-                self._tagger_worker = None
-                return
-        thread.deleteLater()
-        if self._tagger_thread is thread:
-            self._tagger_thread = None
-        if worker is not None:
-            worker.deleteLater()
-        if self._tagger_worker is worker:
-            self._tagger_worker = None
+        return self._workers._cleanup_tagger_thread()
 
     def _detach_running_thread(self, thread: QThread, worker) -> None:
-        """終了しなかったスレッドを、実際に終了した後で破棄するよう繋いで手放す。
-
-        ここで直接 deleteLater() してはいけない。deleteLater() の DeferredDelete は
-        「その QObject が所属するスレッド」へ post されるが、QThread *オブジェクト* の
-        所属は管理対象のワーカースレッドではなく生成元（メインスレッド）なので、
-        次にメインのイベントループが回った時点で——ワーカーの終了を待たずに——破棄
-        される。Qt のドキュメントどおり、稼働中の QThread を破棄すると
-        "Deleting a running QThread will probably result in a program crash"。
-        以前ここには「deleteLater は稼働中でも安全（破棄は終了後まで遅延される）」
-        というコメントがあったが、これは誤りだった（260922 PR#27 レビュー指摘）。
-
-        代わりに Qt 公式の後始末イディオム（finished → deleteLater）を使う。
-        QThreadPrivate::finish() は running=false / finished=true を立ててから
-        finished を emit するので、メインのイベントループが DeferredDelete を
-        処理する時点では確実に停止済みになる。
-
-        参照はモジュール変数 `_detached_threads` が持つ。MainWindow の属性に置くと、
-        ウィンドウ破棄時にリストごと最後の参照が消えて、まさに避けたかった
-        「稼働中の QThread の破棄」が起きる（closeEvent は退避済みスレッドを
-        列挙していなかった）。終了処理は wait_for_detached_threads() で待つ。
-
-        スレッドが永久に終わらない場合はプロセス終了まで参照が残る（リークだが、
-        クラッシュより望ましい）。
-        """
-        # 既に終了・破棄済みのぶんを掃除する。detach 自体が稀なのでここで十分。
-        _prune_detached_threads()
-        _detached_threads.append(thread)
-        if worker is not None:
-            thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        # インスタンス状態を使わない（self=None でも呼べる。既存テスト互換）。
+        worker_host.detach_running_thread(thread, worker)
 
     def _stop_tagging_thread(self):
-        """Requests the tagging thread to stop."""
-        if self._tagger_worker:
-            self.update_log(self.locale_manager.get_string("MainWindow", "Stopping_Tagging_Process"), "orange")
-            self.run_button.setText(self.locale_manager.get_string("Constants", "Stopping_Process"))
-            self.run_button.setEnabled(False)
-            self._tagger_worker.stop()
-            QApplication.processEvents() # Ensure UI remains responsive during stop
+        return self._workers._stop_tagging_thread()
 
     def _start_download_thread(self):
-        """Initializes and starts the DownloaderWorker."""
-        if self._download_thread and self._download_thread.isRunning():
-            return
-
-        self._is_downloading = True
-        self._update_ui_for_processing(True, 'downloading')
-        self.update_log(self.locale_manager.get_string("MainWindow", "Starting_Model_Download"), "black")
-
-        self._download_thread = QThread()
-        self._downloader_worker = DownloaderWorker(self.locale_manager.get_string, model_id=self.settings.model.model_id)
-        self._downloader_worker.moveToThread(self._download_thread)
-
-        self._downloader_worker.log_message.connect(self.update_log)
-        self._downloader_worker.progress_update.connect(self._update_download_progress)
-        self._downloader_worker.download_finished.connect(self._on_download_finished)
-        self._download_thread.started.connect(self._downloader_worker.run_download)
-        
-        self._download_thread.start()
+        return self._workers._start_download_thread()
 
     def _stop_download_thread(self):
-        """Requests the download thread to stop."""
-        if self._downloader_worker:
-            self.update_log(self.locale_manager.get_string("MainWindow", "Stopping_Model_Download"), "orange")
-            self.run_button.setText(self.locale_manager.get_string("Constants", "Stopping_Process"))
-            self.run_button.setEnabled(False)
-            self._downloader_worker.stop()
+        return self._workers._stop_download_thread()
     
     def _start_bulk_tag_worker(self, mode: str, **kwargs: Any):
-        """Initializes and starts the BulkTagWorker for add/delete operations."""
-        # 錠を先にかける（_set_main_controls_enabled が未保存のキャプションを flush する
-        # ので、_is_bulk_deleting を立てるのはその後）。
-        # REQ-2.3 / R2-7: 一括処理中も本体の錠をかける。以前は一括用コントロールだけを
-        # 無効化していたため、実行ボタン・単体タグ編集・グリッド切替・Undo が生きていた。
-        self._set_main_controls_enabled(False)
-        # 実行ボタンはタグ付け/DL 中は「停止」として生きているが、一括処理に停止手段は
-        # 無い。ここだけは明示的に閉じる（処理中にタグ付けを開始できないようにする）。
-        self.run_button.setEnabled(False)
-        self._is_bulk_deleting = True
-        self.update_log(self.locale_manager.get_string("MainWindow", "Starting_Bulk_Tag_Operation", mode=mode), "blue")
-
-        self._bulk_tag_thread = QThread()
-        worker = BulkTagWorker(self.locale_manager.get_string)
-        self._bulk_tag_worker = worker
-        worker.moveToThread(self._bulk_tag_thread)
-
-        worker.log_message.connect(self.update_log)
-        worker.finished.connect(self._on_bulk_tag_finished)
-        worker.bulk_add_completed.connect(self._on_bulk_add_completed)
-        worker.bulk_delete_completed.connect(self._on_bulk_delete_completed)
-        
-        if mode == 'add':
-            self._bulk_tag_thread.started.connect(lambda: worker.run_bulk_add(kwargs['input_dir'], kwargs['tags'], kwargs['prepend']))
-        else: # delete
-            self._bulk_tag_thread.started.connect(lambda: worker.run_bulk_delete(kwargs['input_dir'], kwargs['tag']))
-
-        self._bulk_tag_thread.start()
+        return self._workers._start_bulk_tag_worker(mode, **kwargs)
 
     # --- Thread Finished Slots ---
 
@@ -2132,14 +1657,7 @@ class MainWindow(QMainWindow):
    
 
     def save_current_config(self):
-        """Updates the settings object with the current UI state and saves it to file."""
-        write_debug_log(self.locale_manager.get_string("MainWindow", "Saving_UI_Settings"))
-
-        # Only update geometry if in main view and not maximized/minimized
-        if self.central_widget.currentWidget() == self.main_view_widget and not self.isMaximized() and not self.isMinimized():
-            self.settings.window.geometry = f"{self.width()}x{self.height()}+{self.x()}+{self.y()}"
-
-        save_config(self.settings)
+        return self._settings_binding.save_current_config()
         # The log message can be distracting for this frequent operation, so it's commented out.
         # self.update_log(self.locale_manager.get_string("MainWindow", "Settings_Saved"), "green")
 
@@ -2208,121 +1726,20 @@ class MainWindow(QMainWindow):
         return theme_colors[self._is_dark_theme]
 
     def create_slider_group(self, layout: QGridLayout, section: str, min_val: float, max_val: float, step: float, keys: Mapping[str, int]):
-        """Creates a labeled slider and connects it to the settings object."""
-        resolution = 1 / step if step < 1 else 1
-        
-        for key, row_index in keys.items():
-            is_float = step < 1
-            label_suffix = self.locale_manager.get_string("MainWindow", "Threshold_Suffix") if section == 'Thresholds' else self.locale_manager.get_string("MainWindow", "Max_Count_Suffix")
-            # [CategoryDialog] Category_<key> は「詳細」ダイアログ向けに
-            # "General（一般）" のような訳語併記になっているため、しきい値ラベルの
-            # 頭に付けると "General（一般） しきい値:" と冗長になる。ここは
-            # 短いカテゴリ名のまま出す。
-            label = QLabel(f"{key.capitalize()} {label_suffix}:")
-            
-            settings_section = getattr(self.settings, section.lower())
-            initial_val = getattr(settings_section, key)
-                
-            slider = QSlider(Qt.Orientation.Horizontal)
-            slider.setRange(int(min_val * resolution), int(max_val * resolution))
-            slider.setValue(int(initial_val * resolution))
-            
-            value_label = QLabel(f"{initial_val:.2f}" if is_float else str(int(initial_val)))
-            value_label.setFixedWidth(50)
-            self._sliders[f"{section.lower()}_{key}"] = (slider, value_label)
-
-            def update_value(value: int, k: str = key, s: Any = settings_section, res: float = resolution, v_label: QLabel = value_label, is_flt: bool = is_float):
-                real_val = value / res
-                v_label.setText(f"{real_val:.2f}" if is_flt else str(int(real_val)))
-                setattr(s, k, real_val if is_flt else int(real_val))
-                if not self._suppress_slider_touch:
-                    # A hand move marks the category "touched" so a later model switch
-                    # won't overwrite it with that model's default (see _apply_threshold_defaults).
-                    s.touched = app_settings.add_touched(s.touched, k)
-                # REQ-5.5 / R7-6: つまみ 1 目盛りごとに全設定を書かない。保存は
-                # ドラッグ完了後にまとめる（プログラム的同期ではそもそも呼ばない）。
-                if not self._suppress_slider_save:
-                    self._save_config_soon()
-
-            slider.valueChanged.connect(update_value)
-            # ドラッグ完了時（キーボード操作は valueChanged 側）に確定保存する。
-            slider.sliderReleased.connect(self.save_current_config)
-
-            layout.addWidget(label, row_index, 0)
-            layout.addWidget(slider, row_index, 1)
-            layout.addWidget(value_label, row_index, 2)
+        return self._settings_binding.create_slider_group(layout, section, min_val, max_val, step, keys)
 
     def _current_model_categories(self) -> list[str]:
-        """Tag categories the selected model produces (ui.categories in its config),
-        filtered to known names and returned in the canonical TAG_CATEGORY_NAMES order
-        so the per-category dialog rows are always consistent."""
-        cats = config_mapping(self._current_model_entry().config, "ui").get("categories") or ["general", "character"]
-        cats_set = set(cats)
-        return [c for c in app_settings.TAG_CATEGORY_NAMES if c in cats_set]
+        return self._settings_binding._current_model_categories()
 
     def _save_config_soon(self) -> None:
-        """スライダー操作の保存をまとめる（既定 400ms。REQ-5.5 / R7-6）。"""
-        if not hasattr(self, "_config_save_timer"):
-            self._config_save_timer = QTimer(self)
-            self._config_save_timer.setSingleShot(True)
-            self._config_save_timer.setInterval(400)
-            self._config_save_timer.timeout.connect(self.save_current_config)
-        self._config_save_timer.start()
+        return self._settings_binding._save_config_soon()
 
     def _sync_settings_sliders(self):
-        """Refresh the four main-window sliders (general/character threshold & max) from
-        self.settings without their valueChanged handler flagging them as user-touched."""
-        self._suppress_slider_touch = True
-        self._suppress_slider_save = True
-        try:
-            for key, (slider, value_label) in self._sliders.items():
-                section_name, cat = key.split('_', 1)
-                value = getattr(getattr(self.settings, section_name), cat)
-                is_float = section_name == 'thresholds'
-                res = 100.0 if is_float else 1.0
-                slider.setValue(int(round(value * res)))
-                value_label.setText(f"{value:.2f}" if is_float else str(int(value)))
-        finally:
-            self._suppress_slider_touch = False
-            self._suppress_slider_save = False
+        return self._settings_binding._sync_settings_sliders()
 
     @Slot()
     def _open_category_settings_dialog(self):
-        """Opens the per-category threshold / max-tag dialog for the selected model."""
-        if self._category_settings_dialog is not None and self._category_settings_dialog.isVisible():
-            self._category_settings_dialog.raise_()
-            self._category_settings_dialog.activateWindow()
-            return
-
-        def on_changed():
-            # The dialog has already written into self.settings; mirror the main sliders,
-            # persist, and refresh any open tag view that depends on the values.
-            self._sync_settings_sliders()
-            self.save_current_config()
-
-        def on_reset():
-            # Drop "touched" for this model's categories, then re-apply its defaults.
-            model_cats = set(self._current_model_categories())
-            for section in (self.settings.thresholds, self.settings.limits):
-                kept = app_settings.parse_touched(section.touched) - model_cats
-                section.touched = ",".join(sorted(kept))
-            self._model_mode._apply_threshold_defaults(self._current_model_entry())
-            self._sync_settings_sliders()
-            self.save_current_config()
-            if self._category_settings_dialog is not None:
-                self._category_settings_dialog.reload_from_settings()
-
-        self._category_settings_dialog = CategoryTagSettingsDialog(
-            self,
-            get_string=self.locale_manager.get_string,
-            categories=self._current_model_categories(),
-            thresholds=self.settings.thresholds,
-            limits=self.settings.limits,
-            on_changed=on_changed,
-            on_reset=on_reset,
-        )
-        self._category_settings_dialog.finished.connect(lambda _: setattr(self, "_category_settings_dialog", None))
-        self._category_settings_dialog.show()
+        return self._settings_binding._open_category_settings_dialog()
 
     def update_log(self, message: str, color: str = "black"):
         """Appends a colored, timestamped message to the log output."""
@@ -2363,28 +1780,10 @@ class MainWindow(QMainWindow):
         self._tag_cache[rel_path] = set(tags)
 
     def _highlight_files_for_tag(self, tag_name: str) -> None:
-        """指定タグを持つファイルをTagListWidgetでハイライトする。選択中アイテムはスキップする。"""
-        from PySide6.QtGui import QColor, QBrush
-        color = QColor("#4a5a2a") if self._is_dark_theme else QColor("#c8f0a0")
-        brush = QBrush(color)
-        current_item = self.image_list.currentItem()
-        for i in range(self.image_list.count()):
-            item = self.image_list.item(i)
-            if item is None or item is current_item:
-                continue
-            rel_path = item.data(Qt.ItemDataRole.UserRole + 1)
-            tags = self._tag_cache.get(rel_path, set())
-            if tag_name in tags:
-                item.setBackground(brush)
+        return self._tag_panel._highlight_files_for_tag(tag_name)
 
     def _clear_highlight(self) -> None:
-        """TagListWidgetの全アイテムのハイライトを解除する。"""
-        from PySide6.QtGui import QBrush
-        default_brush = QBrush()
-        for i in range(self.image_list.count()):
-            item = self.image_list.item(i)
-            if item is not None:
-                item.setBackground(default_brush)
+        return self._tag_panel._clear_highlight()
 
     def _update_undo_redo_buttons(self):
         """Updates the enabled state and tooltips of undo/redo buttons."""
@@ -2479,7 +1878,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.settings.model.verified_models = load_settings(load_config()).model.verified_models
-        except Exception as e:  # noqa: BLE001 - 状態更新の失敗で UI を止めない
+        except Exception as e:
             write_debug_log(f"model_status_changed: could not reload verified_models: {e}")
         self._check_model_status_and_update_ui()
 

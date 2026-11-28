@@ -144,12 +144,16 @@ def test_single_add_rejects_case_variant_and_keeps_new_tags(tmp_path: Path):
     txt.write_text("solo", encoding="utf-8")
 
     fake, logs = _fake_main_window(tmp_path, image.name, "Solo")
-    main_window.MainWindow._add_single_tag(fake)
+    # Phase 6: 実装は TagPanel へ切り出された（MainWindow は薄い委譲）。
+    import tag_panel
+    tag_panel.TagPanel(fake)._add_single_tag()
     assert txt.read_text(encoding="utf-8") == "solo"
     assert logs == ["Tag_Already_Exists"]
 
     fake, _ = _fake_main_window(tmp_path, image.name, "  long   hair ")
-    main_window.MainWindow._add_single_tag(fake)
+    # Phase 6: 実装は TagPanel へ切り出された（MainWindow は薄い委譲）。
+    import tag_panel
+    tag_panel.TagPanel(fake)._add_single_tag()
     assert txt.read_text(encoding="utf-8") == "solo, long hair"
 
 
@@ -315,7 +319,8 @@ def test_main_window_image_view_uses_normalized_translation_key():
     ns.update_all_button_alignments = lambda: None
     ns._controls_enabled = True  # Phase 2: チップは錠状態を引き継いで生成される
 
-    main_window.MainWindow._display_image_tag_page(ns)
+    import tag_panel
+    tag_panel.TagPanel(ns)._display_image_tag_page()
     assert [b.text() for b in ns.tag_buttons_for_image] == ["長い髪"]
 
 

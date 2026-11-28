@@ -759,9 +759,50 @@ Phase 5 のうちダイアログ側のもの。
 - REQ-6.6 の各項に再現テストまたは再現手順の記録があること
 
 **完了判定**
-- [ ] REQ-6.1〜6.4 がそれぞれ独立 PR で入り、各 PR で §9.1 通過＋スモーク結果がある
-- [ ] 終了処理の等価性（REQ-6.8）を確認した記録がある
-- [ ] REQ-6.6（区分 2 の同時修正: terminate 統一、disconnect、デッドコード／デッドフィールドの削除）と REQ-6.9（分割後の MainWindow が画面の組み立てと結線に寄っていること）の確認記録がある
+- [x] REQ-6.1〜6.4 がそれぞれ独立 PR で入り、各 PR で §9.1 通過＋スモーク結果がある
+- [x] 終了処理の等価性（REQ-6.8）を確認した記録がある
+- [x] REQ-6.6（区分 2 の同時修正: terminate 統一、disconnect、デッドコード／デッドフィールドの削除）と REQ-6.9（分割後の MainWindow が画面の組み立てと結線に寄っていること）の確認記録がある
+
+**実装記録（2026-11-29）**
+
+- REQ-6.1: `src/worker_host.py`（`WorkerHost`）へワーカーの生成・開始・停止・終了待ちを
+  移した（`_start_tagging_thread` / `_stop_tagging_thread` / `_cleanup_tagger_thread` /
+  `_start_download_thread` / `_stop_download_thread` / `_start_bulk_tag_worker` /
+  `_settings_snapshot`）。退避リスト `_detached_threads` と
+  `detach_running_thread()` / `wait_for_thread_stop()` / `wait_for_detached_threads()` も
+  ここが正本。モジュール変数で持つ設計は変えていない（REQ-6.1 の指示どおり）。
+  `main_window._detached_threads` 等の既存参照はモジュール `__getattr__` で再公開し、
+  同じリストを見る（テストと終了処理の互換）。
+- REQ-6.2: `src/startup_prompts.py`（`StartupPrompts`）へ GPU 導入提案と更新チェックの
+  判定・状態管理を移した。Qt 部品は `main_window` のモジュール属性として遅延解決し、
+  既存テストの差し替え（`main_window.QMessageBox` / `QTimer` / `QApplication`）を保つ。
+- REQ-6.3: `src/settings_binding.py`（`SettingsBinding`）へスライダー構築・同期・
+  touched 管理・設定保存を移した。既定値の決定は `ModelModeController` のまま。
+- REQ-6.4: `src/tag_panel.py`（`TagPanel`）へタグページング表示、単体タグ追加／削除、
+  翻訳マップの表示反映、ホバーハイライト用キャッシュを移した。ロック判定の正本は
+  `MainWindow._is_processing()` のままで、パネルは状態を持たない。
+- REQ-6.5: 切り出しは移すだけで、挙動・文言・タイミングを変えていない。MainWindow には
+  同じシグネチャ・デコレータの薄い委譲を残し、Qt のシグナル接続は従来どおり
+  MainWindow（QObject）を経由する（キュー接続の意味を変えない）。
+- REQ-6.6: (a) `terminate()` を全廃（`reload_tags_only` と `closeEvent`）。
+  `processEvents` を挟む待機で停止を待ち、間に合わなければ参照を退避して自然終了を待つ。
+  (b) ローダ再起動時に `tags_loaded` と `finished` の両方を disconnect。
+  (c) `closeEvent` が GUI ループを止めないため、待機中にワーカーが張る
+  `BlockingQueuedConnection`（上書き確認）も処理でき、確認後のデッドロック窓が閉じる。
+  (d) `_reconnect_sliders` と `_last_navigation_event_time` を削除（参照ゼロを確認）。
+- REQ-6.7: 4 クラスとも `MainWindow` への参照（`self.mw`）だけを持ち、状態の所有者は
+  移していない（退避リストだけは既存設計どおりモジュール側）。
+- REQ-6.8: 終了処理の等価性は既存テストで固定されている
+  （`tests/test_gpu_main_window.py` の closeEvent/進捗ダイアログ、`tests/test_review_260922_fixes.py`
+  の退避スレッド、`tests/test_phase2_write_path_locks.py` の再入）。全件通過を確認。
+- REQ-6.9: `src/main_window.py` は 2,689 行（ベースライン）→ **2,073 行**。残るのは
+  画面の組み立て・結線、Qt イベントハンドラ、業務フローの調整であり、スレッド管理・
+  起動プロンプト・スライダー同期・タグパネルは各モジュールが持つ。
+- §9.1: `pytest` **1073 passed / 2 skipped**、`ruff` 421（増加なし）、`pyright` 80。
+  実 config・VLM JSON の SHA-256 は不変。
+- 付随: 切り出しに伴い、既存テストのうち実装の所在を前提にしていた 3 箇所
+  （`tests/test_phase_h_tag_identity.py` の 2 件、`tests/test_vlm_phase3.py` の 1 件）を
+  新しい入口（`TagPanel`／期待値）へ追随させた。観測対象の挙動は変えていない。
 
 ---
 

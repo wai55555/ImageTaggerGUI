@@ -3,20 +3,14 @@ main_window.py から切り出した。判定と状態管理だけを持ち、�
 MainWindow 側の薄い委譲（@Slot）を経由する（挙動は変えない）。"""
 from __future__ import annotations
 
-
+import webbrowser
+from datetime import datetime, timedelta, timezone
 
 from PySide6.QtCore import Qt
 
-
-
-from datetime import datetime
-from datetime import timedelta
-from datetime import timezone
-from utils import write_debug_log
-from workers import GpuRuntimeDownloadWorker
-from workers import UpdateCheckWorker
 import constants
-import webbrowser
+from utils import write_debug_log
+from workers import GpuRuntimeDownloadWorker, UpdateCheckWorker
 
 
 def _ui(name: str):
@@ -58,8 +52,9 @@ class StartupPrompts:
             return
         try:
             import onnxruntime
-            import onnx_providers
+
             import gpu_runtime
+            import onnx_providers
             if "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
                 return  # this build has no CUDA support -> nothing to offer
             if onnx_providers.gpu_runtime_ready():
