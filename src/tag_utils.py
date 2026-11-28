@@ -1,6 +1,9 @@
 from pathlib import Path
 import csv
 
+from text_io import atomic_write_text
+from utils import write_debug_log
+
 def get_txt_path(image_path: Path) -> Path:
     """Return the path to the txt file corresponding to the image path."""
     return image_path.with_suffix('.txt')
@@ -16,39 +19,53 @@ def read_tags(txt_path: Path) -> list[str]:
         # Remove leading/trailing whitespace from tags and exclude empty tags
         return [tag.strip() for tag in content.split(',') if tag.strip()]
     except Exception as e:
-        print(f"Error reading tag file {txt_path}: {e}")
+        # REQ-2.10: print は windowed ビルドで sys.stdout が無いとそれ自体が例外になり、
+        # フォールバックの return [] まで到達しない。本体側と同じ debug log へ残す
+        # （write_debug_log は [Debug] debug_log 有効時のみ記録する既存方針のまま）。
+        write_debug_log(f"tag_utils.read_tags failed for {txt_path}: {type(e).__name__}: {e}")
         return []
 
-def write_tags(txt_path: Path, tags: list[str]):
-    """Write a list of tags to a txt file (overwriting existing content)."""
+def write_tags(txt_path: Path, tags: list[str]) -> bool:
+    """Write a list of tags to a txt file (overwriting existing content).
+
+    REQ-2.10: 書き込みは一時ファイル + os.replace で原子的に行い、成否を戻り値で返す。
+    失敗しても例外は上げない（呼び出し側の現行契約を維持しつつ、成功扱いだけを防ぐ）。
+    """
     # Join tags with ", " as separator
     content = ', '.join(tags)
     try:
-        txt_path.write_text(content, encoding='utf-8')
+        atomic_write_text(txt_path, content, fsync=False, verify=False)
+        return True
     except Exception as e:
-        print(f"Error writing tag file {txt_path}: {e}")
+        write_debug_log(f"tag_utils.write_tags failed for {txt_path}: {type(e).__name__}: {e}")
+        return False
 
 def add_tags_to_file(txt_path: Path, tags_to_add: list[str]) -> bool:
-    """Add new tags to an existing tag file (avoiding duplicates)."""
+    """Add new tags to an existing tag file (avoiding duplicates).
+
+    戻り値は「新規タグがあって、かつ書き込みに成功した」ときだけ True（REQ-2.10）。
+    """
     existing_tags = read_tags(txt_path)
     added = False
     for tag in tags_to_add:
         if tag not in existing_tags:
             existing_tags.append(tag)
             added = True
-    
-    if added:
-        write_tags(txt_path, existing_tags)
-    return added
+
+    if not added:
+        return False
+    return write_tags(txt_path, existing_tags)
 
 def remove_tag_from_file(txt_path: Path, tag_to_remove: str) -> bool:
-    """Remove the specified tag from the tag file."""
+    """Remove the specified tag from the tag file。
+
+    戻り値は「削除対象が存在し、かつ書き込みに成功した」ときだけ True（REQ-2.10）。
+    """
     existing_tags = read_tags(txt_path)
-    if tag_to_remove in existing_tags:
-        existing_tags.remove(tag_to_remove)
-        write_tags(txt_path, existing_tags)
-        return True
-    return False
+    if tag_to_remove not in existing_tags:
+        return False
+    existing_tags.remove(tag_to_remove)
+    return write_tags(txt_path, existing_tags)
 
 # Must match the shipped filenames exactly (selected_tags_zh_CN.csv / _zh_TW.csv) -
 # on a case-sensitive filesystem the lowercase forms silently fail to load.
@@ -104,36 +121,49 @@ def load_tag_translation_map(model_dir: Path, *fallback_dirs: Path | None) -> di
         # 呼び出し側は空辞書に対して英語タグへフォールバックするので、これ以上何もしなくてよい。
         return mapping
 
-    try:
-        # 英語版CSVを読み込む（ベースとなる）
-        english_tags = []
-        with open(english_csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            next(reader)  # ヘッダーをスキップ
-            for row in reader:
-                if len(row) >= 3:
-                    # 3列目（インデックス2）がタグ名、アンダースコアをスペースに変換
-                    tag = row[2].strip().replace('_', ' ')
-                    english_tags.append(tag)
+    def _read_data_records(path: Path) -> list[list[str]]:
+        """ヘッダーを読み飛ばし、`csv.reader` の論理レコード単位で全行を返す。
 
-        # 各翻訳ファイルを読み込む（存在しないファイルは空リストのまま＝全行フォールバック）
+        クォート内の改行を含むフィールドも 1 レコードとして数える（物理行で数えない）。
+        """
+        with open(path, 'r', encoding='utf-8') as handle:
+            reader = csv.reader(handle)
+            next(reader, None)  # ヘッダー
+            return list(reader)
+
+    try:
+        # 英語版CSVを読み込む（ベースとなる）。REQ-5.13: 短い行・空行を「詰めて落とす」と
+        # 以降の翻訳が全部 1 行ずつズレるため、空文字のプレースホルダで位置を保つ。
+        english_tags: list[str] = []
+        for row in _read_data_records(english_csv_path):
+            if len(row) >= 3:
+                # 3列目（インデックス2）がタグ名、アンダースコアをスペースに変換
+                english_tags.append(row[2].strip().replace('_', ' '))
+            else:
+                english_tags.append('')
+
+        # 各翻訳ファイルを読み込む（存在しないファイルは空リストのまま＝英語でフォールバック）
         all_translations: list[list[str]] = []
-        for lang_path in language_paths:
+        for suffix, lang_path in zip(_TRANSLATION_LANGUAGE_SUFFIXES, language_paths):
             translations: list[str] = []
             if lang_path is not None:
-                with open(lang_path, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    next(reader)  # ヘッダーをスキップ
-                    for row in reader:
-                        if len(row) > 0:
-                            # カンマで終わる場合は削除
-                            trans = row[0].strip().rstrip(',')
-                            translations.append(trans if trans else '')
-                        else:
-                            translations.append('')
+                translations = [
+                    (row[0].strip().rstrip(',') if row else '')
+                    for row in _read_data_records(lang_path)
+                ]
+                # REQ-5.14: レコード数が英語と食い違う翻訳は位置合わせ自体が不可能。
+                # ズレた翻訳を黙って出さず、その言語だけ英語へフォールバックする
+                # （存在しないファイルと同じ扱い。他の言語は巻き込まない）。
+                if len(translations) != len(english_tags):
+                    write_debug_log(
+                        f"tag translations: {lang_path.name} has {len(translations)} data "
+                        f"records but selected_tags.csv has {len(english_tags)}; dropping "
+                        f"{suffix} and falling back to English"
+                    )
+                    translations = []
             all_translations.append(translations)
 
-        # 英語タグと翻訳を対応付ける
+        # 英語タグと翻訳を対応付ける（同じレコード位置どうし）
         for i, en_tag in enumerate(english_tags):
             if en_tag:
                 trans_list = []
@@ -146,8 +176,12 @@ def load_tag_translation_map(model_dir: Path, *fallback_dirs: Path | None) -> di
                 mapping[en_tag] = trans_list
 
     except Exception as e:
-        print(f"Error loading tag translations: {e}")
-        import traceback
-        traceback.print_exc()
+        # REQ-5.14: print / traceback.print_exc() は windowed ビルドで stdout/stderr が
+        # 無いとそれ自体が落ちるうえ利用者の手元に残らない。例外情報ごと debug log へ。
+        # 影響範囲は現行どおり全体（mapping は空のまま＝全言語が英語表示にフォールバック）。
+        write_debug_log(
+            f"tag translations: failed to load {english_csv_path}: "
+            f"{type(e).__name__}: {e}"
+        )
 
     return mapping

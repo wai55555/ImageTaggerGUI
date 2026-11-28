@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol
 
 from utils import write_debug_log
+from text_io import atomic_write_text, long_path_str
 
 
 def _desc(key: str, **kwargs: object) -> str:
@@ -54,15 +55,9 @@ def _long_path_str(path: Path) -> str:
     - 既に `\\\\?\\` 付き（拡張長パス）が渡された場合はそのまま返す。二重に前置すると
       `\\\\?\\UNC\\?\\...` のような不正パスになる（PR#16 レビュー第2ラウンド指摘）。
     """
-    p = os.path.abspath(path)
-    if sys.platform != "win32":
-        return p
-    if p.startswith("\\\\?\\"):
-        return p
-    if p.startswith("\\\\"):
-        return "\\\\?\\UNC" + p[1:]
-    return "\\\\?\\" + p
-
+    # REQ-2.9: 実装は共通部品（src/text_io.py）へ一本化した。名前は既存テスト
+    # （tests/test_pr16_review_fixes.py）が直接参照しているため薄い委譲として残す。
+    return long_path_str(path)
 
 class GetString(Protocol):
     """Protocol for localization function."""
@@ -124,9 +119,8 @@ class AddTagsAction(UndoAction):
                 if tag in tags:
                     tags.remove(tag)
             
-            # Write back
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                f.write(', '.join(tags))
+            # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
             
             write_debug_log(f"Undo AddTags: Removed {len(self.added_tags)} tags from {self.file_path.name}")
             return True
@@ -153,9 +147,8 @@ class AddTagsAction(UndoAction):
                 if tag not in tags:
                     tags.append(tag)
             
-            # Write back
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                f.write(', '.join(tags))
+            # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
             
             write_debug_log(f"Redo AddTags: Added {len(self.added_tags)} tags to {self.file_path.name}")
             return True
@@ -198,9 +191,8 @@ class RemoveTagAction(UndoAction):
             insert_pos = min(self.original_index, len(tags))
             tags.insert(insert_pos, self.removed_tag)
             
-            # Write back
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                f.write(', '.join(tags))
+            # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
             
             write_debug_log(f"Undo RemoveTag: Re-inserted '{self.removed_tag}' at position {insert_pos} in {self.file_path.name}")
             return True
@@ -229,9 +221,8 @@ class RemoveTagAction(UndoAction):
             if self.removed_tag in tags:
                 tags.remove(self.removed_tag)
             
-            # Write back
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                f.write(', '.join(tags))
+            # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+            atomic_write_text(self.file_path, ', '.join(tags), fsync=False, verify=False)
             
             write_debug_log(f"Redo RemoveTag: Removed '{self.removed_tag}' from {self.file_path.name}")
             return True
@@ -259,13 +250,16 @@ class EditCaptionAction(UndoAction):
 
     def __post_init__(self) -> None:
         # 作成時に絶対パスへ固定する（理由は _FileSnapshotAction.__post_init__ と同じ。
-        # このクラスは _long_path_str を通さず直接 write_text / unlink するので、相対の
+        # このクラスは _long_path_str を通さず素のパスで書き込み／unlink するので、相対の
         # まま持つと undo 時点の CWD 基準で別ファイルに当たりうる）。
         self.file_path = Path(os.path.abspath(self.file_path))
 
     def _write(self, text: str) -> bool:
         try:
-            self.file_path.write_text(text, encoding='utf-8')
+            # REQ-2.3: 一時ファイル + os.replace で原子的に（(iii) 段）。
+            # REQ-2.9 / U-3: このクラスだけは従来どおり拡張長パス変換を通さない
+            # （経路のパス解決セマンティクスを変えないため use_long_path=False）。
+            atomic_write_text(self.file_path, text, fsync=False, verify=False, use_long_path=False)
             return True
         except Exception as e:
             write_debug_log(f"EditCaption write failed for {self.file_path}: {e}")
@@ -313,8 +307,8 @@ class _FileSnapshotAction(UndoAction):
 
     def _write(self, text: str) -> bool:
         try:
-            with open(_long_path_str(self.file_path), 'w', encoding='utf-8') as f:
-                f.write(text)
+            # REQ-2.3: 一時ファイル + os.replace で原子的に（(iii) 段）。
+            atomic_write_text(self.file_path, text, fsync=False, verify=False)
             return True
         except Exception as e:
             write_debug_log(f"{type(self).__name__} write failed for {self.file_path}: {e}")
@@ -416,9 +410,8 @@ class BulkAddTagsAction(UndoAction):
                     if tag in tags:
                         tags.remove(tag)
                 
-                # Write back
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(', '.join(tags))
+                # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
                 
                 success_count += 1
                 
@@ -455,9 +448,8 @@ class BulkAddTagsAction(UndoAction):
                         if tag not in tags:
                             tags.append(tag)
                 
-                # Write back
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(', '.join(tags))
+                # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
                 
                 success_count += 1
                 
@@ -501,9 +493,8 @@ class BulkRemoveTagsAction(UndoAction):
                 insert_pos = min(original_index, len(tags))
                 tags.insert(insert_pos, self.removed_tag)
                 
-                # Write back
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(', '.join(tags))
+                # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
                 
                 success_count += 1
                 
@@ -536,9 +527,8 @@ class BulkRemoveTagsAction(UndoAction):
                 if self.removed_tag in tags:
                     tags.remove(self.removed_tag)
                 
-                # Write back
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(', '.join(tags))
+                # Write back（REQ-2.3: 一時ファイル + os.replace で原子的に）
+                atomic_write_text(file_path, ', '.join(tags), fsync=False, verify=False)
                 
                 success_count += 1
                 

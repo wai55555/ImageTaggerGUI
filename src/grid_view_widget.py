@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QRect, QObject, QEvent, QTimer
 from PySide6.QtGui import QPixmap, QWheelEvent, QResizeEvent
 
 import tag_utils
+from text_io import atomic_write_text
 import constants
 from utils import write_debug_log
 from locale_manager import LocaleManager
@@ -253,7 +254,8 @@ class ImageEditCellWidget(QWidget):
         if new_text == old_text:
             return
         try:
-            txt_path.write_text(new_text, encoding="utf-8")
+            # REQ-2.3: 一時ファイル + os.replace で原子的に（REQ-2.7 の (iii) 段）。
+            atomic_write_text(txt_path, new_text, fsync=False, verify=False)
         except Exception as e:
             write_debug_log(f"grid caption save failed for {txt_path.name}: {type(e).__name__}: {e}")
             self.caption_save_failed.emit(f"{txt_path.name}: {type(e).__name__}: {e}")

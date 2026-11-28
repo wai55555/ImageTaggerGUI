@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import traceback
@@ -8,30 +9,35 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, TYPE_CHECKING
 
 import constants
+from text_io import atomic_write_text
 from utils import log_dbg, GetString
 from app_settings import AppSettings
+from batch_types import ExistingFileMode, FileChange, OverwriteDecision
+from batch_runner import ItemContext, ItemOutcome, run_batch
 from tagging_core import (
-    _normalize_np_chw, BASE_DIR, ExistingFileMode, FileChange, OverwriteDecision,
-    make_cpu_session_options, parse_existing_file_mode,
+    _normalize_np_chw, BASE_DIR, DEFAULT_ALPHA_BACKGROUND_RGB, ExistingFileMode,
+    FileChange, OverwriteDecision, flatten_alpha_to_rgb, make_cpu_session_options,
+    parse_existing_file_mode, resampling_filter,
 )
 
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
-    from PIL import Image
+    from PIL import Image, ImageOps
     import onnxruntime as ort  # type: ignore
     from tokenizers import Tokenizer  # type: ignore
 else:
     try:
         import numpy as np
         from numpy.typing import NDArray
-        from PIL import Image
+        from PIL import Image, ImageOps
         import onnxruntime as ort  # type: ignore
         from tokenizers import Tokenizer  # type: ignore
     except ImportError:
         np = None
         NDArray = None
         Image = None
+        ImageOps = None
         ort = None
         Tokenizer = None
 
@@ -56,6 +62,58 @@ class CaptionerConfig:
     decoder_head_dim: int = 64
     tasks: dict[str, str] = field(default_factory=dict)
     default_task: str = "MORE_DETAILED_CAPTION"
+    # DL 済み preprocessor_config.json の `resample` から決める補間方式（REQ-A7）。
+    # ファイルが無い場合の既定は Florence2ImageProcessor と同じ BILINEAR。
+    resampling: str = "bilinear"
+
+
+# torchvision / transformers の PILImageResampling と同じ並び。preprocessor_config.json は
+# この整数で `resample` を書く。
+_PIL_RESAMPLE_NAMES = {
+    0: "nearest",
+    1: "lanczos",
+    2: "bilinear",
+    3: "bicubic",
+    4: "box",
+    5: "hamming",
+}
+
+
+def _read_preprocessor_resampling(model_dir: Path) -> str:
+    """DL 済み preprocessor_config.json の補間方式を返す（REQ-A7(a)）。
+
+    Florence-2 の参照実装（Florence2ImageProcessor）の既定は BILINEAR。ファイルが
+    無い・読めない・値が想定外の場合はこの既定へ倒す。ハードコードの BICUBIC は
+    残さない。generation_config.json は読まない（max_new_tokens は
+    model_config.json の captioner 節が正本。読むと二重管理を作る）。
+    """
+    path = model_dir / "preprocessor_config.json"
+    try:
+        with path.open(encoding="utf-8") as fp:
+            data: Any = json.load(fp)
+    except FileNotFoundError:
+        log_dbg(f"captioner: {path.name} not found; using BILINEAR resampling (Florence-2 default).")
+        return "bilinear"
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError は ValueError であって OSError ではない。json.load() は
+        # 解析前にデコードするため、不正な UTF-8 の preprocessor_config.json は
+        # ここで捕まえないと Florence の初期化ごと落ちる（PR#38 レビュー指摘）。
+        log_dbg(f"captioner: could not read {path.name} ({type(e).__name__}: {e}); using BILINEAR resampling.")
+        return "bilinear"
+
+    value = data.get("resample") if isinstance(data, dict) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        name = _PIL_RESAMPLE_NAMES.get(value)
+        if name is not None:
+            return name
+    if isinstance(value, str):
+        name = value.strip().lower()
+        if name.startswith("pilimageresampling."):
+            name = name.split(".", 1)[1]
+        if name in _PIL_RESAMPLE_NAMES.values():
+            return name
+    log_dbg(f"captioner: unexpected resample {value!r} in {path.name}; using BILINEAR resampling.")
+    return "bilinear"
 
 
 def build_captioner_config(model_dir: Path, model_config: dict[str, Any]) -> CaptionerConfig:
@@ -91,6 +149,7 @@ def build_captioner_config(model_dir: Path, model_config: dict[str, Any]) -> Cap
         decoder_head_dim=head_dim,
         tasks=cap.get("tasks", {}) or d.tasks,
         default_task=cap.get("default_task", d.default_task),
+        resampling=_read_preprocessor_resampling(model_dir),
     )
 
 
@@ -142,7 +201,13 @@ class Florence2Captioner:
 
     def _preprocess_image(self, image: "Image.Image") -> "NDArray[np.float32]":
         size = self.config.image_size
-        resized = image.convert("RGB").resize((size, size), Image.Resampling.BICUBIC)
+        # REQ-A5: VLM 経路と同じく EXIF Orientation を適用する。REQ-A9: 透過画像は
+        # タガーと同じ既定背景（白）で合成する。
+        image = ImageOps.exif_transpose(image)
+        image = flatten_alpha_to_rgb(image, DEFAULT_ALPHA_BACKGROUND_RGB)
+        resized = image.resize(
+            (size, size), resampling_filter(self.config.resampling, default="bilinear")
+        )
         arr = np.asarray(resized, dtype=np.float32) / 255.0
         chw = arr.transpose((2, 0, 1))
         mean = np.asarray(self.config.normalize_mean, dtype=np.float32)
@@ -313,6 +378,10 @@ def process_caption_loop(
     既存ファイルの扱い（ASK / OVERWRITE / SKIP / APPEND）は「そのファイルに書くか」
     だけを決める。実際にどう書くか — 生成キャプションを既存内容の前に入れるか、後ろに
     足すか、丸ごと置き換えるか — は CAPTION_PLACEMENT が担当する（combine_caption）。
+
+    REQ-3.1: 反復・進捗・停止・既存ファイル判定・失敗収集・サマリ集計・FileChange 収集は
+    `batch_runner.run_batch()` に集約し、ここは「1 枚生成して書く」処理だけを持つ。
+    ASK の決定は SKIP かどうかにしか使わない（結合は placement のみで決まる現行挙動）。
     """
 
     def core_log_gui(message: str, color: str = "black") -> None:
@@ -328,86 +397,51 @@ def process_caption_loop(
     # 明示的な「追記」意図を優先し、既存内容を壊さない APPEND として扱う。PREPEND は尊重。
     if mode is ExistingFileMode.APPEND and placement == "OVERWRITE":
         placement = "APPEND"
-    changed_files: list[FileChange] = []
     task_key = settings.get("TASK", captioner.config.default_task)
     task_prompt = captioner.config.tasks.get(task_key, captioner.config.tasks.get(captioner.config.default_task, "Describe with a paragraph what is shown in the image."))
-    total = len(image_paths)
-    # issue #10: 1画像=1 GUI ログだと大量画像で Qt キューが飽和する。個々の skip / 成功は
-    # debug log だけに残し、GUI へは末尾のサマリ1行だけ出す。
-    n_skipped = 0
-    n_errors = 0
-    n_unchanged = 0
-    failed_seen = set(failed_paths or ())
-    # 全体で PROGRESS_SIGNAL_BUDGET 回に間引く（理由と天井除算の根拠は
-    # constants.progress_step_for() を参照）。最後の1枚は必ず発行して N/N に到達させる。
-    progress_step = constants.progress_step_for(total)
 
-    def mark_failed(path: Path) -> None:
-        if failed_paths is not None and path not in failed_seen:
-            failed_seen.add(path)
-            failed_paths.append(path)
+    def index_str(context: ItemContext) -> str:
+        return f"[{context.index+1}/{context.total}]"
 
-    def mark_remaining_failed(start: int) -> None:
-        if failed_paths is None:
-            return
-        for pending in image_paths[start:]:
-            if (mode is ExistingFileMode.SKIP
-                    and pending.with_suffix(".txt").is_file()):
-                continue
-            mark_failed(pending)
+    def on_item_start(context: ItemContext) -> None:
+        # REQ-3.7: 相対パス計算は各ループ側に残す（入力ディレクトリ外では現行どおり
+        # relative_to の例外になる）。
+        context.relative_path = context.image_path.relative_to(settings["INPUT_DIR"])
 
-    for i, image_path in enumerate(image_paths):
-        if progress_cb and ((i + 1) % progress_step == 0 or i == total - 1):
-            progress_cb(i + 1, total)
-        if stop_checker and stop_checker():
-            core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
-            mark_remaining_failed(i)
-            break
+    def on_existing_skip(context: ItemContext) -> None:
+        log_dbg(_get_string_internal(
+            "TaggerCore", "Tag_Skipped_Existing_File_Short",
+            current_index_str=index_str(context), output_path_name=context.output_path.name))
 
-        base_name, _ = os.path.splitext(str(image_path))
-        output_path = Path(base_name + ".txt")
-        relative_path = image_path.relative_to(settings["INPUT_DIR"])
-        current_index_str = f"[{i+1}/{len(image_paths)}]"
+    def on_stop() -> None:
+        core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
 
-        if output_path.is_file():
-            if mode is ExistingFileMode.SKIP:
-                n_skipped += 1
-                log_dbg(_get_string_internal("TaggerCore", "Tag_Skipped_Existing_File_Short", current_index_str=current_index_str, output_path_name=output_path.name))
-                continue
-            if mode is ExistingFileMode.ASK:
-                if decision_resolver is None:
-                    n_skipped += 1
-                    log_dbg("process_caption_loop: ASK モードだが decision_resolver が未設定のためスキップします")
-                    continue
-                if stop_checker and stop_checker():
-                    mark_remaining_failed(i)
-                    break
-                if decision_resolver(output_path) is OverwriteDecision.SKIP:
-                    n_skipped += 1
-                    log_dbg(_get_string_internal("TaggerCore", "Tag_Skipped_Existing_File_Short", current_index_str=current_index_str, output_path_name=output_path.name))
-                    continue
+    def process_item(context: ItemContext) -> ItemOutcome:
+        image_path = context.image_path
+        output_path = context.output_path
+        relative_path = context.relative_path
+        current_index_str = index_str(context)
 
         # ルーチンの「処理中」表示は GUI へ流さず debug log のみ（issue #10）。GUI は progress_cb 経由。
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
 
         try:
             with open(image_path, "rb") as f:
-                image = Image.open(f).convert("RGB")
+                with Image.open(f) as opened_image:
+                    # alpha を落とさずに保持し、EXIF 回転と背景合成は _preprocess_image
+                    # へ任せる（REQ-A5 / A9）。
+                    image = opened_image.copy()
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(f"Caption image load failed for {relative_path}: {type(e).__name__}: {e}")
             core_log_gui(_get_string_internal("TaggerCore", "Image_Load_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         try:
             caption, cancelled = captioner.generate(image, task_prompt, stop_checker)
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(f"Caption generation failed for {relative_path}: {type(e).__name__}: {e}")
             core_log_gui(_get_string_internal("TaggerCore", "Tag_Inference_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         if cancelled:
             # Stop was pressed mid-decode: `caption` is a truncated fragment. Writing it
@@ -415,19 +449,16 @@ def process_caption_loop(
             # leave the loop - the outer stop check would end it on the next pass anyway.
             log_dbg(f"Caption generation cancelled for {relative_path}; not writing a partial caption.")
             core_log_gui(_get_string_internal("TaggerCore", "Caption_Cancelled_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
-            mark_remaining_failed(i)
-            break
+            return ItemOutcome.abort()
 
         if not caption.strip():
             # 生成が空文字を返した（モデルの不具合・極端な画像など）。OVERWRITE だと
             # combine_caption が空文字をそのまま返し、既存キャプションを空ファイルで
             # 潰してしまう。新規側でも中身のない .txt を作って「生成済み」に見せてしまう。
             # 失敗扱いにして触らない（PR#16 レビュー指摘: coderabbit）。
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(f"Caption generation returned empty text for {relative_path}; leaving the file untouched.")
             core_log_gui(_get_string_internal("TaggerCore", "Caption_Empty_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
-            continue
+            return ItemOutcome.error()
 
         previous_content: str | None = None
         if output_path.is_file():
@@ -438,38 +469,50 @@ def process_caption_loop(
                 # 「元は存在しなかった」と undo に誤認され、undo でファイルごと削除して
                 # 原本を破壊する（PR#16 レビュー指摘）。OVERWRITE でも同じ undo 経由の
                 # 破壊が起きるので placement を問わず触らずスキップする。
-                n_errors += 1
-                mark_failed(image_path)
                 log_dbg(f"caption: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
                 core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
-                continue
+                return ItemOutcome.error()
 
         new_content = combine_caption(previous_content or "", caption, placement)
+        was_append = placement != "OVERWRITE" and previous_content is not None
         if previous_content is not None and new_content == previous_content:
             # 内容が変わらないなら mtime も変えない。ルーチン結果なので GUI へは出さず debug log のみ（issue #10）。
-            n_unchanged += 1
             log_dbg(_get_string_internal("TaggerCore", "Log_No_New_Tags", current_index_str=current_index_str, file_name=output_path.name))
-            continue
+            return ItemOutcome.unchanged()
 
         try:
-            resolved_path = output_path.resolve()
-            long_path_str = f"\\\\?\\{resolved_path}" if sys.platform == "win32" else str(resolved_path)
-            with open(long_path_str, "w", encoding="utf-8") as f:
-                f.write(new_content)
-            changed_files.append(FileChange(
-                path=output_path, previous_content=previous_content,
-                new_content=new_content, was_append=(placement != "OVERWRITE" and previous_content is not None)))
-            # ルーチンの出力成功は GUI へ流さず debug log のみ（issue #10）。
-            log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
+            # REQ-2.3: 一時ファイル + os.replace で原子的に書く（REQ-2.7 の (iii) 段）。
+            atomic_write_text(output_path, new_content, fsync=False, verify=False)
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(f"Caption save failed for {output_path.name}: {type(e).__name__}: {e}")
             core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
+            return ItemOutcome.error()
 
-    n_appended = sum(1 for c in changed_files if c.was_append)
+        # ルーチンの出力成功は GUI へ流さず debug log のみ（issue #10）。
+        log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
+
+        change = FileChange(
+            path=output_path, previous_content=previous_content,
+            new_content=new_content, was_append=was_append)
+        return ItemOutcome.written(change)
+
+    result = run_batch(
+        image_paths,
+        mode=mode,
+        output_path_for=lambda path: Path(os.path.splitext(str(path))[0] + ".txt"),
+        process_item=process_item,
+        decision_resolver=decision_resolver,
+        stop_checker=stop_checker,
+        progress_cb=progress_cb,
+        failed_paths=failed_paths,
+        on_item_start=on_item_start,
+        on_existing_skip=on_existing_skip,
+        on_stop=on_stop,
+        # tagging/caption は「進捗発行 → 停止判定」の現行順（§3.1）。
+        progress_before_stop=True,
+    )
     core_log_gui(_get_string_internal(
         "TaggerCore", "Batch_Summary",
-        written=len(changed_files), appended=n_appended, skipped=n_skipped,
-        unchanged=n_unchanged, errors=n_errors, total=total), "blue")
-    return changed_files
+        written=result.written, appended=result.appended, skipped=result.skipped,
+        unchanged=result.unchanged, errors=result.errors, total=result.total), "blue")
+    return result.changes

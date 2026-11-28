@@ -26,7 +26,10 @@ from vlm_protocols import (
     get_protocol, apply_request_headers,
 )
 from vlm_transport import RawHttpResponse, execute_http
-from vlm_model_list import _extract_catalog
+from vlm_model_list import (
+    _extract_catalog, is_cloudflare_connection, model_list_endpoint,
+)
+from vlm_scrub import strip_url_userinfo
 
 # Cloudflare のトークン検証はアカウント ID やモデルに依存しない専用エンドポイント。
 _CLOUDFLARE_TOKEN_VERIFY_URL = "https://api.cloudflare.com/client/v4/user/tokens/verify"
@@ -318,16 +321,13 @@ def _cloudflare_token_probe(rep: DiagReport, api_key: str, *, verify_tls: bool =
 
 
 def _model_list_request(conn: VlmConnection, api_key: str | None) -> VlmHttpRequest:
-    """推論を発生させない認証付きモデル一覧GETを組み立てる。"""
-    base = (conn.base_url or "").rstrip("/")
-    is_cloudflare = (conn.provider_id == "cloudflare"
-                     or "api.cloudflare.com" in (urlparse(base).hostname or ""))
-    if is_cloudflare and base.endswith("/ai/v1"):
-        url = base[:-len("/v1")] + "/models/search"
-        params = {"per_page": "100"}
-    else:
-        url = f"{base}/models"
-        params = {}
+    """推論を発生させない認証付きモデル一覧GETを組み立てる。
+
+    REQ-G15: エンドポイント選択は実経路（vlm_model_list）と共有の定義を使う。
+    診断だけが `{base}/models` を叩くと、実際に使われるのと違うエンドポイントで
+    保存判断・verified 記録が行われてしまう（xAI の /language-models 等）。
+    """
+    url, params = model_list_endpoint(conn)
     req = VlmHttpRequest(method="GET", url=url, headers={}, params=params, json_body={})
     if conn.protocol == "anthropic_messages":
         req.headers["anthropic-version"] = "2023-06-01"
@@ -345,7 +345,8 @@ def _run_lightweight_probe(rep: DiagReport, conn: VlmConnection,
     """GET /models（Cloudflareは /models/search）だけで認証・到達性を確認する。"""
     try:
         req = _model_list_request(conn, api_key)
-        rep.add("Request build", DiagStatus.PASS, f"{req.method} {req.url}")
+        rep.add("Request build", DiagStatus.PASS,
+                f"{req.method} {strip_url_userinfo(req.url)}")
     except Exception as e:  # noqa: BLE001 - 診断なので原因をレポートへ残す
         rep.add("Request build", DiagStatus.FAIL, f"{type(e).__name__}: {e}")
         return
@@ -460,11 +461,11 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
                 detail_key="Diag_D_Invalid_Base_Url", detail_suffix=str(e))
         return rep
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {conn.base_url!r}",
-                detail_key="Diag_D_Invalid_Base_Url", detail_suffix=repr(conn.base_url))
+        safe_base = strip_url_userinfo(conn.base_url)
+        rep.add("URL format", DiagStatus.FAIL, f"invalid base_url: {safe_base!r}",
+                detail_key="Diag_D_Invalid_Base_Url", detail_suffix=repr(safe_base))
         return rep
-    is_cloudflare = (conn.provider_id == "cloudflare"
-                     or (parsed.hostname or "").endswith("api.cloudflare.com"))
+    is_cloudflare = is_cloudflare_connection(conn, conn.base_url)
     # base_url にテンプレート変数（`{account_id}` 等）が残っていると、そのまま実
     # リクエストして意味不明な 404 になる。Cloudflare のアカウント ID 未設定だけは
     # WARN 止まり（キー自体は下の専用エンドポイントで検証できる）。それ以外の
@@ -487,7 +488,7 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         rep.add("URL format", DiagStatus.WARN, "plain http to a non-local host",
                 detail_key="Diag_D_Plain_Http_Remote")
     else:
-        rep.add("URL format", DiagStatus.PASS, conn.base_url)
+        rep.add("URL format", DiagStatus.PASS, strip_url_userinfo(conn.base_url))
     if not conn.model_id:
         rep.add("Model ID", DiagStatus.FAIL, "model_id is empty",
                 detail_key="Diag_D_Model_Id_Empty")
@@ -605,7 +606,8 @@ def diagnose(conn: VlmConnection, api_key: str | None, *,
         apply_connection_auth(req, conn.auth.type, api_key, conn.auth.header_name, conn.auth.query_param)
         apply_request_headers(req, conn.request_headers)
         apply_request_body(req, conn.request_body)
-        rep.add("Request build", DiagStatus.PASS, f"{req.method} {req.url}")
+        rep.add("Request build", DiagStatus.PASS,
+                f"{req.method} {strip_url_userinfo(req.url)}")
     except Exception as e:  # noqa: BLE001 - 診断なので全部拾う
         rep.add("Request build", DiagStatus.FAIL, f"{type(e).__name__}: {e}")
         return rep

@@ -11,9 +11,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
-from vlm_errors import VlmAttemptError, VlmErrorReason, reason_from_http_status
+from vlm_connections import normalize_model_id
+from vlm_errors import (
+    VlmAttemptError, VlmErrorReason, reason_from_http_status, reason_from_provider_code,
+)
 from vlm_profiles import GenerationProfile
+from vlm_scrub import scrub_text
 
 if TYPE_CHECKING:
     from vlm_image import PreparedImage
@@ -136,12 +141,27 @@ class VlmProtocol:
     # 共通ヘルパ: HTTP ステータスからの一次分類。各実装が body を見て上書きしてよい。
     @staticmethod
     def _error_from_status(status: int, text_body: str, provider_code: str = "") -> VlmAttemptError:
+        # REQ-G10: 例外側（_scrub_exc）と同じマスクを通してからメッセージへ入れる。
+        # 生のレスポンスボディには API キーがエコーされることがある。
         return VlmAttemptError(
             reason=reason_from_http_status(status, text_body, provider_code),
             http_status=status,
-            message=(text_body or "")[:500],
+            message=scrub_text(text_body, limit=500),
             provider_code=provider_code,
         )
+
+
+def _error_from_body_payload(payload: Any, http_status: int, text_body: str) -> VlmAttemptError:
+    """200 応答の本文に含まれる error オブジェクトを通常の分類へ流す（REQ-G1）。"""
+    code = ""
+    message = ""
+    if isinstance(payload, dict):
+        code = str(payload.get("code") or payload.get("type") or payload.get("status") or "")
+        message = str(payload.get("message") or "")
+    reason = reason_from_provider_code(code, message) or VlmErrorReason.BAD_RESPONSE
+    detail = scrub_text(message or text_body, limit=500)
+    return VlmAttemptError(reason=reason, http_status=http_status,
+                           message=detail, provider_code=code)
 
 
 class OpenAIChatCompletionsProtocol(VlmProtocol):
@@ -192,6 +212,9 @@ class OpenAIChatCompletionsProtocol(VlmProtocol):
                 err = VlmAttemptError(VlmErrorReason.CONTENT_POLICY, status or None, err.message, code)
             return VlmParseResult(error=err)
 
+        # REQ-G1: 200 でも error フィールドを持つ応答は非200 と同じ分類へ流す。
+        if body.get("error"):
+            return VlmParseResult(error=_error_from_body_payload(body.get("error"), 200, text_body))
         text = extract_by_path(body, self.default_text_path)
         finish = str(extract_by_path(body, "choices[0].finish_reason") or "")
         pt = _as_int(extract_by_path(body, "usage.prompt_tokens"))
@@ -248,6 +271,13 @@ class OpenAIResponsesProtocol(VlmProtocol):
             if is_policy:
                 err = VlmAttemptError(VlmErrorReason.CONTENT_POLICY, status or None, err.message, code)
             return VlmParseResult(error=err)
+        # REQ-G1: Responses API は 200 + status="failed" + body["error"] を返す。
+        # ここで error を読まないと実エラーコードを捨てて EMPTY_RESPONSE に潰れ、
+        # rate_limit のクールダウン登録も model_not_found の EXCLUDE も働かない。
+        if str(body.get("status") or "").strip().lower() == "failed" or body.get("error"):
+            payload = body.get("error")
+            if payload:
+                return VlmParseResult(error=_error_from_body_payload(payload, 200, text_body))
         text = _openai_responses_text(body, self.default_text_path)
         status_text = str(body.get("status") or "")
         incomplete = str(extract_by_path(body, "incomplete_details.reason") or "")
@@ -302,6 +332,10 @@ class AnthropicMessagesProtocol(VlmProtocol):
             return VlmParseResult(error=self._error_from_status(status or 0, text_body, code))
         text = _anthropic_text(body, self.default_text_path)
         finish = str(body.get("stop_reason") or "")
+        # REQ-G2: Anthropic の refusal は他形式の content_filter / SAFETY と同じ扱いにする。
+        if finish.strip().lower() == "refusal":
+            return VlmParseResult(error=VlmAttemptError(
+                VlmErrorReason.CONTENT_POLICY, 200, "stop_reason=refusal"))
         pt = _as_int(extract_by_path(body, "usage.input_tokens"))
         ct = _as_int(extract_by_path(body, "usage.output_tokens"))
         if not text:
@@ -322,7 +356,10 @@ class GeminiGenerateContentProtocol(VlmProtocol):
 
     def build_request(self, base_url: str, api_key: str | None, spec: VlmCallSpec) -> VlmHttpRequest:
         root = base_url.rstrip("/") if base_url else "https://generativelanguage.googleapis.com/v1beta"
-        url = f"{root}/models/{spec.model_id}:generateContent"
+        # REQ-G3: 公式表記 `models/gemini-...` を貼られても二重接頭辞にしない。
+        # URL へ載せる前にセグメントとしてエスケープし、`?`／`#`／`/` でパスを壊させない。
+        model_segment = quote(normalize_model_id(spec.model_id), safe="")
+        url = f"{root}/models/{model_segment}:generateContent"
         headers = {"Content-Type": "application/json"}
         params: dict[str, str] = {}
         if api_key:

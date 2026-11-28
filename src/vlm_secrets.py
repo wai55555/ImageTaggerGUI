@@ -44,6 +44,19 @@ def _service_for(secret_ref: str) -> str:
     return _SERVICE
 
 
+def _unquote_dotenv_value(value: str) -> str:
+    """.env の値をクォート解除する（REQ-5.8）。
+
+    両端が**対応する同じクォート**で囲まれているときだけ外側 1 組を外す。
+    旧実装の `val.strip().strip('"').strip("'")` はクォート文字を無条件に全部剥がすため、
+    クォートしていない値の両端の `"` / `'` まで壊していた（`"abc'` はそのまま、
+    `""x""` は `"x"` になる）。
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
+
+
 def _load_dotenv() -> None:
     """exe/スクリプトの隣、または作業ディレクトリの `.env` を環境変数へ読み込む。
 
@@ -75,7 +88,7 @@ def _load_dotenv() -> None:
                 line = line[7:]
             key, _, val = line.partition("=")
             key = key.strip()
-            val = val.strip().strip('"').strip("'")
+            val = _unquote_dotenv_value(val.strip())
             if key and key not in os.environ:
                 os.environ[key] = val
 
@@ -164,6 +177,14 @@ def set_secret(secret_ref: str, value: str, *, persist: bool) -> bool:
     return False
 
 
+def _looks_like_missing_entry(exc: BaseException) -> bool:
+    """「エントリが無い」ことを表す例外か（backend ごとに型も文言も違う）。"""
+    if type(exc).__name__ in {"PasswordDeleteError", "PasswordGetError"}:
+        return True
+    text = str(exc).lower()
+    return "not found" in text or "no such" in text or "not exist" in text
+
+
 def delete_secret(secret_ref: str) -> bool:
     """秘密値を削除する。keyring から実際に消えていれば True。
 
@@ -174,18 +195,37 @@ def delete_secret(secret_ref: str) -> bool:
         return True
     removed = True
     if keyring is not None:
+        unconfirmed_delete = False
         for service in (_SERVICE, _LEGACY_SERVICE):
             try:
                 keyring.delete_password(service, secret_ref)
-            except Exception as e:  # backend 無し / エントリ未登録など
+            except Exception as e:  # backend 無し / エントリ未登録 / ロック中など
                 write_debug_log(f"vlm_secrets: keyring delete failed for a ref: {type(e).__name__}")
-        # 実際に消えたかを両サービス名で確認する（未登録なら例外でも結果的に None で OK）。
+                if not _looks_like_missing_entry(e):
+                    # 「無い」ではなく「消せたか分からない」例外（KeyringLocked 等）。
+                    # この状態ではキーが残っている可能性がある（PR#38 レビュー指摘）。
+                    unconfirmed_delete = True
+        # 実際に消えたかを両サービス名で確認する。「値が残っていることを確認できた」
+        # ときだけ removed = False とする（REQ-5.5）。エントリ未登録のときに例外を返す
+        # バックエンドでは、読み直しが例外になるのが正常なので「確認できなかった」を
+        # そのまま「残っている」と判定はしない。
         for service in (_SERVICE, _LEGACY_SERVICE):
             try:
                 if keyring.get_password(service, secret_ref):
                     removed = False
-            except Exception:
-                removed = False
+            except Exception as e:
+                if unconfirmed_delete:
+                    # 削除自体も確認できていない → 消えたとは言えないので失敗として返す。
+                    removed = False
+                    write_debug_log(
+                        f"vlm_secrets: delete and verification both failed "
+                        f"({type(e).__name__}); reporting it as not removed"
+                    )
+                else:
+                    write_debug_log(
+                        f"vlm_secrets: could not verify deletion ({type(e).__name__}); "
+                        f"treating it as removed"
+                    )
     with _lock:
         _session_store.pop(secret_ref, None)
     return removed

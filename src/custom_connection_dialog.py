@@ -16,7 +16,11 @@ from PySide6.QtWidgets import (
 )
 
 import vlm_secrets
-from vlm_connections import ConnectionKind, ConnectionLocality, VlmConnection, resolve_custom_kind
+from vlm_connections import (
+    RetryPolicy,
+    ConnectionKind, ConnectionLocality, VlmConnection, normalize_model_id, resolve_custom_kind,
+)
+from vlm_scrub import strip_url_userinfo
 from vlm_config import new_connection_id
 from vlm_model_list import ModelCatalogEntry, catalog_entry_from_id, filter_vlm_catalog
 from vlm_worker import VlmModelListWorker
@@ -117,7 +121,12 @@ class CustomConnectionDialog(QDialog):
         adv = QGroupBox(self._t("Vlm", "Custom_Section_Advanced"))
         gf = QFormLayout(adv)
         self.connect_timeout = _spin(1, 120, 10)
-        self.read_timeout = _spin(5, 900, 120)
+        # REQ-5.10: 既定の read_timeout は本体側の RetryPolicy（60 秒）が正。
+        # ここに 120 を直書きすると、(a) 新規作成した接続が本体既定と違う値で保存され、
+        # (b) retry を持たない既存接続を開いて保存するだけで実効値が 60→120 に変わる。
+        # RetryPolicy は float なので QSpinBox 用に int へ落とす（現行 60.0 では切り捨て
+        # の影響なし。将来の既定が非整数になれば切り捨てになる）。
+        self.read_timeout = _spin(5, 900, int(RetryPolicy().read_timeout_s))
         self.retry_same = _spin(0, 5, 1)
         self.text_path_edit = QLineEdit()
         self.text_path_edit.setPlaceholderText("choices[0].message.content")
@@ -164,7 +173,7 @@ class CustomConnectionDialog(QDialog):
         self.auth_query_edit.setText(str(auth.get("query_param", "key")))
         retry = data.get("retry", {}) if isinstance(data.get("retry"), dict) else {}
         self.connect_timeout.setValue(_int(retry.get("connect_timeout_s"), 10))
-        self.read_timeout.setValue(_int(retry.get("read_timeout_s"), 120))
+        self.read_timeout.setValue(_int(retry.get("read_timeout_s"), int(RetryPolicy().read_timeout_s)))
         self.retry_same.setValue(_int(retry.get("retry_same_max"), 1))
         resp = data.get("response", {}) if isinstance(data.get("response"), dict) else {}
         self.text_path_edit.setText(str(resp.get("text_path", "") or data.get("text_path", "")))
@@ -312,8 +321,10 @@ class CustomConnectionDialog(QDialog):
 
     def _on_save(self) -> None:
         name = self.name_edit.text().strip()
-        base_url = self.base_url_edit.text().strip()
-        model_id = self.model_edit.currentText().strip()
+        # REQ-G12: base_url の userinfo は保存しない。
+        # REQ-G3: `models/` 接頭辞は保存前に落とす（実行経路と同じ正規化）。
+        base_url = strip_url_userinfo(self.base_url_edit.text().strip())
+        model_id = normalize_model_id(self.model_edit.currentText())
         if not name or not base_url or not model_id:
             QMessageBox.warning(self, self._t("Vlm", "Custom_Dialog_Title"),
                                 self._t("Vlm", "Custom_Validation_Required"))

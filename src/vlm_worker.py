@@ -227,10 +227,12 @@ class VlmCaptionWorker(QObject):
     def _run_single_test(self) -> None:
         self.running_state_changed.emit(True)
         changed: list[FileChange] = []
+        executor: VlmExecutor | None = None
         try:
             rt = self._build_runtime()
             if rt is None:
                 return
+            executor = rt["executor"]
             if not rt["candidates"].has_candidates:
                 # 画面へは訳した理由を出し、英語の原文はデバッグログへ残す。
                 write_debug_log("vlm: " + explain_candidate_failure(
@@ -298,6 +300,10 @@ class VlmCaptionWorker(QObject):
             self.log_message.emit(self.get_string("Vlm", "Error_Fatal", e=str(e)), "red")
             write_debug_log(f"vlm single test fatal: {traceback.format_exc()}")
         finally:
+            # Session の解放（テストのスタブ executor は close を持たない）。
+            close_executor = getattr(executor, "close", None)
+            if callable(close_executor):
+                close_executor()
             self.batch_completed.emit(changed)
             self.running_state_changed.emit(False)
             self.reload_image_list_signal.emit()
@@ -308,6 +314,8 @@ class VlmCaptionWorker(QObject):
         self.running_state_changed.emit(True)
         changed: list[FileChange] = []
         failed: list[Path] = []
+        # REQ-G7: 実行中に使い回した HTTP Session をジョブ終了時に閉じる。
+        executor: VlmExecutor | None = None
         try:
             rt = self._build_runtime()
             if rt is None:
@@ -341,7 +349,10 @@ class VlmCaptionWorker(QObject):
             last_conn = ""
 
             self.log_message.emit(self.get_string("Vlm", "Batch_Start", count=total), "blue")
-            executor: VlmExecutor = rt["executor"]
+            # close 用に Optional で保持し、呼び出しは非 Optional の別名で行う
+            # （pyright の reportOptionalMemberAccess を避ける）。
+            executor = rt["executor"]
+            active_executor = rt["executor"]  # type: VlmExecutor
 
             def remaining_failures(start: int) -> list[Path]:
                 """Return unprocessed inputs that would still require VLM work."""
@@ -367,7 +378,7 @@ class VlmCaptionWorker(QObject):
 
                 # 既存出力をSKIPする画像は、接続が尽きていても失敗では
                 # ない。それを解決した後、実際に生成が必要な画像でだけ打ち切る。
-                if not executor.live_candidates(candidates.connection_ids):
+                if not active_executor.live_candidates(candidates.connection_ids):
                     # break で残り全部を一括で見捨てない: ここでの「候補が尽きた」は
                     # 恒久的な EXCLUDE だけでなく、レート制限のような時間で解ける
                     # cooldown が原因のこともある。この画像だけ失敗にして次へ進めば、
@@ -398,7 +409,7 @@ class VlmCaptionWorker(QObject):
                                                           name=image_path.name), "red")
                     continue
 
-                result = executor.caption_one(spec_base, candidates.connection_ids)
+                result = active_executor.caption_one(spec_base, candidates.connection_ids)
                 if self.is_stopped() or result.stopped:
                     self.log_message.emit(self.get_string("Vlm", "Stopped_By_User"), "orange")
                     failed.extend(remaining_failures(i))
@@ -452,6 +463,10 @@ class VlmCaptionWorker(QObject):
             self.log_message.emit(self.get_string("Vlm", "Error_Fatal", e=str(e)), "red")
             write_debug_log(f"vlm batch fatal: {traceback.format_exc()}")
         finally:
+            # Session の解放（テストのスタブ executor は close を持たない）。
+            close_executor = getattr(executor, "close", None)
+            if callable(close_executor):
+                close_executor()
             # 例外で途中終了しても、それまでに実書き込みしたファイルは Undo 対象にする。
             # 失敗画像パスも同様に部分結果で出す（成功時は空）。単体テスト側では出さない。
             self.batch_completed.emit(changed)

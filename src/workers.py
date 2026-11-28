@@ -1,14 +1,17 @@
 from pathlib import Path
+import csv
 import json
 import os
 import requests
 import threading
+from dataclasses import dataclass
 from typing import Callable, Sequence
 from collections import Counter
 
 from PySide6.QtCore import QObject, Signal, Slot
 
 from utils import write_debug_log, calculate_sha256, GetString, default_get_string_fallback
+from text_io import atomic_write_text
 from constants import (
     DOWNLOAD_URLS, MODEL_PATH, TAGS_CSV_PATH, MODEL_POINTER_PATH
 )
@@ -17,7 +20,9 @@ from get_pointer_huggingface import get_model_info_from_pointer
 from tagging_core import (
     setup_tagger_from_settings, process_image_loop, get_image_paths_recursive,
     FileChange, OverwriteDecision, parse_target_mode, filter_target_images,
+    TAGS_CSV_COLUMN_COUNTS,
 )
+import tagging_core
 import model_registry
 import caption_core
 
@@ -92,6 +97,22 @@ def ensure_pixai_tags_csv(get_string: GetString, log: Callable[[str, str], None]
             tmp.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class FileDownloadResult:
+    """1ファイル分の DL 結果。
+
+    `bool()` は成功／失敗（既存の `if not success:` をそのまま使える）。
+    `suspected_incomplete` は REQ-E6 の「不完全の疑い」で、成功／失敗とは別軸。
+    期待サイズも Content-Length も無いまま正常終端したファイルは、完全性を
+    証明できないため呼び出し側は verified を付けてはいけない。
+    """
+    ok: bool
+    suspected_incomplete: bool = False
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 class DownloaderWorker(QObject):
     """Downloads model files and verifies their integrity."""
     log_message = Signal(str, str)
@@ -105,6 +126,8 @@ class DownloaderWorker(QObject):
         self._stop_event = threading.Event()
         self._file_sizes: dict[Path, int] = {} # To store expected file sizes
         self._hash_verified_files: set[Path] = set()  # Which file(s) get SHA256-checked for the current model
+        # REQ-E3/E6: CSV サイドカーの形式確認に使う、このモデルの tags_csv.format。
+        self._tags_csv_format: str | None = None
 
     def stop(self):
         write_debug_log(f"DEBUG: {type(self).__name__}.stop() called.")
@@ -113,137 +136,225 @@ class DownloaderWorker(QObject):
     def is_stopped(self):
         return self._stop_event.is_set()
 
-    def _download_single_file(self, file_path: Path, url: str, expected_sha256: str | None = None) -> bool:
-        """
-        Downloads a single file with progress updates and optional SHA256 verification.
-        Returns True on success, False otherwise.
+    def _download_single_file(
+        self,
+        file_path: Path,
+        url: str,
+        expected_sha256: str | None = None,
+        *,
+        mark_verified: bool = True,
+        allow_restart: bool = True,
+    ) -> "FileDownloadResult":
+        """Downloads a single file with progress updates and optional SHA256 verification.
+
+        `mark_verified=False` is passed by the manifest path, which marks the model
+        verified only after every file succeeded (REQ-E2). The legacy PixAI path keeps
+        the default: its model.onnx success is the only place that marks it.
+
+        `suspected_incomplete=True` means the transfer ended normally but neither an
+        expected size nor a Content-Length was available, so completeness cannot be
+        proven (REQ-E6). The caller must then not mark the model verified.
+
+        `allow_restart` bounds the single 416 re-fetch so a server that keeps answering
+        416 cannot recurse forever (REQ-E4).
         """
         if self.is_stopped():
-            return False
+            return FileDownloadResult(False)
 
         file_name = file_path.name
         # 期待される最終サイズ。モデルポインターから取得した値があればそれを使用。
         # なければ0で初期化し、content-lengthから取得を試みる。
         expected_final_size = self._file_sizes.get(file_path, 0)
-        
+
         if file_path.exists():
             if file_path == TAGS_CSV_PATH:
-                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Skip_Existing_Tags_CSV", file_name=file_path.name), "blue")
-                write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Skip_Existing_Tags_CSV_Debug", file_path_name=file_path.name)), self.get_string)
-                return True
-
-            local_size = file_path.stat().st_size
-            if expected_final_size > 0: # 期待サイズが分かっている場合のみチェック
-                if local_size > expected_final_size:
-                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_LocalFileTooLarge", file_name=file_path.name), "red")
-                    return False
-                elif local_size == expected_final_size:
-                    if file_path in self._hash_verified_files and expected_sha256:
-                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_VerifyingHash", file_name=file_path.name), "blue")
-                        local_sha256 = calculate_sha256(file_path)
-                        if local_sha256.lower() == expected_sha256.lower():
-                            self._mark_model_as_verified()
-                            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_HashMatch", file_name=file_path.name), "green")
-                            write_debug_log(str(self.get_string("Workers", "DownloaderWorker_HashMatch_Log", file_path_name=file_path.name)), self.get_string)
-                            return True
-                        else:
-                            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_HashMismatch", file_name=file_path.name), "red")
-                            file_path.unlink(missing_ok=True)
-                            return False
-                    else:
-                        write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Skip_Existing", file_path_name=file_path.name)), self.get_string)
-                        return True
+                # REQ-E6: 実在だけで「取得済み」と判断しない。形式確認を通ったものだけ
+                # 再利用し、途中で切れた CSV は取り直す（従来は無条件にスキップしていた）。
+                if self._sidecar_looks_complete(file_path, self._tags_csv_format):
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Skip_Existing_Tags_CSV", file_name=file_path.name), "blue")
+                    write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Skip_Existing_Tags_CSV_Debug", file_path_name=file_path.name)), self.get_string)
+                    return FileDownloadResult(True)
+                write_debug_log(f"DownloaderWorker: existing {file_name} does not look like a complete tags CSV; re-downloading.")
+                file_path.unlink(missing_ok=True)
+            else:
+                local_size = file_path.stat().st_size
+                if expected_final_size > 0: # 期待サイズが分かっている場合のみチェック
+                    if local_size > expected_final_size:
+                        # REQ-E7: 削除しないと何度再実行しても同じ分岐で即失敗し、アプリ内から
+                        # 永遠に回復できない。ハッシュ不一致分岐と同じく unlink して自己回復させる
+                        # （ログ文言も「削除される」と約束している）。
+                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_LocalFileTooLarge", file_name=file_path.name), "red")
+                        file_path.unlink(missing_ok=True)
+                        return FileDownloadResult(False)
+                    elif local_size == expected_final_size:
+                        return FileDownloadResult(
+                            self._verify_complete_local_file(
+                                file_path, expected_sha256, mark_verified=mark_verified)
+                        )
 
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Downloading_Model", file_name=file_name, total_size=f"{expected_final_size/1024/1024:.2f}"), "blue")
-        
+        if expected_final_size > 0:
+            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Downloading_Model", file_name=file_name, total_size=f"{expected_final_size/1024/1024:.2f}"), "blue")
+        else:
+            # REQ-E9: 期待サイズが無いファイルに "(0.00 MB)" と表示しない。
+            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Downloading_Model_UnknownSize", file_name=file_name), "blue")
+
         downloaded_size = file_path.stat().st_size if file_path.exists() else 0
         mode = 'ab' if downloaded_size > 0 else 'wb'
 
         try:
             write_debug_log(str(self.get_string("Workers", "DownloaderWorker_URL_Connect_Start", url=url)), self.get_string)
             headers = {'Range': f'bytes={downloaded_size}-'}
-            response = requests.get(url, stream=True, timeout=10, headers=headers)
-            response.raise_for_status()
-            content_length = int(response.headers.get('content-length', 0))
-            
-            # 進捗表示用の合計サイズを決定
-            current_total_size_for_progress = expected_final_size if expected_final_size > 0 else content_length
-
-            if content_length > 0:
-                if response.status_code == 206:
-                    # レジュームダウンロードの場合、進捗表示用の合計サイズを更新
-                    current_total_size_for_progress = downloaded_size + content_length
-                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Resume_Download", content_length=f"{content_length/1024/1024:.2f}", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "black")
-                else:
-                    if downloaded_size > 0:
-                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Warning_200_OK_Restart"), "orange")
-                        downloaded_size = 0
-                        mode = 'wb'
-                    # 新規ダウンロードの場合、進捗表示用の合計サイズを更新
-                    current_total_size_for_progress = content_length
-                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Info_FileSize_Header", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "black")
-            
-            last_percent = int(downloaded_size * 100 / current_total_size_for_progress) if current_total_size_for_progress > 0 else 0
-            self.progress_update.emit(last_percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
-            
-            with open(file_path, mode) as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if self.is_stopped(): break
-                    f.write(chunk)
-                    downloaded_size += len(chunk)
-                    if current_total_size_for_progress > 0: 
-                        percent = min(100, int(downloaded_size * 100 / current_total_size_for_progress))
-                        self.progress_update.emit(percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
-                        last_percent = percent
-            
-            if self.is_stopped():
-                write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Aborted", file_name=file_name)), self.get_string)
-                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Download_Aborted_User", file_name=file_name), "red")
-                return False
-            
-            final_size = file_path.stat().st_size
-            
-            # 最終的なファイルサイズチェックは expected_final_size と比較
-            # expected_final_size が0より大きい場合のみチェックを行う
-            if expected_final_size > 0 and final_size != expected_final_size:
-                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Size_Mismatch", downloaded_size=f"{final_size/1024/1024:.2f}", total_size=f"{expected_final_size/1024/1024:.2f}"), "red")
-                return False
-            # expected_final_size が0の場合（期待サイズ不明の場合）は、content_length が0より大きい場合は content_length と比較する
-            # 期待サイズ不明の場合は current_total_size_for_progress と比較する。
-            # 206 Partial Content では content_length は「残りバイト数」でしかないため、
-            # そのまま比較すると正常に再開・完了したファイルを不一致として弾いてしまう。
-            elif expected_final_size == 0 and current_total_size_for_progress > 0 and final_size != current_total_size_for_progress:
-                 self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Size_Mismatch", downloaded_size=f"{final_size/1024/1024:.2f}", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "red")
-                 return False
-
-            if file_path in self._hash_verified_files and expected_sha256:
-                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_VerifyingHash", file_name=file_path.name), "blue")
-                local_sha256 = calculate_sha256(file_path)
-                if local_sha256.lower() != expected_sha256.lower():
-                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_HashMismatch", file_name=file_path.name), "red")
+            # REQ-E8: レスポンスは with で確実に閉じる（例外時も解放される）。
+            with requests.get(url, stream=True, timeout=10, headers=headers) as response:
+                if response.status_code == 416:
+                    # REQ-E4: 416 は「Range の開始位置が既にファイル末尾以降」。
+                    # 期待サイズ既知でローカルがちょうどそのサイズか、SHA256 が分かっていれば
+                    # 「完全」を証明できる（後者は gpu_runtime と同じ考え方）。
+                    can_prove_complete = (
+                        (expected_final_size > 0 and downloaded_size == expected_final_size)
+                        or bool(expected_sha256)
+                    )
+                    if can_prove_complete:
+                        write_debug_log(f"DownloaderWorker: server returned 416 for {file_name} but the local file can be proven complete; verifying it instead of re-downloading.")
+                        return FileDownloadResult(
+                            self._verify_complete_local_file(
+                                file_path, expected_sha256, mark_verified=mark_verified)
+                        )
+                    # 完全とみなせない場合は部分ファイルを捨てて最初から取り直す。
+                    write_debug_log(f"DownloaderWorker: server returned 416 for {file_name}; discarding the partial file and restarting from scratch.")
                     file_path.unlink(missing_ok=True)
-                    return False
-                else:
-                    self._mark_model_as_verified()
-            
-            if not self.is_stopped():
-                self.progress_update.emit(100, current_total_size_for_progress / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
-                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Download_Complete", file_name=file_name), "green")
-            
-            return True
-                
+                    if allow_restart:
+                        return self._download_single_file(
+                            file_path, url, expected_sha256,
+                            mark_verified=mark_verified, allow_restart=False)
+                    return FileDownloadResult(False)
+
+                response.raise_for_status()
+                content_length = int(response.headers.get('content-length', 0))
+
+                # 進捗表示用の合計サイズを決定
+                current_total_size_for_progress = expected_final_size if expected_final_size > 0 else content_length
+
+                if content_length > 0:
+                    if response.status_code == 206:
+                        # レジュームダウンロードの場合、進捗表示用の合計サイズを更新
+                        current_total_size_for_progress = downloaded_size + content_length
+                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Resume_Download", content_length=f"{content_length/1024/1024:.2f}", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "black")
+                    else:
+                        if downloaded_size > 0:
+                            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Warning_200_OK_Restart"), "orange")
+                            downloaded_size = 0
+                            mode = 'wb'
+                        # 新規ダウンロードの場合、進捗表示用の合計サイズを更新
+                        current_total_size_for_progress = content_length
+                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Info_FileSize_Header", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "black")
+
+                last_percent = int(downloaded_size * 100 / current_total_size_for_progress) if current_total_size_for_progress > 0 else 0
+                self.progress_update.emit(last_percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
+
+                with open(file_path, mode) as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if self.is_stopped(): break
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        if current_total_size_for_progress > 0:
+                            percent = min(100, int(downloaded_size * 100 / current_total_size_for_progress))
+                            # REQ-5.16: 8KB チャンクごとに emit すると 1.2GB のモデルで
+                            # 約 15 万回のクロススレッドシグナルになる。パーセントが
+                            # 変化したときだけ発行する（最大 101 回＋完了時の 100）。
+                            # 停止チェック（is_stopped）の粒度は変えない。
+                            if percent != last_percent:
+                                self.progress_update.emit(percent, downloaded_size / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
+                                last_percent = percent
+
+                if self.is_stopped():
+                    write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Aborted", file_name=file_name)), self.get_string)
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Download_Aborted_User", file_name=file_name), "red")
+                    return FileDownloadResult(False)
+
+                final_size = file_path.stat().st_size
+
+                # 最終的なファイルサイズチェックは expected_final_size と比較
+                # expected_final_size が0より大きい場合のみチェックを行う
+                if expected_final_size > 0 and final_size != expected_final_size:
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Size_Mismatch", downloaded_size=f"{final_size/1024/1024:.2f}", total_size=f"{expected_final_size/1024/1024:.2f}"), "red")
+                    return FileDownloadResult(False)
+                # expected_final_size が0の場合（期待サイズ不明の場合）は、content_length が0より大きい場合は content_length と比較する
+                # 期待サイズ不明の場合は current_total_size_for_progress と比較する。
+                # 206 Partial Content では content_length は「残りバイト数」でしかないため、
+                # そのまま比較すると正常に再開・完了したファイルを不一致として弾いてしまう。
+                elif expected_final_size == 0 and current_total_size_for_progress > 0 and final_size != current_total_size_for_progress:
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Size_Mismatch", downloaded_size=f"{final_size/1024/1024:.2f}", total_size=f"{current_total_size_for_progress/1024/1024:.2f}"), "red")
+                    return FileDownloadResult(False)
+
+                has_hash_target = file_path in self._hash_verified_files and bool(expected_sha256)
+                suspected_incomplete = (
+                    not has_hash_target
+                    and expected_final_size == 0
+                    and content_length == 0
+                )
+                if suspected_incomplete:
+                    # REQ-E6(a): 警告を残し、(b) 呼び出し側で verified を付けない。
+                    write_debug_log(f"DownloaderWorker: {file_name} finished without an expected size or Content-Length; its completeness cannot be verified.")
+
+                if file_path in self._hash_verified_files and expected_sha256:
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_VerifyingHash", file_name=file_path.name), "blue")
+                    local_sha256 = calculate_sha256(file_path)
+                    if local_sha256.lower() != expected_sha256.lower():
+                        self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_HashMismatch", file_name=file_path.name), "red")
+                        file_path.unlink(missing_ok=True)
+                        return FileDownloadResult(False)
+                    elif mark_verified:
+                        self._mark_model_as_verified()
+
+                if not self.is_stopped():
+                    self.progress_update.emit(100, current_total_size_for_progress / 1024 / 1024, current_total_size_for_progress / 1024 / 1024)
+                    self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Download_Complete", file_name=file_name), "green")
+
+                return FileDownloadResult(True, suspected_incomplete)
+
         except requests.exceptions.RequestException as e:
             write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Network_Error", e=e)), self.get_string)
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Network_Failed"), "red")
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Details", type_e_name=type(e).__name__, e=e), "red")
-            return False
+            return FileDownloadResult(False)
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Unexpected_Error", e=e)), self.get_string)
             error_msg = self.get_string("Workers", "DownloaderWorker_Error_Unexpected_File_Access")
             self.log_message.emit(error_msg, "red")
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_Details", type_e_name=type(e).__name__, e=e), "red")
+            return FileDownloadResult(False)
+
+    def _verify_complete_local_file(self, file_path: Path, expected_sha256: str | None, *,
+                                    mark_verified: bool) -> bool:
+        """サイズ既知で「既に完全」と分かっているローカルファイルを検証する。
+
+        既存ファイルのスキップ分岐と 416 応答の両方から使う（REQ-E4）。
+        `mark_verified=False` はマニフェスト経路（REQ-E2）。
+        """
+        if file_path in self._hash_verified_files and expected_sha256:
+            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_VerifyingHash", file_name=file_path.name), "blue")
+            local_sha256 = calculate_sha256(file_path)
+            if local_sha256.lower() == expected_sha256.lower():
+                if mark_verified:
+                    self._mark_model_as_verified()
+                self.log_message.emit(self.get_string("Workers", "DownloaderWorker_HashMatch", file_name=file_path.name), "green")
+                write_debug_log(str(self.get_string("Workers", "DownloaderWorker_HashMatch_Log", file_path_name=file_path.name)), self.get_string)
+                return True
+            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_HashMismatch", file_name=file_path.name), "red")
+            file_path.unlink(missing_ok=True)
             return False
+        write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Skip_Existing", file_path_name=file_path.name)), self.get_string)
+        return True
+
+    def _mark_model_as_unverified(self):
+        """REQ-E6(b): 不完全の疑いがあるファイルを含むモデルの verified を取り消す。"""
+        try:
+            update_model_verification_status(self.model_id, False, self.get_string)
+            write_debug_log(f"DownloaderWorker: cleared the verified flag for '{self.model_id}' because a downloaded file could not be proven complete.")
+        except Exception as e:
+            write_debug_log(f"DownloaderWorker: failed to clear the verified flag for '{self.model_id}': {e}")
 
     def _mark_model_as_verified(self):
         try:
@@ -257,40 +368,54 @@ class DownloaderWorker(QObject):
 
     @Slot()
     def run_download(self):
+        """Download entry point. Guarantees exactly one `download_finished` emission.
+
+        REQ-E5: an unexpected exception used to leave the UI stuck in "downloading" and
+        orphan the thread, because the signal was emitted inside each path's helper.
+        """
         write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Start")), self.get_string)
+        ok = False
+        try:
+            ok = self._download()
+        except Exception as exc:  # noqa: BLE001 - last-resort guard for the worker
+            write_debug_log(f"DownloaderWorker: fatal {exc!r}")
+        self.download_finished.emit(ok)
+        write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Thread_Exit")), self.get_string)
+
+    def _download(self) -> bool:
+        entry = model_registry.get_model_entry(self.model_id)
+        if entry is not None:
+            # REQ-E3/E6: CSV サイドカーの形式確認に、そのモデルの tags_csv.format を使う。
+            self._tags_csv_format = model_registry.config_mapping(entry.config, "tags_csv").get("format")
 
         if self.model_id == "pixai-tagger-v0.9":
-            self._run_download_pixai_legacy()
-            return
+            return self._run_download_pixai_legacy()
 
-        entry = model_registry.get_model_entry(self.model_id)
         if entry is None:
             write_debug_log(f"DownloaderWorker: unknown model_id '{self.model_id}', cannot download.")
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_NoPointerURL"), "red")
-            self.download_finished.emit(False)
-            return
+            return False
 
-        self._download_from_manifest(entry.model_dir, model_registry.config_mapping(entry.config, "network"))
+        return self._download_from_manifest(entry.model_dir, model_registry.config_mapping(entry.config, "network"))
 
-    def _run_download_pixai_legacy(self):
-        """Unchanged PixAI download path (design.md 5章, NFR-3: byte-for-byte the same as before multi-model support)."""
+    def _run_download_pixai_legacy(self) -> bool:
+        """Unchanged PixAI download path (design.md 5章, NFR-3) - except REQ-E2/E6."""
         all_success = True
         self._hash_verified_files = {MODEL_PATH}
 
         model_pointer_url = DOWNLOAD_URLS.get(MODEL_POINTER_PATH)
         if not model_pointer_url:
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_NoPointerURL"), "red")
-            self.download_finished.emit(False)
-            return
+            return False
 
         expected_sha256, expected_size = get_model_info_from_pointer(model_pointer_url, self.get_string)
         if not expected_sha256 or not expected_size:
             self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_FailedToGetModelInfo"), "red")
-            self.download_finished.emit(False)
-            return
+            return False
 
         self._file_sizes[MODEL_PATH] = expected_size
 
+        suspected_incomplete = False
         for file_path, url in DOWNLOAD_URLS.items():
             if file_path == MODEL_POINTER_PATH:
                 continue
@@ -299,28 +424,62 @@ class DownloaderWorker(QObject):
                 all_success = False
                 break
 
-            success = self._download_single_file(file_path, url, expected_sha256 if file_path == MODEL_PATH else None)
-            if not success:
+            result = self._download_single_file(file_path, url, expected_sha256 if file_path == MODEL_PATH else None)
+            if not result:
                 all_success = False
                 break
+            if result.suspected_incomplete:
+                suspected_incomplete = True
 
-        self.download_finished.emit(all_success)
-        write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Thread_Exit")), self.get_string)
+        if all_success and suspected_incomplete:
+            # REQ-E6(b): レガシー経路はモデル本体の印しが後続ファイルより先に付くため、
+            # 不完全が判明した時点で取り消す。
+            self._mark_model_as_unverified()
 
-    @staticmethod
-    def _sidecar_looks_complete(file_path: Path) -> bool:
-        """Cheap integrity check for a non-hash-verified sidecar already on disk."""
+        return all_success
+
+    def _sidecar_looks_complete(self, file_path: Path, csv_format: str | None = None) -> bool:
+        """Cheap integrity check for a non-hash-verified sidecar already on disk.
+
+        JSON must parse. CSV must be structurally sound (REQ-E3): every row has the same
+        number of columns and the header matches the model's declared csv_format. When
+        `csv_format` is unknown, only the column-count consistency is checked.
+        """
         try:
             if file_path.stat().st_size == 0:
                 return False
-            if file_path.suffix.lower() == ".json":
+            suffix = file_path.suffix.lower()
+            if suffix == ".json":
                 with file_path.open("r", encoding="utf-8") as f:
                     json.load(f)
+                return True
+            if suffix == ".csv":
+                return self._csv_sidecar_looks_complete(file_path, csv_format)
             return True
         except Exception:
             return False
 
-    def _download_from_manifest(self, model_dir: Path, network_config: dict):
+    @staticmethod
+    def _csv_sidecar_looks_complete(file_path: Path, csv_format: str | None) -> bool:
+        """CSV サイドカーの形式確認（REQ-E3）。
+
+        行の境界で綺麗に切れた切り詰めは、パースも列構造も成立するため検出できない
+        （計画 §13 REQ-E3 に明記された限界。行の途中で切れたものと列構造の崩れを検出する）。
+        """
+        expected_columns = TAGS_CSV_COLUMN_COUNTS.get(csv_format or "")
+        try:
+            with file_path.open("r", encoding="utf-8-sig", newline="") as fp:
+                rows = [row for row in csv.reader(fp) if any(cell.strip() for cell in row)]
+        except (OSError, UnicodeDecodeError, csv.Error):
+            return False
+        if len(rows) < 2:  # ヘッダ＋最低1データ行
+            return False
+        widths = {len(row) for row in rows}
+        if len(widths) != 1:
+            return False
+        return expected_columns is None or len(rows[0]) == expected_columns
+
+    def _download_from_manifest(self, model_dir: Path, network_config: dict) -> bool:
         """
         Generic downloader for any model described by a model_config.json "network" block
         (spec.md 6.1節). Rather than requiring a separate pointer_url per file in the config,
@@ -338,9 +497,11 @@ class DownloaderWorker(QObject):
         self._hash_verified_files = {model_dir / name for name in hash_verified_names}
 
         expected_sha_by_path: dict[Path, str] = {}
+        pointer_failures: list[str] = []
         for name in hash_verified_names:
             url = files.get(name)
             if not url:
+                pointer_failures.append(name)
                 continue
             pointer_url = url.replace("/resolve/main/", "/raw/main/")
             expected_sha256, expected_size = get_model_info_from_pointer(pointer_url, self.get_string)
@@ -349,7 +510,14 @@ class DownloaderWorker(QObject):
                 expected_sha_by_path[file_path] = expected_sha256
                 self._file_sizes[file_path] = expected_size
             else:
-                write_debug_log(f"DownloaderWorker: could not resolve pointer info for {name} ({pointer_url}); will download without hash verification.")
+                pointer_failures.append(name)
+
+        if pointer_failures:
+            # REQ-E1: 期待ハッシュ／サイズが無い状態で DL を進めない（レガシー経路に揃える）。
+            # 進めてしまうと、ハッシュ検証なしのファイルに verified が付きうる。
+            write_debug_log(f"DownloaderWorker: could not resolve pointer info for {pointer_failures}; aborting the download.")
+            self.log_message.emit(self.get_string("Workers", "DownloaderWorker_Error_FailedToGetModelInfo"), "red")
+            return False
 
         # Fetch the shared tag-translation key list first: it is tiny, and doing it here
         # means translations work even if the (much larger) model download is aborted.
@@ -357,6 +525,7 @@ class DownloaderWorker(QObject):
             ensure_pixai_tags_csv(self.get_string, self.log_message.emit, self.is_stopped)
 
         all_success = True
+        suspected_incomplete = False
         for file_name, url in files.items():
             if self.is_stopped():
                 all_success = False
@@ -367,27 +536,34 @@ class DownloaderWorker(QObject):
                 # Small metadata/tag JSON/CSV sidecars aren't hash-verified, and HF often
                 # serves them gzip-encoded with no Content-Length, so there's no reliable
                 # size to compare against. Trust an existing copy only if it passes a cheap
-                # sanity check (parseable JSON / non-empty) - a copy left truncated by an
-                # interrupted earlier run must be re-fetched, not trusted forever.
-                if self._sidecar_looks_complete(file_path):
+                # sanity check (parseable JSON / structurally sound CSV) - a copy left
+                # truncated by an interrupted earlier run must be re-fetched, not trusted
+                # forever.
+                if self._sidecar_looks_complete(file_path, self._tags_csv_format):
                     write_debug_log(f"DownloaderWorker: {file_name} already exists and looks complete, skipping (not hash-verified).")
                     continue
                 write_debug_log(f"DownloaderWorker: {file_name} exists but looks truncated/corrupt; re-downloading.")
                 file_path.unlink(missing_ok=True)
 
-            success = self._download_single_file(file_path, url, expected_sha_by_path.get(file_path))
-            if not success:
+            # REQ-E2: マニフェスト経路では verified をここで付けず、全ファイル成功後に付ける。
+            result = self._download_single_file(
+                file_path, url, expected_sha_by_path.get(file_path), mark_verified=False)
+            if not result:
                 all_success = False
                 break
+            if result.suspected_incomplete:
+                suspected_incomplete = True
 
-        # Mark verified once the whole manifest is on disk. Without this, a model whose
-        # pointer hashes never resolve (or that declares no hash_verified_file) downloads
-        # fully but stays "unverified" - _is_model_available then keeps offering Download.
-        if all_success:
+        # Mark verified only once the whole manifest is on disk and no file's completeness
+        # is in doubt (REQ-E2/E6). Without this, a model whose pointer hashes never resolve
+        # (or that declares no hash_verified_file) downloads fully but stays "unverified" -
+        # _is_model_available then keeps offering Download.
+        if all_success and not suspected_incomplete:
             self._mark_model_as_verified()
+        elif all_success:
+            write_debug_log("DownloaderWorker: not marking the model verified because at least one file could not be proven complete.")
 
-        self.download_finished.emit(all_success)
-        write_debug_log(str(self.get_string("Workers", "DownloaderWorker_Download_Thread_Exit")), self.get_string)
+        return all_success
 
 class GpuRuntimeDownloadWorker(QObject):
     """任意ダウンロードの GPU コンポーネント（CUDA provider DLL ＋ NVIDIA ランタイム）を
@@ -403,6 +579,8 @@ class GpuRuntimeDownloadWorker(QObject):
         super().__init__()
         self.get_string: GetString = get_string if get_string else default_get_string_fallback
         self._stop_event = threading.Event()
+        # REQ-5.19: 進捗シグナルの間引き用（直前に発行したパーセント）。
+        self._last_progress_percent = -1
 
     def stop(self):
         write_debug_log(f"DEBUG: {type(self).__name__}.stop() called.")
@@ -412,9 +590,14 @@ class GpuRuntimeDownloadWorker(QObject):
         return self._stop_event.is_set()
 
     def _on_progress(self, done: int, total: int) -> None:
+        # REQ-5.19: gpu_runtime は 256KB チャンクごとに呼ぶ（合計約 2GB で約 8,000 回）。
+        # パーセントが変化したときだけ emit する。合計不明（total == 0）はパーセントが
+        # 定義できないため現行どおり毎回発行する。
         if total > 0:
             pct = max(0, min(100, int(done * 100 / total)))
-            self.progress_update.emit(pct, done / 1024 / 1024, total / 1024 / 1024)
+            if pct != self._last_progress_percent:
+                self._last_progress_percent = pct
+                self.progress_update.emit(pct, done / 1024 / 1024, total / 1024 / 1024)
         else:
             self.progress_update.emit(0, done / 1024 / 1024, 0.0)
 
@@ -582,7 +765,13 @@ class TaggerThreadWorker(QObject):
             tagger, settings_dict = setup_tagger_from_settings(self._settings, self.get_string)
             if not tagger or not settings_dict:
                 self.log_message.emit(self.get_string("Workers", "TaggerThreadWorker_Error_Tagger_Init_Failed"), "red")
-                self._mark_model_as_unverified()
+                if tagging_core.ort is None or tagging_core.np is None or tagging_core.Image is None:
+                    # REQ-E11: ライブラリ不足はモデルファイルの問題ではない。Captioner 側と同じく
+                    # 環境要因を区別し、数百 MB の再 DL を強いる unverified 化をしない。
+                    write_debug_log("TaggerThreadWorker: required libraries are missing; keeping the model's verified flag.")
+                    self.log_message.emit(self.get_string("TaggerCore", "Onnxruntime_Not_Installed"), "red")
+                else:
+                    self._mark_model_as_unverified()
                 # running_state_changed / reload / finished are all emitted once by the
                 # finally block below - do not emit them here too (double reload / double
                 # finished otherwise).
@@ -841,8 +1030,8 @@ class BulkTagWorker(QObject):
             
             if set(existing_tags) != set(modified_tags):
                 new_content = ", ".join(modified_tags)
-                with open(txt_file_path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
+                # REQ-2.3: 一時ファイル + os.replace で原子的に書く（(iii) 段）。
+                atomic_write_text(txt_file_path, new_content, fsync=False, verify=False)
                 return True
         except Exception as e:
             write_debug_log(str(self.get_string("Workers", "BulkTagWorker_File_Processing_Failed", txt_name=txt_file_path.name, e=e)), self.get_string)

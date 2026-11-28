@@ -1,9 +1,11 @@
 import configparser
+import io
 import os
 from typing import Any
 from dataclasses import dataclass, field, is_dataclass, fields
 from pathlib import Path
 
+from text_io import atomic_write_text
 from utils import write_debug_log, GetString, default_get_string_fallback
 from vlm_profiles import DEFAULT_MAX_OUTPUT_TOKENS
 
@@ -326,6 +328,16 @@ def get_default_config() -> configparser.ConfigParser:
     config.read_dict(DEFAULT_CONFIG)
     return config
 
+def _write_config_atomically(config: configparser.ConfigParser) -> None:
+    """config.ini を原子的に書く（REQ-2.3 / REQ-2.7 の (i) 段）。
+
+    低頻度・高価値なファイルなので、fsync + 読み直し検証 + os.replace のフル装備を使う。
+    改行は現行どおり `newline=None`（Windows では CRLF へ翻訳）で、バイト列を変えない。
+    """
+    buffer = io.StringIO()
+    config.write(buffer)
+    atomic_write_text(CONFIG_PATH, buffer.getvalue(), fsync=True, verify=True)
+
 def load_config() -> configparser.ConfigParser:
     """Loads the config.ini file, creating it from defaults if it doesn't exist."""
     config = get_default_config()
@@ -335,8 +347,7 @@ def load_config() -> configparser.ConfigParser:
         write_debug_log(_get_string("ConfigUtils", "Config_File_Load_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
     else:
         try:
-            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-                config.write(f)
+            _write_config_atomically(config)
             write_debug_log(_get_string("ConfigUtils", "Config_File_NotFound_Create_Default", CONFIG_PATH=CONFIG_PATH), _get_string)
         except Exception as e:
             write_debug_log(_get_string("ConfigUtils", "Config_File_Creation_Failed", e=e), _get_string)
@@ -483,6 +494,46 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
     )
 
 
+def _merge_unknown_config_entries(config: configparser.ConfigParser) -> bool:
+    """既存 config.ini の未知キー／未知セクションを `config` へ取り込む（REQ-5.2）。
+
+    `save_config()` は dataclass から config を**再構築**するため、そのまま書くと
+    手書きで足したキーや将来の版のキーが消える。現在のファイルを読んで、dataclass が
+    書かないキー／セクションだけを足す（既知キーの値は dataclass 側を正とする）。
+
+    旧形式の `[Model] verified` だけは**取り込まない**（移行で消費済みのキーで、残すと
+    `_parse_verified_models()` が `verified_models` より優先し続けて移行が完了しない）。
+
+    Returns:
+        取り込めたら True。ファイルが無い／パースできない場合は False。
+        パース不能（セクションヘッダ無し等）でも保存自体は成功させる（現行挙動の維持）。
+    """
+    if not CONFIG_PATH.is_file():
+        return False
+    # REQ（PR#38 レビュー）: `items()` は既定で補間するため、値に `%` を含む未知キー
+    # （例: `progress = 100%`）で InterpolationSyntaxError になる。保存に使う parser も
+    # 補間なしで作らないと `set()` が単独の `%` を拒否するので、両方 `interpolation=None`
+    # にして生の表現のまま持ち回る（未知キーはアプリが読まないため補間は不要）。
+    existing = configparser.ConfigParser(interpolation=None)
+    try:
+        existing.read(CONFIG_PATH, encoding='utf-8')
+    except Exception as e:
+        write_debug_log(
+            f"config.ini could not be parsed for unknown-key preservation; "
+            f"writing the dataclass defaults only ({type(e).__name__}: {e})"
+        )
+        return False
+    if existing.has_option('Model', 'verified'):
+        existing.remove_option('Model', 'verified')
+    for section in existing.sections():
+        if not config.has_section(section):
+            config.add_section(section)
+        for key, value in existing.items(section):
+            if not config.has_option(section, key):
+                config.set(section, key, value)
+    return True
+
+
 def save_config(settings: AppSettings) -> bool:
     """Saves the AppSettings object to the config.ini file.
 
@@ -490,7 +541,8 @@ def save_config(settings: AppSettings) -> bool:
     configuration file cannot be written.
     """
     write_debug_log(_get_string("ConfigUtils", "Settings_Save_Start"), _get_string)
-    config = configparser.ConfigParser()
+    # 未知キーの値をそのまま書き戻せるよう補間なしで組み立てる（上記と同じ理由）。
+    config = configparser.ConfigParser(interpolation=None)
 
     def _save_dataclass_to_config(config_parser: configparser.ConfigParser, dataclass_instance: Any, section_name: str):
         if not config_parser.has_section(section_name):
@@ -505,7 +557,9 @@ def save_config(settings: AppSettings) -> bool:
             else:
                 # Convert value to string for configparser
                 if isinstance(value, float):
-                    config_parser.set(section_name, field_info.name, f"{value:.2f}")
+                    # REQ-5.1: `f"{value:.2f}"` は小数第3位以下を丸める（0.455 → 0.45）。
+                    # repr(float) は最短の往復表現なので、保存→読込→保存で値が変わらない。
+                    config_parser.set(section_name, field_info.name, repr(float(value)))
                 elif isinstance(value, Path):
                     config_parser.set(section_name, field_info.name, str(value))
                 elif isinstance(value, dict):
@@ -532,8 +586,11 @@ def save_config(settings: AppSettings) -> bool:
 
 
     try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-            config.write(f)
+        # REQ-5.2: 未知キー／未知セクションを保持する（壊れた config でも保存は続行）。
+        # 取り込みで予期しない失敗をしても、保存 API の契約どおり False を返して
+        # 例外を漏らさないよう try の内側で行う（PR#38 レビュー指摘）。
+        _merge_unknown_config_entries(config)
+        _write_config_atomically(config)
         write_debug_log(_get_string("ConfigUtils", "Config_File_Save_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
         return True
     except Exception as e:

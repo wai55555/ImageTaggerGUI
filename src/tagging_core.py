@@ -18,18 +18,19 @@ from constants import BASE_DIR
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
-    from PIL import Image
+    from PIL import Image, ImageOps
     import onnxruntime as ort # type: ignore
 else:
     try:
         import numpy as np
         from numpy.typing import NDArray
-        from PIL import Image
+        from PIL import Image, ImageOps
         import onnxruntime as ort # type: ignore
     except ImportError:
         np = None
         NDArray = None
         Image = None
+        ImageOps = None
         ort = None
 
 LOG_FILE_PATH = BASE_DIR / "debug_log.txt"
@@ -38,6 +39,7 @@ CONFIG_PATH = BASE_DIR / "config.ini"
 from utils import config_mapping, log_dbg, GetString
 from app_settings import AppSettings, load_settings
 from onnx_providers import make_session
+from text_io import atomic_write_text
 
 
 # カテゴリ別の最大タグ数が1つも指定されていない場合に適用する出力上限。
@@ -45,6 +47,12 @@ from onnx_providers import make_session
 # predict() を直接呼んだとき（単体テスト・スクリプト利用）だけ。出力仕様に影響
 # するため、無名の 100 ではなく根拠付きの定数として置く。
 DEFAULT_TAG_OUTPUT_CAP = 100
+
+# 透過画像を推論へ渡すときの合成背景（REQ-A9）。マニフェストで
+# inference.alpha_background_rgb を指定していないモデルにも同じ既定を適用する。
+# 値は唯一の既存定義（pixai-tagger-v1.0 の [255, 255, 255]）と VLM 経路の
+# 平坦化色に合わせた白。モデルごとに透明の扱いが変わるのを防ぐ。
+DEFAULT_ALPHA_BACKGROUND_RGB = (255, 255, 255)
 
 
 _get_string: GetString = lambda section, key, **kwargs: str(key)
@@ -56,33 +64,10 @@ if not TYPE_CHECKING:
             raise ImportError(_get_string("TaggerCore", "Error_Required_Libraries_NotFound"))
         sys.exit(1)
 
-@dataclass(frozen=True)
-class FileChange:
-    """1ファイル分の書き換え記録（design.md 2.2節）。
-
-    previous_content が None なら「変更前にファイルが存在しなかった」ことを表し、
-    Undo ではファイルを削除する。was_append は追記ログ / 説明用のメタ情報。
-    """
-    path: Path
-    previous_content: str | None
-    new_content: str
-    was_append: bool
-    added_tags: tuple[str, ...] = ()
-
-
-class ExistingFileMode(Enum):
-    """出力先の .txt が既に存在する場合の処理方針（spec.md 1.1節）。"""
-    ASK = auto()        # 都度確認
-    OVERWRITE = auto()  # 常に上書き
-    SKIP = auto()       # 常にスキップ
-    APPEND = auto()     # 常に追記
-
-
-class OverwriteDecision(Enum):
-    """ASK モードでユーザーが1ファイルに対して下した判断（spec.md 2.2節）。"""
-    OVERWRITE = auto()
-    SKIP = auto()
-    APPEND = auto()
+# REQ-3.3: バッチ処理の骨格（batch_runner）と共有する型は batch_types へ移した。
+# 既存の `from tagging_core import FileChange` 等が壊れないよう、ここで再エクスポートする。
+from batch_types import ExistingFileMode, FileChange, OverwriteDecision
+from batch_runner import ItemContext, ItemOutcome, run_batch
 
 
 EXISTING_FILE_MODE_MAP: dict[str, ExistingFileMode] = {
@@ -205,6 +190,38 @@ def _resolve_category_keep_row(category_str: str, *, context: str) -> int:
         return int(TagCategory.GENERAL)
     return resolved
 
+def _category_slot(category_key: Any) -> int | None:
+    """閾値／上限の Mapping のキーをカテゴリ ID（int）へ落とす。
+
+    `TagCategory` は IntEnum なので int キーでも同じスロットを指す。解釈できない
+    キーは呼び出し側で「使われないキー」として無視する（改修前の辞書引きと同じ挙動）。
+    """
+    try:
+        return int(category_key)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cell(cells: list[str], index: int) -> str:
+    """CSV 行から列を取り出す。短い行は空文字で位置を保持する（REQ-A1）。
+
+    infer_batch_prepared はラベルとスコアを index で zip するため、短い行を
+    `continue` で飛ばすと以降のタグがすべて別のスコアに結び付く。
+    """
+    return cells[index] if index < len(cells) else ""
+
+
+def _is_blank_csv_row(cells: list[str]) -> bool:
+    """物理的な空行だけをデータ行でないとみなす（REQ-A1 / PR#38 レビュー指摘）。
+
+    区切り文字だけの行（`,,` や `,,,,,`）は「列を持つ空レコード」であり、落とすと
+    以降の行が 1 行ずつずれてスコア対応が壊れる。プレースホルダ（空文字）として
+    位置を保つ。空白だけの行も同様に保持する: 末尾に余分な行が増えても `zip(tags,
+    scores)` が短い方で切るため、後続の対応はずれない（落とす方が危険）。
+    """
+    return not cells
+
+
 def _load_selected_tags_pixai6col(tags_path: Path) -> list[TagMeta]:
     labels: list[TagMeta] = []
     with tags_path.open(encoding="utf-8", newline="") as fp:
@@ -214,12 +231,12 @@ def _load_selected_tags_pixai6col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 6:
+            if _is_blank_csv_row(cells):
                 continue
-            tag_name = cells[2]
-            category = _resolve_category_keep_row(cells[3], context="pixai6col")
-            count_str = cells[4]
-            ips_json = cells[5]
+            tag_name = _cell(cells, 2)
+            category = _resolve_category_keep_row(_cell(cells, 3), context="pixai6col")
+            count_str = _cell(cells, 4)
+            ips_json = _cell(cells, 5)
             try:
                 count = int(count_str) if count_str else None
             except ValueError:
@@ -245,10 +262,10 @@ def _load_selected_tags_simple3col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 3:
+            if _is_blank_csv_row(cells):
                 continue
-            category = _resolve_category_keep_row(cells[2], context="simple3col")
-            labels.append(TagMeta(name=cells[1], category=category, count=None, ips=()))
+            category = _resolve_category_keep_row(_cell(cells, 2), context="simple3col")
+            labels.append(TagMeta(name=_cell(cells, 1), category=category, count=None, ips=()))
     return labels
 
 def _load_selected_tags_wd4col(tags_path: Path) -> list[TagMeta]:
@@ -261,15 +278,100 @@ def _load_selected_tags_wd4col(tags_path: Path) -> list[TagMeta]:
         except StopIteration:
             return []
         for cells in reader:
-            if len(cells) < 4:
+            if _is_blank_csv_row(cells):
                 continue
-            category = _resolve_category_keep_row(cells[2], context="wd4col")
+            category = _resolve_category_keep_row(_cell(cells, 2), context="wd4col")
+            count_str = _cell(cells, 3)
             try:
-                count = int(cells[3]) if cells[3] else None
+                count = int(count_str) if count_str else None
             except ValueError:
                 count = None
-            labels.append(TagMeta(name=cells[1], category=category, count=count, ips=()))
+            labels.append(TagMeta(name=_cell(cells, 1), category=category, count=count, ips=()))
     return labels
+
+class _IndexPairsDict(dict):
+    """`json.load(object_pairs_hook=...)` の結果。重複キーを記録しておく。
+
+    json は重複キーを後勝ちで潰すため、parse 後の dict からは「重複していた」ことを
+    検出できない。インデックスの重複はタグとスコアの対応ずれに直結するので、
+    parse 時点で記録して REQ-A2 の検証へ渡す。
+    """
+
+    duplicate_keys: tuple[str, ...] = ()
+
+
+def _index_pairs_hook(pairs: list[tuple[str, Any]]) -> _IndexPairsDict:
+    result = _IndexPairsDict()
+    duplicates: list[str] = []
+    for key, value in pairs:
+        if key in result:
+            duplicates.append(key)
+        result[key] = value
+    result.duplicate_keys = tuple(duplicates)
+    return result
+
+
+def _load_index_json(tags_path: Path) -> Any:
+    """重複キーを記録しつつ JSON を読む（REQ-A2）。"""
+    with tags_path.open(encoding="utf-8") as fp:
+        return json.load(fp, object_pairs_hook=_index_pairs_hook)
+
+
+def _as_index_key(key: Any) -> int | None:
+    try:
+        return int(key)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_missing_indices(indices: list[int], limit: int = 5) -> list[int]:
+    """昇順インデックスの欠番を先頭から最大 `limit` 個返す。
+
+    `set(range(indices[-1] + 1))` を作ると、キーが `"0"` と `"1000000000"` の
+    2 件だけでも 10 億要素を確保してメモリ不足で落ちる（PR#38 レビュー指摘）。
+    診断目的なので、最初の数個が分かれば十分。
+    """
+    missing: list[int] = []
+    previous: int | None = None
+    for value in indices:
+        if previous is not None and value > previous + 1:
+            for candidate in range(previous + 1, min(value, previous + 1 + (limit - len(missing)))):
+                missing.append(candidate)
+            if len(missing) >= limit:
+                break
+        previous = value
+    return missing
+
+
+def _validated_numeric_keys(mapping: Any, *, context: str, tags_path: Path) -> list[str]:
+    """インデックス写像の連続性を検証し、数値キーを昇順で返す（REQ-A2）。
+
+    欠け・重複・非連続は「タグとスコアの対応が黙ってずれる」ため、詰めて読まずに
+    例外へ倒す（PixAI v1 のローダと同じ振る舞い）。
+    """
+    if not isinstance(mapping, dict):
+        raise ValueError(
+            f"load_selected_tags[{context}]: expected an object, got "
+            f"{type(mapping).__name__} in {tags_path}"
+        )
+    numeric = _numeric_keys_sorted(mapping)
+    duplicates = sorted({
+        index for key in getattr(mapping, "duplicate_keys", ())
+        if (index := _as_index_key(key)) is not None
+    })
+    indices = [int(key) for key in numeric]
+    if duplicates or indices != list(range(len(indices))):
+        problems: list[str] = []
+        if duplicates:
+            problems.append(f"duplicate indices {duplicates}")
+        if indices:
+            missing = _first_missing_indices(indices)
+            if missing:
+                problems.append(f"missing indices {missing}")
+        detail = "; ".join(problems) or f"non-contiguous indices {indices}"
+        raise ValueError(f"load_selected_tags[{context}]: {detail} in {tags_path}")
+    return numeric
+
 
 def _numeric_keys_sorted(raw: dict[str, Any]) -> list[str]:
     """Keys that are integer strings, in numeric order. Non-numeric keys (a stray
@@ -294,15 +396,14 @@ def _load_selected_tags_idx_json(tags_path: Path) -> list[TagMeta]:
          [optional] "idx_to_category": {"<idx>": "General"}}
     * flat list:  [{"tag"/"name": "...", "category": "..."}, ...]  (order == index)
     """
-    with tags_path.open(encoding="utf-8") as fp:
-        raw: Any = json.load(fp)
+    raw: Any = _load_index_json(tags_path)
     labels: list[TagMeta] = []
 
     if isinstance(raw, dict) and "idx_to_tag" in raw:
         idx_to_tag: dict[str, Any] = raw.get("idx_to_tag", {}) or {}
         tag_to_category: dict[str, Any] = raw.get("tag_to_category", {}) or {}
         idx_to_category: dict[str, Any] = raw.get("idx_to_category", {}) or {}
-        for idx in _numeric_keys_sorted(idx_to_tag):
+        for idx in _validated_numeric_keys(idx_to_tag, context="idx_json/v2", tags_path=tags_path):
             tag_name = str(idx_to_tag[idx])
             cat_str = str(idx_to_category.get(idx, tag_to_category.get(tag_name, "")))
             category = _resolve_category_keep_row(cat_str, context="idx_json/v2")
@@ -321,7 +422,7 @@ def _load_selected_tags_idx_json(tags_path: Path) -> list[TagMeta]:
         return labels
 
     # v1 shape: {"<idx>": {"tag": ..., "category": ...}}
-    for idx in _numeric_keys_sorted(raw):
+    for idx in _validated_numeric_keys(raw, context="idx_json", tags_path=tags_path):
         entry = raw[idx] if isinstance(raw[idx], dict) else {}
         category = _resolve_category_keep_row(str(entry.get("category", "")), context="idx_json")
         labels.append(TagMeta(name=str(entry.get("tag", "")), category=category, count=None, ips=()))
@@ -362,13 +463,12 @@ def _load_pixai_v1_tags_json(tags_path: Path) -> list[TagMeta]:
 
 def _load_selected_tags_camie_metadata_json(tags_path: Path) -> list[TagMeta]:
     """camie-tagger-v2: camie-tagger-v2-metadata.json -> dataset_info.tag_mapping.{idx_to_tag,tag_to_category}."""
-    with tags_path.open(encoding="utf-8") as fp:
-        raw: dict[str, Any] = json.load(fp)
-    tag_mapping = raw.get("dataset_info", {}).get("tag_mapping", {})
+    raw: dict[str, Any] = _load_index_json(tags_path)
+    tag_mapping = config_mapping(raw, "dataset_info", "tag_mapping")
     idx_to_tag: dict[str, str] = tag_mapping.get("idx_to_tag", {})
     tag_to_category: dict[str, str] = tag_mapping.get("tag_to_category", {})
     labels: list[TagMeta] = []
-    for idx in _numeric_keys_sorted(idx_to_tag):
+    for idx in _validated_numeric_keys(idx_to_tag, context="camie_metadata_json", tags_path=tags_path):
         tag_name = idx_to_tag[idx]
         category = _resolve_category_keep_row(str(tag_to_category.get(tag_name, "")), context="camie_metadata_json")
         labels.append(TagMeta(name=tag_name, category=category, count=None, ips=()))
@@ -383,12 +483,26 @@ _TAGS_CSV_LOADERS: dict[str, Callable[[Path], list[TagMeta]]] = {
     "camie_metadata_json": _load_selected_tags_camie_metadata_json,
 }
 
+# CSV 形式のタグファイルが持つ列数。DL 側（workers）の「取得済みファイルが完全か」の
+# 判定に使う（REQ-E3）。ローダーと同じ表をここに置き、列数を二重管理しない。
+# 列数が変わるとタグとスコアの対応も変わるので、形式を足すときは両方を確認すること。
+TAGS_CSV_COLUMN_COUNTS: dict[str, int] = {
+    "pixai6col": 6,
+    "simple3col": 3,
+    "wd4col": 4,
+}
+
 def load_selected_tags(tags_csv: str | Path, csv_format: TagsCsvFormat = "pixai6col") -> list[TagMeta]:
     tags_path = Path(tags_csv)
     if not tags_path.is_file():
         log_dbg(_get_string("TaggerCore", "Tag_CSV_File_Not_Found", tags_csv=str(tags_csv)))
         raise FileNotFoundError(_get_string("TaggerCore", "Tag_CSV_File_Not_Found", tags_csv=str(tags_csv)))
-    loader = _TAGS_CSV_LOADERS.get(csv_format, _load_selected_tags_pixai6col)
+    loader = _TAGS_CSV_LOADERS.get(csv_format)
+    if loader is None:
+        # REQ-A3(a): 未知の csv_format を PixAI 6列として黙って読むと、別形式の
+        # ファイルでタグとスコアの対応がずれる。fallback せず失敗させる。
+        log_dbg(f"load_selected_tags: unknown csv_format {csv_format!r} for {tags_path}")
+        raise ValueError(f"Unsupported tags csv_format: {csv_format!r}")
     return loader(tags_path)
 
 def discover_labels_csv(model_dir: Path, tags_csv: str | Path | None) -> Path | None:
@@ -418,6 +532,42 @@ def _normalize_np_chw(x: NDArray[np.float32], mean: NDArray[np.float_], std: NDA
     for c in range(3):
         x[c] = (x[c] - mean[c]) / std[c]
     return x
+
+
+def resampling_filter(name: str, default: str = "lanczos") -> "Image.Resampling":
+    """設定値のリサンプリング方式名を PIL のフィルタへ変換する。
+
+    未知の名前は `default` に倒す（従来どおり黙って LANCZOS / BILINEAR で動く）。
+    タガーの `inference.resampling` と Florence の preprocessor_config.json の
+    `resample` が同じ表を使うように、変換をここへ一本化する。
+    """
+    filters = {
+        "nearest": Image.Resampling.NEAREST,
+        "bilinear": Image.Resampling.BILINEAR,
+        "bicubic": Image.Resampling.BICUBIC,
+        "lanczos": Image.Resampling.LANCZOS,
+        "box": Image.Resampling.BOX,
+        "hamming": Image.Resampling.HAMMING,
+    }
+    key = str(name).strip().lower()
+    if key in filters:
+        return filters[key]
+    return filters.get(str(default).strip().lower(), Image.Resampling.LANCZOS)
+
+
+def flatten_alpha_to_rgb(image: "Image.Image", background_rgb: tuple[int, int, int]) -> "Image.Image":
+    """透過を指定色で平坦化して RGB 画像を返す（REQ-A9）。
+
+    EXIF Orientation の適用は呼び出し側の責務（読み込み時 or 前処理時）。
+    alpha を持たない画像は従来どおり `convert("RGB")` だけを行う。
+    """
+    has_alpha = "A" in image.getbands() or "transparency" in image.info
+    if not has_alpha:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (*background_rgb, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
 
 def make_cpu_session_options(intra_op_num_threads: int):
     """Return an ort.SessionOptions that caps intra-op parallelism, or None.
@@ -459,7 +609,7 @@ class InferenceConfig:
     output_activation: str = "sigmoid"   # "sigmoid" | "none" (already applied in-graph)
     tags_csv_format: TagsCsvFormat = "pixai6col"
     resampling: str = "lanczos"       # "nearest" | "bilinear" | "bicubic" | "lanczos"
-    alpha_background_rgb: tuple[int, int, int] | None = None
+    alpha_background_rgb: tuple[int, int, int] | None = DEFAULT_ALPHA_BACKGROUND_RGB
 
 class OnnxTagger:
     # Kept as class constants (matching InferenceConfig's own defaults) purely so any
@@ -471,6 +621,11 @@ class OnnxTagger:
     output_name: str
     tags: list[TagMeta]
     tag_meta_lookup: dict[str, TagMeta]
+    # REQ-1.2: 後処理をベクトル化するためのカテゴリ ID 列（TagMeta.category の int 配列）。
+    # self.tags は tag_meta_lookup 等の既存参照のために残す。タグ名の配列は作らない
+    # （並べ替えで同点が出た行だけタグ名を引けば足りるため。NFR-4）。
+    _tag_category_ids: NDArray[np.intp]
+    _category_slots: int
     session: ort.InferenceSession
     get_string: GetString
     inference_config: InferenceConfig
@@ -507,6 +662,8 @@ class OnnxTagger:
             raise FileNotFoundError(self.get_string("TaggerCore", "Tag_CSV_File_Not_Found_Check_Dir", model_dir=str(model_dir)))
         self.tags = load_selected_tags(tags_path, self.inference_config.tags_csv_format)
         self.tag_meta_lookup = {tag.name: tag for tag in self.tags}
+        # REQ-1.2: 後処理のフィルタ・上限判定を NumPy で回すための事前構築。
+        self._build_tag_arrays()
         log_dbg(self.get_string("TaggerCore", "Loaded_Tags_Count", count=len(self.tags), tags_path=tags_path.name))
 
         inputs: list[Any] = list(self.session.get_inputs()) # type: ignore
@@ -538,19 +695,16 @@ class OnnxTagger:
         preprocessed_images: list[NDArray[np.float32]] = []
         padding_masks: list[NDArray[np.bool_]] = []
         needs_padding_mask = "padding_mask" in cfg.extra_inputs
-        resampling = {
-            "nearest": Image.Resampling.NEAREST,
-            "bilinear": Image.Resampling.BILINEAR,
-            "bicubic": Image.Resampling.BICUBIC,
-            "lanczos": Image.Resampling.LANCZOS,
-        }.get(cfg.resampling.lower(), Image.Resampling.LANCZOS)
+        resampling = resampling_filter(cfg.resampling)
 
         for img_array in images:
             image_pil = Image.fromarray(img_array)
             w, h = image_pil.size
             ratio = min(target_size / w, target_size / h)
-            new_w = int(w * ratio)
-            new_h = int(h * ratio)
+            # REQ-A6: int() 切り捨てだと極端なアスペクト比（長辺の 1/448 未満）で
+            # 短辺が 0 になり PIL が例外を出す。VLM 側と同じ round()＋最小1で揃える。
+            new_w = max(1, round(w * ratio))
+            new_h = max(1, round(h * ratio))
             resized_image = image_pil.resize((new_w, new_h), resampling)
             canvas = Image.new("RGB", (target_size, target_size), cfg.pad_color_rgb)
             x_offset = (target_size - new_w) // 2
@@ -616,60 +770,244 @@ class OnnxTagger:
             scores_batch = output_array
         else:
             scores_batch = _sigmoid(output_array)
-        results: list[TagResult] = []
-        
         cat_thresholds: Mapping[TagCategory, float] = thresholds if thresholds is not None else {}
         cat_limits: Mapping[TagCategory, int] = max_tags if max_tags is not None else {}
 
         if not self.tags:
-             return [TagResult() for _ in scores_batch]
+            return [TagResult() for _ in scores_batch]
         hard_cap = (sum(cat_limits.values()) if cat_limits
                     else DEFAULT_TAG_OUTPUT_CAP)
         score_floor = 1e-4
-        for scores in scores_batch:
-            raw_predictions: list[TagPrediction] = []
-            for tag_meta, score in zip(self.tags, scores):
-                if score < score_floor:
-                    continue
-                category = TagCategory(tag_meta.category)
-                threshold = cat_thresholds.get(category, cat_thresholds.get(TagCategory.GENERAL, 0.0))
-                if float(score) < threshold:
-                    continue
-                raw_predictions.append(TagPrediction(
-                    name=tag_meta.name,
-                    score=float(score),
-                    category=category
-                ))
-            ordered = sorted(raw_predictions, key=lambda pred: (-pred.score, pred.name))
-            taken: list[TagPrediction] = []
-            per_category: dict[TagCategory, int] = {}
-            for prediction in ordered:
-                if len(taken) >= hard_cap:
-                    break
-                
-                category = prediction.category
-                limit = cat_limits.get(category)
+        # REQ-1.3: 閾値は呼び出しごとに変わる引数なので、行ループの外で 1 回だけ
+        # カテゴリ ID → 実効閾値のベクトルに落とす。
+        threshold_by_category = self._threshold_vector(cat_thresholds)
+        limit_by_category = self._limit_vector(cat_limits)
+        return [
+            TagResult(tags=self._predictions_for_row(
+                scores,
+                threshold_by_category,
+                limit_by_category,
+                hard_cap,
+                score_floor,
+            ))
+            for scores in scores_batch
+        ]
 
-                current = per_category.get(category, 0)
-                if limit is not None and current >= limit:
-                    continue
-                
-                per_category[category] = current + 1
-                taken.append(prediction)
-            results.append(TagResult(tags=taken))
-        return results
+    def _build_tag_arrays(self) -> None:
+        """タグメタデータから後処理用の NumPy 配列を構築する（REQ-1.2）。
+
+        `self.tags` を読み終えた直後に 1 回だけ呼ぶ。13k〜31k 要素の int 配列 1 本だけで、
+        タグ数に比例する追加コストは最小限に留める（NFR-4。タグ名の配列は作らない）。
+        テストなどで `__init__` を通さずにタグを組み立てる場合も、これを呼べば揃う。
+        """
+        self._tag_category_ids = np.fromiter(
+            (int(tag.category) for tag in self.tags), dtype=np.intp, count=len(self.tags)
+        )
+        # カテゴリ ID → 閾値／上限の配列長。全メンバーぶんを確保し、未知の ID が
+        # 混ざっていても（あり得ないが）インデックスがずれないよう最大値まで広げる。
+        max_category_id = int(self._tag_category_ids.max()) + 1 if self.tags else 0
+        self._category_slots = max(len(TagCategory), max_category_id)
+
+    def _threshold_vector(self, thresholds: Mapping[TagCategory, float]) -> NDArray[np.float64]:
+        """カテゴリ ID → その呼び出しでの実効閾値（float64）を作る。
+
+        フォールバック規則は改修前の `cat_thresholds.get(category,
+        cat_thresholds.get(GENERAL, 0.0))` と同一: 指定の無いカテゴリは GENERAL の
+        閾値、GENERAL も無ければ 0.0。dtype を float64 にするのは比較の等価性のためで、
+        float32 に落とすと Python float の閾値と約 1e-8 ずれ、閾値近傍で採否が反転し得る。
+        """
+        general = float(thresholds.get(TagCategory.GENERAL, 0.0))
+        vector = np.full(self._category_slots, general, dtype=np.float64)
+        for category_key, value in thresholds.items():
+            slot = _category_slot(category_key)
+            if slot is not None and 0 <= slot < vector.size:
+                # 改修前は辞書引きで「使われないキー」を無視していたので、範囲外・
+                # 解釈できないキーも無視して同じ結果にする。
+                vector[slot] = float(value)
+        return vector
+
+    def _limit_vector(self, limits: Mapping[TagCategory, int]) -> NDArray[np.float64]:
+        """カテゴリ ID → カテゴリ別上限を作る（NaN = 上限なし）。
+
+        改修前は `cat_limits.get(category)` が None のカテゴリを無制限として扱っていた。
+        判定を `current >= limit` の 1 比較に統一できるよう、無制限は NaN で表す
+        （NaN との比較は常に False になるので「上限に達していない」＝無制限になる）。
+        """
+        vector = np.full(self._category_slots, np.nan, dtype=np.float64)
+        for category_key, value in limits.items():
+            slot = _category_slot(category_key)
+            if slot is not None and 0 <= slot < vector.size:
+                vector[slot] = float(value)
+        return vector
+
+    def _predictions_for_row(
+        self,
+        scores: NDArray[np.float_],
+        threshold_by_category: NDArray[np.float64],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+        score_floor: float,
+    ) -> list[TagPrediction]:
+        """1 画像ぶんのスコア行から採用タグを選ぶ（REQ-1.3〜1.5, REQ-1.9）。
+
+        改修前（9e21884 の `infer_batch_prepared` 後段）と同一のセマンティクスを保つ:
+
+        - スコア床・カテゴリ別閾値とも「未満が棄却」（ちょうどは残る）。
+        - 並びはスコア降順 → タグ名昇順 → 元のタグ順（安定）。
+        - カテゴリ別上限に達したものは飛ばしつつ全体上限 hard_cap で打ち切る。
+        - zip と同じく min(len(tags), len(scores)) で打ち切る。
+
+        走査と棄却だけを NumPy で行い、TagPrediction の生成は採用された分に限る。
+        """
+        count = min(self._tag_category_ids.size, int(scores.size))
+        if count == 0 or hard_cap <= 0:
+            return []
+        row = scores[:count]
+        category_ids = self._tag_category_ids[:count]
+
+        # NaN は「床未満」「閾値未満」のどちらも False になるため改修前は通過していた。
+        # 通過させる点までは再現できるが、NaN を含むキーの並びは Python の sorted() と
+        # NumPy で一致しない（§6 U-1 / REQ-1.10 の判断対象）。勝手にどちらかへ倒さず、
+        # NaN を含む行だけ改修前の実装そのものへ委譲して挙動を固定する。
+        if np.isnan(row).any():
+            return self._predictions_for_row_reference(
+                row, threshold_by_category, limit_by_category, hard_cap, score_floor
+            )
+
+        keep = ~((row < score_floor) | (row < threshold_by_category[category_ids]))
+        candidate_index = np.flatnonzero(keep)
+        if candidate_index.size == 0:
+            return []
+        candidate_scores = row[candidate_index]
+        full_index, full_scores = candidate_index, candidate_scores
+
+        # 全体上限まで届く見込みがあるときは、先頭部分（真の並びの接頭辞）だけを確定
+        # させる。同点が多いモデルでは候補が数千件になるが、必要なのは先頭 hard_cap 件
+        # だけなので、これで並べ替えの対象を減らせる（§1.3 の計測に基づく）。
+        # 接頭辞が埋め切れなかった場合は全候補でやり直すので、結果は常に同じになる。
+        truncated = candidate_index.size > max(hard_cap * 4, 256)
+        if truncated:
+            top = np.argpartition(-candidate_scores, hard_cap - 1)[:hard_cap]
+            # 境界と同点の候補はどちらが先か決まらないので全部含める。こうすると
+            # 選んだ集合は必ず「真の並びの接頭辞」になる（外側はすべてスコアが低い）。
+            boundary = float(candidate_scores[top].min())
+            prefix_mask = candidate_scores >= boundary
+            candidate_index, candidate_scores = self._sort_candidates(
+                candidate_index[prefix_mask], candidate_scores[prefix_mask]
+            )
+        else:
+            candidate_index, candidate_scores = self._sort_candidates(candidate_index, candidate_scores)
+
+        taken = self._take_within_caps(
+            candidate_index, candidate_scores, category_ids, limit_by_category, hard_cap
+        )
+        if not truncated or len(taken) >= hard_cap:
+            return taken
+
+        # 上限を埋め切れなかった（上限に達していないカテゴリの候補が接頭辞の外にあった）
+        # → 全候補でやり直す。ここに来るのはカテゴリ別上限が厳しく効いている行だけ。
+        full_index, full_scores = self._sort_candidates(full_index, full_scores)
+        return self._take_within_caps(
+            full_index, full_scores, category_ids, limit_by_category, hard_cap
+        )
+
+    def _sort_candidates(
+        self,
+        candidate_index: NDArray[np.intp],
+        candidate_scores: NDArray[np.float_],
+    ) -> tuple[NDArray[np.intp], NDArray[np.float_]]:
+        """候補を「スコア降順 → タグ名昇順 → 元のタグ順」に並べる（REQ-1.4）。"""
+        # スコア降順。同点は kind="stable" で元のタグ順が保たれる。
+        order = np.argsort(-candidate_scores, kind="stable")
+        candidate_index = candidate_index[order]
+        candidate_scores = candidate_scores[order]
+        if candidate_scores.size > 1 and np.any(candidate_scores[1:] == candidate_scores[:-1]):
+            # 同点があるときだけタグ名昇順を足す（同点が無ければ argsort で確定）。
+            # 第 3 キーの candidate_index が一意なので並びは完全に決まる。
+            names = np.array([self.tags[int(tag_index)].name for tag_index in candidate_index])
+            tie_order = np.lexsort((candidate_index, names, -candidate_scores))
+            candidate_index = candidate_index[tie_order]
+            candidate_scores = candidate_scores[tie_order]
+        return candidate_index, candidate_scores
+
+    def _take_within_caps(
+        self,
+        candidate_index: NDArray[np.intp],
+        candidate_scores: NDArray[np.float_],
+        category_ids: NDArray[np.intp],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+    ) -> list[TagPrediction]:
+        """並び順に走査し、カテゴリ別上限を飛ばしつつ全体上限で打ち切る（§1.1-6）。"""
+        taken: list[TagPrediction] = []
+        per_category: dict[int, int] = {}
+        for position in range(candidate_index.size):
+            if len(taken) >= hard_cap:
+                break
+            tag_index = int(candidate_index[position])
+            category_id = int(category_ids[tag_index])
+            used = per_category.get(category_id, 0)
+            # 無制限は NaN なので比較は False になり、上限判定が効かない。
+            if used >= limit_by_category[category_id]:
+                continue
+            per_category[category_id] = used + 1
+            taken.append(TagPrediction(
+                name=self.tags[tag_index].name,
+                score=float(candidate_scores[position]),
+                category=TagCategory(category_id),
+            ))
+        return taken
+
+    def _predictions_for_row_reference(
+        self,
+        scores: NDArray[np.float_],
+        threshold_by_category: NDArray[np.float64],
+        limit_by_category: NDArray[np.float64],
+        hard_cap: int,
+        score_floor: float,
+    ) -> list[TagPrediction]:
+        """改修前（9e21884）の後処理そのもの。NaN を含む行のためだけに残す。
+
+        `sorted()` は NaN キーに対して「比較が常に False」という定義外の並びを作る。
+        その並びは NumPy のソートと一致しないため、NaN を含む行ではこの実装へ委譲し、
+        改修前後で観測可能な出力が変わる余地を残さない（REQ-1.10）。
+        """
+        raw_predictions: list[TagPrediction] = []
+        for tag_meta, score in zip(self.tags, scores):
+            if score < score_floor:
+                continue
+            category = TagCategory(tag_meta.category)
+            if float(score) < threshold_by_category[int(category)]:
+                continue
+            raw_predictions.append(TagPrediction(
+                name=tag_meta.name,
+                score=float(score),
+                category=category
+            ))
+        ordered = sorted(raw_predictions, key=lambda pred: (-pred.score, pred.name))
+        taken: list[TagPrediction] = []
+        per_category: dict[TagCategory, int] = {}
+        for prediction in ordered:
+            if len(taken) >= hard_cap:
+                break
+            category = prediction.category
+            current = per_category.get(category, 0)
+            if current >= limit_by_category[int(category)]:
+                continue
+            per_category[category] = current + 1
+            taken.append(prediction)
+        return taken
 
     def infer_batch(self, images: Sequence[Image.Image], *, thresholds: Mapping[TagCategory, float] | None = None, max_tags: Mapping[TagCategory, int] | None = None) -> list[TagResult]:
         rgb_arrays: list[NDArray[np.uint8]] = []
+        background_rgb = self.inference_config.alpha_background_rgb
         for image in images:
-            background_rgb = self.inference_config.alpha_background_rgb
-            if background_rgb is not None and ("A" in image.getbands() or "transparency" in image.info):
-                rgba = image.convert("RGBA")
-                background = Image.new("RGBA", rgba.size, (*background_rgb, 255))
-                background.alpha_composite(rgba)
-                image = background.convert("RGB")
-            else:
+            # REQ-A9: 既定は白背景。マニフェストが明示的に null を書いた場合だけ
+            # 従来の「alpha を捨てる」変換に倒す。
+            if background_rgb is None:
                 image = image.convert("RGB")
+            else:
+                image = flatten_alpha_to_rgb(image, background_rgb)
             rgb_arrays.append(np.asarray(image, dtype=np.uint8))
         batch, extra_inputs = self.prepare_batch_from_rgb_np(rgb_arrays)
         return self.infer_batch_prepared(batch, extra_inputs, thresholds=thresholds, max_tags=max_tags)
@@ -714,6 +1052,41 @@ def format_tags(tag_results: TagResult, convert_underscore: bool) -> str:
     output_tags += _emit(by_category.get(TagCategory.RATING, []))
     return ", ".join(output_tags)
 
+_INFERENCE_ACTIVATIONS = ("sigmoid", "none")
+_INFERENCE_LAYOUTS = ("nchw", "nhwc")
+_INFERENCE_CHANNEL_ORDERS = ("rgb", "bgr")
+_NORMALIZE_VECTOR_LENGTH = 3
+
+
+def _validated_choice(value: Any, allowed: tuple[str, ...], *, key: str) -> str:
+    """model_config.json の列挙値を検証する（REQ-A3(b)）。
+
+    activation のタイプミスで二重 sigmoid、未知 layout が nchw 扱い、未知 channel が
+    rgb 扱いになるのを防ぐ。`build_captioner_config` の検証と同じ方針。
+    """
+    if not isinstance(value, str) or value not in allowed:
+        raise ValueError(f"inference.{key} must be one of {list(allowed)}, got {value!r}")
+    return value
+
+
+def _validated_normalize_vector(value: Any, *, key: str) -> tuple[float, float, float] | None:
+    """正規化用の3要素ベクトルであることを検証する（REQ-A3(b)）。
+
+    None は「このモデルは正規化しない」という明示指定として従来どおり許す。
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"inference.{key} must be a list of 3 numbers, got {value!r}")
+    if len(value) != _NORMALIZE_VECTOR_LENGTH:
+        raise ValueError(
+            f"inference.{key} must have exactly {_NORMALIZE_VECTOR_LENGTH} elements, got {len(value)}"
+        )
+    if not all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value):
+        raise ValueError(f"inference.{key} must contain only numbers, got {value!r}")
+    return tuple(value)  # type: ignore[return-value]
+
+
 def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
     """
     Builds an InferenceConfig from a model_config.json dict's "inference"/"tags_csv"
@@ -724,13 +1097,6 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
     tags_csv = config_mapping(model_config, "tags_csv")
     defaults = InferenceConfig()
 
-    def _tuple3(value: Any) -> tuple[float, float, float] | None:
-        # `value` has already had its default applied by inference.get(...); None here
-        # means the model explicitly disables normalization.
-        if value is None:
-            return None
-        return tuple(value)  # type: ignore[return-value]
-
     pad_color = inference.get("pad_color_rgb")
     alpha_background = inference.get("alpha_background_rgb", defaults.alpha_background_rgb)
     normalize_mean = inference.get("normalize_mean", defaults.normalize_mean)
@@ -739,17 +1105,25 @@ def build_inference_config(model_config: dict[str, Any]) -> InferenceConfig:
 
     return InferenceConfig(
         input_size=inference.get("input_size", defaults.input_size),
-        layout=inference.get("layout", defaults.layout),
-        channel_order=inference.get("channel_order", defaults.channel_order),
+        layout=_validated_choice(inference.get("layout", defaults.layout), _INFERENCE_LAYOUTS, key="layout"),
+        channel_order=_validated_choice(
+            inference.get("channel_order", defaults.channel_order),
+            _INFERENCE_CHANNEL_ORDERS,
+            key="channel_order",
+        ),
         rescale_to_unit=inference.get("rescale_to_unit", defaults.rescale_to_unit),
         pad_color_rgb=tuple(pad_color) if pad_color is not None else defaults.pad_color_rgb,  # type: ignore[arg-type]
         resampling=inference.get("resampling", defaults.resampling),
         alpha_background_rgb=tuple(alpha_background) if alpha_background is not None else None,  # type: ignore[arg-type]
-        normalize_mean=_tuple3(normalize_mean),
-        normalize_std=_tuple3(normalize_std),
+        normalize_mean=_validated_normalize_vector(normalize_mean, key="normalize_mean"),
+        normalize_std=_validated_normalize_vector(normalize_std, key="normalize_std"),
         extra_inputs=tuple(extra_inputs),
         output_name_hint=inference.get("output_name", defaults.output_name_hint),
-        output_activation=inference.get("output_activation", defaults.output_activation),
+        output_activation=_validated_choice(
+            inference.get("output_activation", defaults.output_activation),
+            _INFERENCE_ACTIVATIONS,
+            key="output_activation",
+        ),
         tags_csv_format=tags_csv.get("format", defaults.tags_csv_format),
     )
 
@@ -777,7 +1151,9 @@ def setup_tagger_from_settings(app_settings: AppSettings, get_string: GetString 
             model_path = BASE_DIR / app_settings.paths.model_dir / app_settings.paths.model_filename
             inference_config = InferenceConfig()
         else:
-            model_path = entry.model_dir / "model.onnx"
+            # REQ-A4: ONNX ファイル名の正本はマニフェストの network.files。
+            # ここで "model.onnx" を二重管理しない。
+            model_path = entry.model_dir / model_registry.primary_onnx_file_name(entry)
             inference_config = build_inference_config(entry.config)
             # Models whose tag-metadata file isn't named selected_tags*.csv (camie's
             # own metadata JSON, cl_tagger's tag_mapping.json) must say so explicitly -
@@ -857,11 +1233,10 @@ def process_image_loop(
 
     `progress_cb(done, total)` は全体で最大 constants.PROGRESS_SIGNAL_BUDGET 回
     ＋最後の N/N（完了）だけ呼ぶ。
-    issue #10: 1画像=1〜2回の GUI ログ発行だと高速ループ（SKIP など）で Qt イベント
-    キューが飽和して固まるため、ルーチンの「処理中／出力成功」ログは GUI へ出さず、
-    間引いた progress_cb へ回す（progress_cb 自体もクロススレッドの queued signal なので
-    毎画像発行はしない）。スキップ・エラー・警告・追記件数など有界・低頻度のログは
-    従来どおり GUI へ出す。
+
+    REQ-3.1: 反復・進捗・停止・既存ファイル判定・失敗収集・サマリ集計・FileChange 収集は
+    `batch_runner.run_batch()` に集約し、ここは「1 枚生成して書く」処理だけを持つ。
+    進捗発行→停止判定の順序（現行挙動）は `progress_before_stop=True` で保つ。
     """
 
     def core_log_gui(message: str, color: str = "black") -> None:
@@ -870,87 +1245,48 @@ def process_image_loop(
 
     _get_string_internal = get_string if get_string else _get_string
     mode: ExistingFileMode = settings.get('EXISTING_FILE_MODE', ExistingFileMode.ASK)
-    changed_files: list[FileChange] = []
-    total = len(image_paths)
-    # issue #10: 1画像=1 GUI ログだと全既存フォルダの SKIP で Qt キューが飽和する。
-    # 個々の skip / 成功は debug log だけに残し、GUI へは末尾のサマリ1行だけ出す。
-    n_skipped = 0
-    n_errors = 0
-    n_unchanged = 0
-    failed_seen = set(failed_paths or ())
-    # 全体で PROGRESS_SIGNAL_BUDGET 回に間引く（理由と天井除算の根拠は
-    # constants.progress_step_for() を参照）。最後の1枚は必ず発行して
-    # N/N（完了）に到達させる。
-    progress_step = constants.progress_step_for(total)
 
-    def mark_failed(path: Path) -> None:
-        if failed_paths is not None and path not in failed_seen:
-            failed_seen.add(path)
-            failed_paths.append(path)
+    def index_str(context: ItemContext) -> str:
+        return f"[{context.index+1}/{context.total}]"
 
-    def mark_remaining_failed(start: int) -> None:
-        """Record unprocessed work without labelling SKIP outputs as failures."""
-        if failed_paths is None:
-            return
-        for pending in image_paths[start:]:
-            if (mode is ExistingFileMode.SKIP
-                    and pending.with_suffix(".txt").is_file()):
-                continue
-            mark_failed(pending)
+    def on_item_start(context: ItemContext) -> None:
+        # REQ-3.7: 相対パス計算は各ループ側に残す。入力ディレクトリ外のパスでは
+        # 現行どおり relative_to の例外になり、既存ファイル判定より前に評価される。
+        context.relative_path = context.image_path.relative_to(settings['INPUT_DIR'])
 
-    for i, image_path in enumerate(image_paths):
-        if progress_cb and ((i + 1) % progress_step == 0 or i == total - 1):
-            progress_cb(i + 1, total)
-        if stop_checker and stop_checker():
-            core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
-            log_dbg(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User_Debug"))
-            mark_remaining_failed(i)
-            break
+    def on_existing_skip(context: ItemContext) -> None:
+        log_dbg(_get_string_internal(
+            "TaggerCore", "Tag_Output_Skipped_Existing_File",
+            current_index_str=index_str(context), relative_path=str(context.relative_path)))
 
-        # First, check if the output file exists and should be skipped.
-        base_name, _ = os.path.splitext(str(image_path))
-        output_path = Path(base_name + ".txt")
-        relative_path = image_path.relative_to(settings['INPUT_DIR'])
-        current_index_str = f"[{i+1}/{len(image_paths)}]"
+    def on_stop() -> None:
+        core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
+        log_dbg(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User_Debug"))
 
-        will_append = False
-        if output_path.is_file():
-            if mode is ExistingFileMode.SKIP:
-                n_skipped += 1
-                log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Skipped_Existing_File", current_index_str=current_index_str, relative_path=str(relative_path)))
-                continue
-            if mode is ExistingFileMode.ASK:
-                if decision_resolver is None:
-                    # 防御: resolver 未設定なら既存ファイルには触らない
-                    n_skipped += 1
-                    log_dbg("process_image_loop: ASK モードだが decision_resolver が未設定のためスキップします")
-                    continue
-                if stop_checker and stop_checker():
-                    # ここで停止要求が来ていたら resolver（GUI 往復しうる）を呼ばずに抜ける
-                    mark_remaining_failed(i)
-                    break
-                decision = decision_resolver(output_path)
-                if decision is OverwriteDecision.SKIP:
-                    n_skipped += 1
-                    log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Skipped_Existing_File", current_index_str=current_index_str, relative_path=str(relative_path)))
-                    continue
-                will_append = decision is OverwriteDecision.APPEND
-            else:
-                will_append = mode is ExistingFileMode.APPEND
+    def process_item(context: ItemContext) -> ItemOutcome:
+        image_path = context.image_path
+        output_path = context.output_path
+        relative_path = context.relative_path
+        current_index_str = index_str(context)
+        # 追記かどうかは「既存があり、かつモードか ASK の決定が APPEND」で決まる
+        # （新規ファイルに対しては常に False。現行どおり）。
+        will_append = context.existed and (
+            context.mode is ExistingFileMode.APPEND
+            or context.decision is OverwriteDecision.APPEND)
 
         # ルーチンの「処理中」表示は GUI へ流さず debug log のみ（issue #10）。GUI は progress_cb 経由。
         log_dbg(_get_string_internal("TaggerCore", "Processing_Image", current_index_str=current_index_str, relative_path=str(relative_path)))
 
         try:
             with Image.open(image_path) as opened_image:
-                # Preserve alpha so model-specific preprocessing can composite it.
-                image = opened_image.copy()
+                # REQ-A5: VLM 経路と同じく EXIF Orientation を適用してから推論する
+                # （横向きのまま推論して黙って精度が落ちるのを防ぐ）。alpha は
+                # exif_transpose 後も保持されるので、モデル側の合成にそのまま渡せる。
+                image = ImageOps.exif_transpose(opened_image)
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Image_Load_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
             core_log_gui(_get_string_internal("TaggerCore", "Image_Load_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         try:
             results = tagger.infer_batch(
@@ -959,27 +1295,34 @@ def process_image_loop(
                 max_tags=settings['MAX_TAGS_PER_CATEGORY'],
             )
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Tag_Inference_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
             core_log_gui(_get_string_internal("TaggerCore", "Tag_Inference_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "red")
-            continue
+            return ItemOutcome.error()
 
         if not results or not results[0].tags:
-            n_errors += 1
-            mark_failed(image_path)
-            log_dbg(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed", current_index_str=current_index_str, relative_path=str(relative_path)))
-            core_log_gui(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
-            continue
+            # REQ-A8: 全カテゴリの上限が 0 のときは hard_cap=0 で結果が必ず空になる。
+            # これを推論失敗として数えると「失敗分のみ」モードで同じ画像を無限に
+            # 再試行してしまうため、上限0による空は「成功（タグ無し）」として扱う。
+            # 判別はループ側が保持している設定値だけで行い、推論後処理の外部
+            # シグネチャは変えない。
+            limits = settings.get('MAX_TAGS_PER_CATEGORY') or {}
+            limits_all_zero = bool(limits) and all(int(limit) == 0 for limit in limits.values())
+            if not limits_all_zero:
+                log_dbg(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed", current_index_str=current_index_str, relative_path=str(relative_path)))
+                core_log_gui(_get_string_internal("TaggerCore", "Tag_Acquisition_Failed_Short", current_index_str=current_index_str, relative_path_name=relative_path.name), "orange")
+                return ItemOutcome.error()
+            log_dbg(f"tags: all per-category limits are 0 for {relative_path}; treating the empty "
+                    f"result as success (no tags) rather than a failure.")
+            tag_result = results[0] if results else TagResult()
+        else:
+            tag_result = results[0]
 
-        tag_result = results[0]
-        
         final_tags, all_series_tags = filter_tags_by_solo_rule(
             tag_result, tagger, settings['ENABLE_SOLO_LIMIT']
         )
         tag_result.tags = final_tags
         tag_result.series_tags = tuple(sorted(list(all_series_tags)))
-        
+
         formatted_tags = format_tags(tag_result, settings['CONVERT_UNDERSCORE'])
 
         previous_content: str | None = None
@@ -989,20 +1332,17 @@ def process_image_loop(
                 previous_content = output_path.read_text(encoding='utf-8')
             except Exception as e:
                 # 既存内容が読めないファイルは触らずスキップする（spec.md 3.3節）
-                n_errors += 1
-                mark_failed(image_path)
                 log_dbg(f"append: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
                 core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
-                continue
+                return ItemOutcome.error()
             existing_tags = [t.strip() for t in previous_content.split(",") if t.strip()]
             generated_tags = [t.strip() for t in formatted_tags.split(",") if t.strip()]
             merged = merge_tags(existing_tags, generated_tags)
             if merged == existing_tags:
                 # 追加できる新規タグが無い場合は mtime も変えない（spec.md 3.3節）
                 # ルーチン結果なので GUI へは出さず debug log のみ（issue #10）。
-                n_unchanged += 1
                 log_dbg(_get_string_internal("TaggerCore", "Log_No_New_Tags", current_index_str=current_index_str, file_name=output_path.name))
-                continue
+                return ItemOutcome.unchanged()
             added_tags = tuple(merged[len(existing_tags):])
             new_content = ", ".join(merged)
         else:
@@ -1015,45 +1355,52 @@ def process_image_loop(
                     # のまま書くと「元は存在しなかった」と undo に誤認され、undo で
                     # ファイルごと削除して原本を復元不能に破壊する（PR#16 レビュー指摘）。
                     # APPEND 分岐と同様、触らずスキップする。
-                    n_errors += 1
-                    mark_failed(image_path)
                     log_dbg(f"overwrite: 既存ファイルの読み込みに失敗したためスキップします {output_path.name}: {type(e).__name__}: {e}")
                     core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
-                    continue
+                    return ItemOutcome.error()
             new_content = formatted_tags
 
         try:
-            resolved_path = output_path.resolve()
-            if sys.platform == "win32":
-                long_path_str = f"\\\\?\\{resolved_path}"
-            else:
-                long_path_str = str(resolved_path)
-
-            with open(long_path_str, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-
-            changed_files.append(FileChange(
-                path=output_path, previous_content=previous_content,
-                new_content=new_content, was_append=will_append, added_tags=added_tags))
-            # 個々の追記／出力成功は debug log のみ。件数は末尾サマリで GUI へ（issue #10）。
-            if will_append:
-                log_dbg(_get_string_internal("TaggerCore", "Log_Appended", current_index_str=current_index_str, count=len(added_tags), file_name=output_path.name))
-            else:
-                log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
-            log_dbg(_get_string_internal("TaggerCore", "Tagging_Result_Output", current_index_str=current_index_str, output_path_name=output_path.name))
+            # REQ-2.3: 一時ファイル + os.replace で原子的に書く（REQ-2.7 の (iii) 段）。
+            # 現行の直接書きも fsync していないため耐久性は据え置き、原子性だけを得る
+            # （計測: 0.10 → 0.33 ms/ファイル、fsync を足すと +7 ms/ファイル）。
+            atomic_write_text(output_path, new_content, fsync=False, verify=False)
         except Exception as e:
-            n_errors += 1
-            mark_failed(image_path)
             log_dbg(_get_string_internal("TaggerCore", "Save_Failed", current_index_str=current_index_str, relative_path=str(relative_path), type_e_name=type(e).__name__, e=str(e)))
-
             core_log_gui(_get_string_internal("TaggerCore", "Save_Failed_Short", current_index_str=current_index_str, output_path_name=output_path.name), "red")
+            return ItemOutcome.error()
 
-    n_appended = sum(1 for c in changed_files if c.was_append)
+        change = FileChange(
+            path=output_path, previous_content=previous_content,
+            new_content=new_content, was_append=will_append, added_tags=added_tags)
+        # 個々の追記／出力成功は debug log のみ。件数は末尾サマリで GUI へ（issue #10）。
+        if will_append:
+            log_dbg(_get_string_internal("TaggerCore", "Log_Appended", current_index_str=current_index_str, count=len(added_tags), file_name=output_path.name))
+        else:
+            log_dbg(_get_string_internal("TaggerCore", "Tag_Output_Success", current_index_str=current_index_str, output_path_name=output_path.name))
+        log_dbg(_get_string_internal("TaggerCore", "Tagging_Result_Output", current_index_str=current_index_str, output_path_name=output_path.name))
+        return ItemOutcome.written(change)
+
+    result = run_batch(
+        image_paths,
+        mode=mode,
+        output_path_for=lambda path: Path(os.path.splitext(str(path))[0] + ".txt"),
+        process_item=process_item,
+        decision_resolver=decision_resolver,
+        stop_checker=stop_checker,
+        progress_cb=progress_cb,
+        failed_paths=failed_paths,
+        on_item_start=on_item_start,
+        on_existing_skip=on_existing_skip,
+        on_stop=on_stop,
+        # tagging/caption は「進捗発行 → 停止判定」の現行順（§3.1）。
+        progress_before_stop=True,
+    )
     core_log_gui(_get_string_internal(
         "TaggerCore", "Batch_Summary",
-        written=len(changed_files), appended=n_appended, skipped=n_skipped,
-        unchanged=n_unchanged, errors=n_errors, total=total), "blue")
-    return changed_files
+        written=result.written, appended=result.appended, skipped=result.skipped,
+        unchanged=result.unchanged, errors=result.errors, total=result.total), "blue")
+    return result.changes
 
 def filter_tags_by_solo_rule(
     tag_result: TagResult,
