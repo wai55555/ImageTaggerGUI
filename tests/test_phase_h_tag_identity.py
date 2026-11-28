@@ -300,6 +300,7 @@ def test_main_window_image_view_uses_normalized_translation_key():
         window=SimpleNamespace(tag_display_cols=4, tag_display_rows=5)
     )
     ns._get_image_tags_per_page = lambda: 20
+    ns._tag_display_grid_dims = lambda: (4, 5)  # Phase 5（R28-1）で追加された入口
     ns._get_translation_index = lambda language: 0 if language == "日本語" else -1
     ns._delete_image_tag = lambda tag: None
     ns._current_image_tags = ["long_hair"]

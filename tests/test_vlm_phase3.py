@@ -513,6 +513,14 @@ def test_custom_connection_model_list_keeps_only_vlm_models():
             ModelCatalogEntry("local-vlm", True, True, "test"),
         ])
         assert [dialog.model_edit.itemText(i) for i in range(dialog.model_edit.count())] == ["local-vlm"]
+        # REQ-5.8 / R13-1: 手入力されたモデル ID を一覧の先頭で黙って差し替えない。
+        assert dialog.model_edit.currentText() == "old-model"
+
+        # 未入力なら従来どおり先頭（＝最初の VLM）を選ぶ。
+        dialog.model_edit.setCurrentText("")
+        dialog._on_model_list("custom-model-list", [
+            ModelCatalogEntry("local-vlm", True, True, "test"),
+        ])
         assert dialog.model_edit.currentText() == "local-vlm"
     finally:
         dialog.close()
