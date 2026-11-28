@@ -341,12 +341,34 @@ def setup_captioner_from_settings(app_settings: AppSettings, get_string: GetStri
         return None, {}
 
 
+def caption_already_present(existing: str, caption: str) -> bool:
+    """既存内容に、追加しようとするキャプションと完全一致する塊があるか（REQ-C6）。
+
+    `vlm_persistence.caption_already_present`（改行区切り）の Florence 版。こちらは
+    `combine_caption` が ", " で連結するため、", " を境界とした contiguous な完全一致
+    だけを見る（意味的・表現的な類似は判定しない。既存の読み方は変えない）。
+    再実行のたびに同じ文が増える（"cap" → "cap, cap" → …）のを止めるのが目的。
+    """
+    target_parts = [part.strip() for part in caption.strip().split(",")]
+    if not any(target_parts):
+        return True
+    existing_parts = [part.strip() for part in existing.strip().strip(",").split(",")]
+    width = len(target_parts)
+    return any(
+        existing_parts[start:start + width] == target_parts
+        for start in range(len(existing_parts) - width + 1)
+    )
+
+
 def combine_caption(existing: str, caption: str, placement: str) -> str:
     """生成キャプションを既存内容と組み合わせる（2026-08-31 ユーザー要望）。
 
     danbooru タグ＋自然言語を1つの .txt に同居させるモデルがあるため、上書き以外に
     「前に追加」「後に追加」が要る。区切りは学習用キャプションの慣習に合わせて ", "。
     既存が空なら生成文のみ、生成文が空なら既存のみを返す。
+
+    REQ-C6: APPEND／PREPEND では、既に同じキャプションが入っていれば既存をそのまま
+    返す（再実行しても内容が増えない。VLM の `caption_already_present` と同じ考え方）。
     """
     existing = existing.strip().strip(",").strip()
     caption = caption.strip()
@@ -357,6 +379,9 @@ def combine_caption(existing: str, caption: str, placement: str) -> str:
         return existing
     if placement == "OVERWRITE":
         return caption
+    if caption_already_present(existing, caption):
+        # 同じキャプションを再実行しても増やさない（新規タグ無しのタガーと同じ振る舞い）。
+        return existing
     if placement == "PREPEND":
         return f"{caption}, {existing}"
     return f"{existing}, {caption}"
@@ -372,6 +397,7 @@ def process_caption_loop(
     get_string: GetString | None,
     progress_cb: Callable[[int, int], None] | None = None,
     failed_paths: list[Path] | None = None,
+    changes_out: list[FileChange] | None = None,
 ) -> list[FileChange]:
     """Captioner counterpart of tagging_core.process_image_loop.
 
@@ -382,6 +408,8 @@ def process_caption_loop(
     REQ-3.1: 反復・進捗・停止・既存ファイル判定・失敗収集・サマリ集計・FileChange 収集は
     `batch_runner.run_batch()` に集約し、ここは「1 枚生成して書く」処理だけを持つ。
     ASK の決定は SKIP かどうかにしか使わない（結合は placement のみで決まる現行挙動）。
+
+    `changes_out` を渡すと、書き込みごとに FileChange がそこへも積まれる（REQ-C1）。
     """
 
     def core_log_gui(message: str, color: str = "black") -> None:
@@ -412,6 +440,14 @@ def process_caption_loop(
         log_dbg(_get_string_internal(
             "TaggerCore", "Tag_Skipped_Existing_File_Short",
             current_index_str=index_str(context), output_path_name=context.output_path.name))
+
+    def on_duplicate_skip(context: ItemContext) -> None:
+        # REQ-C5: 同じ .txt を共有する画像は、理由を出してスキップする。
+        log_dbg(f"caption: {context.image_path} shares {context.output_path.name} with an "
+                f"earlier image in this batch; skipping it.")
+        core_log_gui(_get_string_internal(
+            "TaggerCore", "Tag_Skipped_Duplicate_Output",
+            current_index_str=index_str(context), output_path_name=context.output_path.name), "orange")
 
     def on_stop() -> None:
         core_log_gui(_get_string_internal("TaggerCore", "Tagging_Process_Aborted_By_User"), "red")
@@ -507,9 +543,11 @@ def process_caption_loop(
         failed_paths=failed_paths,
         on_item_start=on_item_start,
         on_existing_skip=on_existing_skip,
+        on_duplicate_skip=on_duplicate_skip,
         on_stop=on_stop,
-        # tagging/caption は「進捗発行 → 停止判定」の現行順（§3.1）。
-        progress_before_stop=True,
+        # REQ-C4: 進捗は各アイテムの処理が終わってから発行する（意図的変更、§2.3）。
+        progress_after_item=True,
+        changes_out=changes_out,
     )
     core_log_gui(_get_string_internal(
         "TaggerCore", "Batch_Summary",
