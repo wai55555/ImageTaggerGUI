@@ -285,14 +285,20 @@ def execute_http(req, *, connect_timeout: float, read_timeout: float,
         watchdog = threading.Timer(remaining, _expire)
         watchdog.daemon = True
         watchdog.start()
+        total_deadline_hit = False
         try:
             # チャンクは小さく保つ（1 チャンクあたりの待ち時間の上限を下げる）。
             for chunk in resp.iter_content(chunk_size=512):
                 if deadline_expired.is_set():
+                    total_deadline_hit = True
                     break
                 if chunk:
                     chunks.append(chunk)
                 if time.monotonic() - started > total_timeout_s:
+                    # watchdog の発火より先にここへ来ることがある（高負荷時）。
+                    # 部分本文を「正常な 200」として返すと、呼び出し側は
+                    # BAD_RESPONSE と誤判定するので、締切超過として扱う（REQ-G6）。
+                    total_deadline_hit = True
                     break
         except requests.exceptions.Timeout:
             if not deadline_expired.is_set():
@@ -307,7 +313,7 @@ def execute_http(req, *, connect_timeout: float, read_timeout: float,
                                        f"receive error: {_scrub_exc(e)}")
         finally:
             watchdog.cancel()
-        if deadline_expired.is_set():
+        if total_deadline_hit or deadline_expired.is_set():
             return VlmAttemptError(
                 VlmErrorReason.TIMEOUT, None,
                 f"total deadline {total_timeout_s:.0f}s exceeded while receiving")
