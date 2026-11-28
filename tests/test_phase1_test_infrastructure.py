@@ -214,6 +214,7 @@ def _entry(config: dict):
 
 
 def test_model_default_threshold_and_limit_resolution():
+    import app_settings
     from model_mode_controller import ModelModeController
 
     controller = ModelModeController(_controller_stub())
@@ -228,9 +229,12 @@ def test_model_default_threshold_and_limit_resolution():
     assert controller._model_default_limit(ui_cfg, "character") == 3
     assert controller._model_default_limit(ui_cfg, "general") == 55
 
-    # 明示が無ければフォールバック既定（モデル非依存）。
+    # 明示が無ければフォールバック既定（モデル非依存）。character は 77件側 REQ-D4
+    # （R18-4）が app_settings.DEFAULT_CHARACTER_THRESHOLD を単一の正本に定めたため、
+    # 二重定義だった 0.65 ではなく実効値 0.85 を引く。
     assert controller._model_default_threshold({}, "general") == 0.40
-    assert controller._model_default_threshold({}, "character") == 0.65
+    assert controller._model_default_threshold({}, "character") == app_settings.DEFAULT_CHARACTER_THRESHOLD
+    assert controller._model_default_threshold({}, "character") == 0.85
     assert controller._model_default_limit({}, "general") == 55
 
 

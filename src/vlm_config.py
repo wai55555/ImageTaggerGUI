@@ -30,6 +30,34 @@ VLM_PROFILES_VERSION = 1
 
 # --- vlm_connections.json（カスタム接続定義） ---------------------------------------
 
+def _json_version_ok(data: dict, expected: int, *, name: str) -> bool:
+    """設定 JSON の `version` を検証する（REQ-D9）。
+
+    - `version` が無い場合は現行形式（version=expected 相当）として読む
+      —旧版や手編集で version を持たないファイルを無効化しない（NFR-2）。
+    - 未知の将来 version（と、数値として読めない値）は明示的に失敗させる。
+      黙って読むと、意味の変わったフィールドを現行解釈で実行してしまう。
+    """
+    if "version" not in data:
+        return True
+    raw = data.get("version")
+    if isinstance(raw, bool):  # int(True) == 1 で通してしまわない
+        write_debug_log(
+            f"vlm_config: ignoring {name}: unsupported version {raw!r} (expected {expected})")
+        return False
+    try:
+        version = int(raw)
+    except (TypeError, ValueError):
+        write_debug_log(
+            f"vlm_config: ignoring {name}: unsupported version {raw!r} (expected {expected})")
+        return False
+    if version != expected:
+        write_debug_log(
+            f"vlm_config: ignoring {name}: unsupported version {version} (expected {expected})")
+        return False
+    return True
+
+
 def load_custom_connections() -> list[dict]:
     """vlm_connections.json のカスタム接続定義（生 dict）を返す。壊れていれば []。"""
     if not VLM_CONNECTIONS_PATH.is_file():
@@ -41,6 +69,8 @@ def load_custom_connections() -> list[dict]:
         write_debug_log(f"vlm_config: cannot read {VLM_CONNECTIONS_PATH.name}: {e}")
         return []
     if not isinstance(data, dict):
+        return []
+    if not _json_version_ok(data, VLM_CONNECTIONS_VERSION, name=VLM_CONNECTIONS_PATH.name):
         return []
     conns = data.get("connections")
     if not isinstance(conns, list):
@@ -143,7 +173,11 @@ def load_user_profiles() -> list[dict]:
     except (OSError, ValueError) as e:
         write_debug_log(f"vlm_config: cannot read {VLM_PROFILES_PATH.name}: {e}")
         return []
-    profs = data.get("profiles") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return []
+    if not _json_version_ok(data, VLM_PROFILES_VERSION, name=VLM_PROFILES_PATH.name):
+        return []
+    profs = data.get("profiles")
     if not isinstance(profs, list):
         return []
     return [p for p in profs if isinstance(p, dict) and p.get("profile_id")]
@@ -168,6 +202,21 @@ def save_user_profiles(profiles: list[dict]) -> bool:
                 tmp.unlink()
         except OSError:
             pass
+
+
+def _profile_aliases(raw: object) -> list[str]:
+    """`aliases` を文字列の並びに正規化する（REQ-D10）。
+
+    手編集 JSON で `"aliases": "gemma-4-31b"` のように文字列が入ると、素の反復では
+    1文字ずつ alias として登録され、`resolve_alias()` が短い入力に誤一致しうる。
+    文字列は単一の alias として扱い、リスト／タプル以外の型は無視する。
+    """
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        return [stripped] if stripped else []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(a) for a in raw if str(a).strip()]
 
 
 def _profile_from_dict(d: dict) -> VlmModelProfile | None:
@@ -202,7 +251,7 @@ def _profile_from_dict(d: dict) -> VlmModelProfile | None:
         family=str(d.get("family", "")),
         base_model=str(d.get("base_model", d.get("canonical_model_id", pid))),
         quantization="unknown",
-        aliases=tuple(str(a) for a in (d.get("aliases") or []) if str(a).strip()),
+        aliases=tuple(_profile_aliases(d.get("aliases"))),
         bindings=bindings,
     )
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import app_settings
 import constants
 from utils import config_mapping, write_debug_log
 
@@ -55,7 +56,9 @@ _PIXAI_CONFIG: dict[str, Any] = {
         "supports_character_tag": True,
         "supports_threshold_slider": True,
         "default_threshold": 0.40,
-        "default_character_threshold": 0.85,
+        # character しきい値の既定は app_settings.DEFAULT_CHARACTER_THRESHOLD が
+        # 単一の正本（REQ-D4 / R18-4）。ここで数値を二重管理しない。
+        "default_character_threshold": app_settings.DEFAULT_CHARACTER_THRESHOLD,
         "categories": ["general", "character"],
     },
 }

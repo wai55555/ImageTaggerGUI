@@ -1,5 +1,6 @@
 import configparser
 import io
+import math
 import os
 from typing import Any
 from dataclasses import dataclass, field, is_dataclass, fields
@@ -22,6 +23,14 @@ _get_string: GetString = default_get_string_fallback
 # (260922_vlm_fallback_ui_candidate_c_plan.md)。
 DEFAULT_VLM_MODEL_PROFILE_ID = "gemma-4-31b-it"
 DEFAULT_VLM_CONNECTION_ORDER = "gemini"
+
+# PixAI v0.9 の character しきい値の単一の正本（R18-4 / REQ-D4）。
+# かつて 0.65（このファイルの既定と load の fallback、model_mode_controller の
+# フォールバック）と 0.85（model_registry の _PIXAI_CONFIG）が併存していたが、
+# `_apply_threshold_defaults` が未編集カテゴリをモデル側既定で上書きするため
+# 実効値は常時 0.85 だった。現在の実効挙動を変えない側に倒し、参照箇所は
+# すべてこの定数から引く。general の 0.40 は全箇所一致しており対象外。
+DEFAULT_CHARACTER_THRESHOLD: float = 0.85
 
 def set_get_string_func(func: GetString):
     global _get_string
@@ -165,8 +174,11 @@ def parse_onnx_device(raw: str) -> str:
 
 
 def parse_gpu_setup_prompt(raw: str) -> str:
-    """[Behavior] gpu_setup_prompt を検証する。空文字・不正値は ask へ。"""
+    """[Behavior] gpu_setup_prompt を検証する。空文字・不正値は ask へ。
+    off / false / 0 等の「オフ」らしい値は dismissed 扱い（REQ-D3）。"""
     value = str(raw).strip().lower()
+    if value in _OFF_ALIASES:
+        return "dismissed"
     return value if value in GPU_SETUP_PROMPT_STATES else "ask"
 
 
@@ -175,7 +187,8 @@ UPDATE_CHECK_STATES: tuple[str, ...] = ("ask", "dismissed")
 
 # 手で config.ini を編集する人が「無効化」のつもりで書きがちな値。これらを ask に
 # 丸めると「オフにしたのに毎回訊かれる」になるので dismissed として受け付ける。
-_UPDATE_CHECK_OFF_ALIASES: frozenset[str] = frozenset(
+# gpu_setup_prompt と update_check は同じ「オフ意図」の別名を共用する（REQ-D3）。
+_OFF_ALIASES: frozenset[str] = frozenset(
     {"false", "no", "off", "0", "never", "disabled", "disable", "none"})
 
 
@@ -183,7 +196,7 @@ def parse_update_check(raw: str) -> str:
     """[Behavior] update_check を検証する。空文字・不正値は ask へ。
     false / no / off / 0 / never / disabled 等の「オフ」らしい値は dismissed 扱い。"""
     value = str(raw).strip().lower()
-    if value in _UPDATE_CHECK_OFF_ALIASES:
+    if value in _OFF_ALIASES:
         return "dismissed"
     return value if value in UPDATE_CHECK_STATES else "ask"
 
@@ -262,6 +275,16 @@ class Vlm:
     # 内蔵経路のモデル ID 上書き。`<profile_id>:<provider_id>=<model_id>` をカンマ区切り。
     # 出荷時の推定 ID が実サービスと違うとき、接続診断で確認しつつここで直せる。
     model_id_overrides: str = ""
+    # 生成プロファイルの詳細設定（REQ-D5 / R14-3）。
+    # GenerationProfile の消費側は既に実装済みなのに、config.ini からの入力経路が
+    # 無いため手書き値が黙って無視されていた。ここでコア側の配線だけ行う
+    # （入力 UI の新設は CUT-2、二次改修の判断に委ねる）。
+    # temperature / top_p は None（未設定）を空文字で往復させる。
+    custom_system_prompt: str = ""
+    temperature: float | None = None
+    top_p: float | None = None
+    image_format: str = "auto"
+    image_jpeg_quality: int = 90
 
     def order_list(self) -> list[str]:
         return [p.strip() for p in self.connection_order.split(",") if p.strip()]
@@ -298,10 +321,14 @@ from constants import BASE_DIR, CONFIG_PATH, MODEL_DIR_NAME
 
 def get_default_config() -> configparser.ConfigParser:
     """Returns a ConfigParser object with default settings."""
-    config = configparser.ConfigParser()
+    # REQ-D1(b): 補間なし。既定の BasicInterpolation だと、アプリ自身が書いた
+    # `%` を含むパス（例: フォルダ "100%"）が次回読み込みで
+    # InterpolationSyntaxError になる。`load_settings` へ渡すパーサは
+    # すべて補間なしに揃える（保存側 / 未知キー取り込みも同じ）。
+    config = configparser.ConfigParser(interpolation=None)
     DEFAULT_CONFIG = {
         'Paths': {'input_dir': str(BASE_DIR / "inputs"), 'model_dir': MODEL_DIR_NAME, 'model_filename': 'model.onnx'},
-        'Thresholds': {'general': '0.40', 'character': '0.65', 'rating': '0.50', 'copyright': '0.50', 'style': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
+        'Thresholds': {'general': '0.40', 'character': str(DEFAULT_CHARACTER_THRESHOLD), 'rating': '0.50', 'copyright': '0.50', 'style': '0.50', 'artist': '0.50', 'meta': '0.50', 'model': '0.50', 'quality': '0.50', 'year': '0.50', 'touched': ''},
         'Limits': {'general': '55', 'character': '1', 'rating': '0', 'copyright': '0', 'style': '0', 'artist': '0', 'meta': '0', 'model': '0', 'quality': '0', 'year': '0', 'touched': ''},
         'Behavior': {'enable_solo_character_limit': 'True', 'convert_underscore_to_space': 'True', 'existing_file_mode': 'ASK', 'onnx_threads': '0', 'target_mode': 'ALL', 'onnx_device': 'auto', 'gpu_setup_prompt': 'ask', 'update_check': 'ask', 'update_check_last': '', 'update_skip_version': ''},
         'Window': {'geometry': '986x976+50+50', 'tag_display_rows': '6', 'tag_display_cols': '5'},
@@ -321,6 +348,9 @@ def get_default_config() -> configparser.ConfigParser:
             'image_max_long_edge': '1536',
             'verified_bindings': '',
             'vlm_capable_overrides': '', 'strict_identity': 'False', 'model_id_overrides': '',
+            # REQ-D5: 未設定の temperature / top_p は空文字（None と等価）
+            'custom_system_prompt': '', 'temperature': '', 'top_p': '',
+            'image_format': 'auto', 'image_jpeg_quality': '90',
         },
         'Debug': {'debug_log': 'False'},
         'General': {'language_code': ''}
@@ -338,12 +368,99 @@ def _write_config_atomically(config: configparser.ConfigParser) -> None:
     config.write(buffer)
     atomic_write_text(CONFIG_PATH, buffer.getvalue(), fsync=True, verify=True)
 
+def _raw_option(config: configparser.ConfigParser, section: str, key: str) -> object:
+    """ログ用に生の表現を得る（補間・型変換で例外を出さない）。"""
+    try:
+        return config.get(section, key, raw=True, fallback=None)
+    except (configparser.Error, TypeError, ValueError):
+        return "<unreadable>"
+
+
+def _log_bad_config_value(section: str, key: str, raw: object, fallback: object,
+                          reason: str) -> None:
+    write_debug_log(
+        f"app_settings: invalid [{section}] {key}={raw!r}; "
+        f"using fallback {fallback!r} ({reason})")
+
+
+def _get_float(config: configparser.ConfigParser, section: str, key: str,
+               fallback: float) -> float:
+    """REQ-D1(a) / REQ-D2: 不正値・非有限値は fallback + debug log へ倒す。
+
+    `configparser.getfloat()` はキー欠落なら fallback を返すが、値が数値でないときは
+    ValueError を投げ、`"nan"` / `"inf"` / `"1e999"` は例外なく非有限値を返す。
+    手編集された config.ini の1つの値で起動不能になったり、しきい値フィルタが
+    黙って無効化されたりしないよう、ここで両方を捕まえる。
+    """
+    try:
+        value = config.getfloat(section, key, fallback=fallback)
+    except (configparser.Error, TypeError, ValueError, OverflowError) as e:
+        _log_bad_config_value(section, key, _raw_option(config, section, key), fallback,
+                              f"{type(e).__name__}: {e}")
+        return fallback
+    if not math.isfinite(value):
+        _log_bad_config_value(section, key, _raw_option(config, section, key), fallback,
+                              "non-finite float (nan/inf)")
+        return fallback
+    return value
+
+
+def _get_optional_float(config: configparser.ConfigParser, section: str, key: str,
+                        fallback: float | None = None) -> float | None:
+    """空文字・未設定は「指定なし」(fallback) として静かに返す。
+
+    [Vlm] temperature / top_p は None が正しい未設定表現で、それを空文字で往復させる
+    （REQ-D5）。よって空文字は不正値ではないので log を出さない。不正値と非有限値は
+    REQ-D1 / REQ-D2 と同じく fallback + debug log へ倒す。
+    """
+    raw = _raw_option(config, section, key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return fallback
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError, OverflowError) as e:
+        _log_bad_config_value(section, key, raw, fallback, f"{type(e).__name__}: {e}")
+        return fallback
+    if not math.isfinite(value):
+        _log_bad_config_value(section, key, raw, fallback, "non-finite float (nan/inf)")
+        return fallback
+    return value
+
+
+def _get_int(config: configparser.ConfigParser, section: str, key: str, fallback: int) -> int:
+    """REQ-D1(a): 不正値を fallback + debug log へ倒す（小数・空文字・非数値）。"""
+    try:
+        return config.getint(section, key, fallback=fallback)
+    except (configparser.Error, TypeError, ValueError, OverflowError) as e:
+        _log_bad_config_value(section, key, _raw_option(config, section, key), fallback,
+                              f"{type(e).__name__}: {e}")
+        return fallback
+
+
+def _get_bool(config: configparser.ConfigParser, section: str, key: str, fallback: bool) -> bool:
+    """REQ-D1(a): bool として解釈できない値を fallback + debug log へ倒す。"""
+    try:
+        return config.getboolean(section, key, fallback=fallback)
+    except (configparser.Error, TypeError, ValueError) as e:
+        _log_bad_config_value(section, key, _raw_option(config, section, key), fallback,
+                              f"{type(e).__name__}: {e}")
+        return fallback
+
+
 def load_config() -> configparser.ConfigParser:
     """Loads the config.ini file, creating it from defaults if it doesn't exist."""
     config = get_default_config()
     if CONFIG_PATH.is_file():
-            
-        config.read(CONFIG_PATH, encoding='utf-8')
+        try:
+            config.read(CONFIG_PATH, encoding='utf-8')
+        except (configparser.Error, OSError, UnicodeDecodeError) as e:
+            # REQ-D1(a): config.read 自体の失敗（セクションヘッダ無し等）でも、既定値で
+            # 起動できる形にする。読みかけの半端な値を持ち込まず、config.ini の削除を
+            # 復旧手段にしない（ファイル自体は触らない。利用者が直せる状態を保つ）。
+            write_debug_log(
+                f"ConfigUtils: config.ini could not be parsed; starting with defaults "
+                f"({type(e).__name__}: {e})")
+            return get_default_config()
         write_debug_log(_get_string("ConfigUtils", "Config_File_Load_Success", CONFIG_PATH=CONFIG_PATH), _get_string)
     else:
         try:
@@ -369,7 +486,7 @@ def _parse_verified_models(config: configparser.ConfigParser) -> dict[str, bool]
     defaults, so its presence really does mean "this came from the file".
     """
     if config.has_option('Model', 'verified'):
-        legacy_verified = config.getboolean('Model', 'verified', fallback=False)
+        legacy_verified = _get_bool(config, 'Model', 'verified', False)
         return {"pixai-tagger-v0.9": legacy_verified}
 
     raw = config.get('Model', 'verified_models', fallback='')
@@ -394,34 +511,34 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
             model_filename=config.get('Paths', 'model_filename', fallback='model.onnx')
         ),
         thresholds=Thresholds(
-            general=config.getfloat('Thresholds', 'general', fallback=0.40),
-            character=config.getfloat('Thresholds', 'character', fallback=0.65),
-            rating=config.getfloat('Thresholds', 'rating', fallback=0.50),
-            copyright=config.getfloat('Thresholds', 'copyright', fallback=0.50),
-            style=config.getfloat('Thresholds', 'style', fallback=0.50),
-            artist=config.getfloat('Thresholds', 'artist', fallback=0.50),
-            meta=config.getfloat('Thresholds', 'meta', fallback=0.50),
-            model=config.getfloat('Thresholds', 'model', fallback=0.50),
-            quality=config.getfloat('Thresholds', 'quality', fallback=0.50),
-            year=config.getfloat('Thresholds', 'year', fallback=0.50),
+            general=_get_float(config, 'Thresholds', 'general', 0.40),
+            character=_get_float(config, 'Thresholds', 'character', DEFAULT_CHARACTER_THRESHOLD),
+            rating=_get_float(config, 'Thresholds', 'rating', 0.50),
+            copyright=_get_float(config, 'Thresholds', 'copyright', 0.50),
+            style=_get_float(config, 'Thresholds', 'style', 0.50),
+            artist=_get_float(config, 'Thresholds', 'artist', 0.50),
+            meta=_get_float(config, 'Thresholds', 'meta', 0.50),
+            model=_get_float(config, 'Thresholds', 'model', 0.50),
+            quality=_get_float(config, 'Thresholds', 'quality', 0.50),
+            year=_get_float(config, 'Thresholds', 'year', 0.50),
             touched=config.get('Thresholds', 'touched', fallback='')
         ),
         limits=Limits(
-            general=config.getint('Limits', 'general', fallback=55),
-            character=config.getint('Limits', 'character', fallback=1),
-            rating=config.getint('Limits', 'rating', fallback=0),
-            copyright=config.getint('Limits', 'copyright', fallback=0),
-            style=config.getint('Limits', 'style', fallback=0),
-            artist=config.getint('Limits', 'artist', fallback=0),
-            meta=config.getint('Limits', 'meta', fallback=0),
-            model=config.getint('Limits', 'model', fallback=0),
-            quality=config.getint('Limits', 'quality', fallback=0),
-            year=config.getint('Limits', 'year', fallback=0),
+            general=_get_int(config, 'Limits', 'general', 55),
+            character=_get_int(config, 'Limits', 'character', 1),
+            rating=_get_int(config, 'Limits', 'rating', 0),
+            copyright=_get_int(config, 'Limits', 'copyright', 0),
+            style=_get_int(config, 'Limits', 'style', 0),
+            artist=_get_int(config, 'Limits', 'artist', 0),
+            meta=_get_int(config, 'Limits', 'meta', 0),
+            model=_get_int(config, 'Limits', 'model', 0),
+            quality=_get_int(config, 'Limits', 'quality', 0),
+            year=_get_int(config, 'Limits', 'year', 0),
             touched=config.get('Limits', 'touched', fallback='')
         ),
         behavior=Behavior(
-            enable_solo_character_limit=config.getboolean('Behavior', 'enable_solo_character_limit', fallback=True),
-            convert_underscore_to_space=config.getboolean('Behavior', 'convert_underscore_to_space', fallback=True),
+            enable_solo_character_limit=_get_bool(config, 'Behavior', 'enable_solo_character_limit', True),
+            convert_underscore_to_space=_get_bool(config, 'Behavior', 'convert_underscore_to_space', True),
             existing_file_mode=config.get('Behavior', 'existing_file_mode', fallback='ASK'),
             onnx_threads=_parse_onnx_threads(config.get('Behavior', 'onnx_threads', fallback='0')),
             target_mode=parse_target_mode_setting(config.get('Behavior', 'target_mode', fallback='ALL')),
@@ -433,8 +550,8 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
         ),
         window=Window(
             geometry=config.get('Window', 'geometry', fallback='986x976+50+50'),
-            tag_display_rows=config.getint('Window', 'tag_display_rows', fallback=6),
-            tag_display_cols=config.getint('Window', 'tag_display_cols', fallback=5)
+            tag_display_rows=_get_int(config, 'Window', 'tag_display_rows', 6),
+            tag_display_cols=_get_int(config, 'Window', 'tag_display_cols', 5)
         ),
         model=Model(
             model_id=config.get('Model', 'model_id', fallback='pixai-tagger-v0.9'),
@@ -446,7 +563,7 @@ def load_settings(config: configparser.ConfigParser) -> AppSettings:
         ),
         vlm=_load_vlm(config),
         debug=Debug(
-            debug_log=config.getboolean('Debug', 'debug_log', fallback=False) # Default is False for debug_log
+            debug_log=_get_bool(config, 'Debug', 'debug_log', False) # Default is False for debug_log
         ),
         language_code=config.get('General', 'language_code', fallback="")
     )
@@ -459,16 +576,10 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
     def gb(k: str, fb: bool) -> bool:
         # 手書き config.ini の [Vlm] enabled / strict_identity が bool として
         # 解釈できない値でも、gi と同様に既定値へ倒して起動を止めない。
-        try:
-            return config.getboolean('Vlm', k, fallback=fb)
-        except (TypeError, ValueError):
-            return fb
+        return _get_bool(config, 'Vlm', k, fb)
 
     def gi(k: str, fb: int) -> int:
-        try:
-            return config.getint('Vlm', k, fallback=fb)
-        except (TypeError, ValueError):
-            return fb
+        return _get_int(config, 'Vlm', k, fb)
 
     return Vlm(
         enabled=gb('enabled', d.enabled),
@@ -491,6 +602,12 @@ def _load_vlm(config: configparser.ConfigParser) -> Vlm:
         vlm_capable_overrides=g('vlm_capable_overrides', d.vlm_capable_overrides),
         strict_identity=gb('strict_identity', d.strict_identity),
         model_id_overrides=g('model_id_overrides', d.model_id_overrides),
+        # REQ-D5: 生成プロファイルの詳細設定（手書き値が消費側へ流れるようにする）。
+        custom_system_prompt=g('custom_system_prompt', d.custom_system_prompt),
+        temperature=_get_optional_float(config, 'Vlm', 'temperature', d.temperature),
+        top_p=_get_optional_float(config, 'Vlm', 'top_p', d.top_p),
+        image_format=g('image_format', d.image_format),
+        image_jpeg_quality=gi('image_jpeg_quality', d.image_jpeg_quality),
     )
 
 
@@ -556,7 +673,11 @@ def save_config(settings: AppSettings) -> bool:
                 _save_dataclass_to_config(config_parser, value, field_info.name.capitalize())
             else:
                 # Convert value to string for configparser
-                if isinstance(value, float):
+                if value is None:
+                    # REQ-D5: `temperature` / `top_p` の未設定は空文字で往復させる
+                    # （str(None) = "None" を書くと config.ini に無効な値が残る）。
+                    config_parser.set(section_name, field_info.name, "")
+                elif isinstance(value, float):
                     # REQ-5.1: `f"{value:.2f}"` は小数第3位以下を丸める（0.455 → 0.45）。
                     # repr(float) は最短の往復表現なので、保存→読込→保存で値が変わらない。
                     config_parser.set(section_name, field_info.name, repr(float(value)))

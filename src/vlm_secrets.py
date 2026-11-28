@@ -62,6 +62,14 @@ def _load_dotenv() -> None:
 
     内蔵プロバイダーぶんのキーをダイアログで登録する代わりに `.env` 一枚で済ませられる。
     既に設定済みの環境変数は上書きしない。値の `"..."` / `'...'` は外す。
+
+    REQ-D6: 取り込むのは**アプリが実際に参照するキーだけ**（許可リスト）。
+    これが無いと、敵対的フォルダの `.env` が REQUESTS_CA_BUNDLE / SSL_CERT_FILE を
+    設定して TLS 検証を無効化できてしまう。許可リストは鍵解決の定義
+    (`_ENV_ALIASES`) と `PIXAI_VLM_*` の慣習名から生成する（別名が増えても自動追随）。
+
+    REQ-D7: BOM 付きの `.env`（メモ帳等で保存）でも先頭行のキーが無効にならないよう
+    `utf-8-sig` で読む。
     """
     try:
         from constants import BASE_DIR
@@ -75,11 +83,12 @@ def _load_dotenv() -> None:
             continue
         seen.add(p)
         try:
-            with open(p, "r", encoding="utf-8") as f:
+            with open(p, "r", encoding="utf-8-sig") as f:
                 lines = f.readlines()
         except OSError as e:  # pragma: no cover
             write_debug_log(f"vlm_secrets: cannot read {p}: {e}")
             continue
+        skipped = 0
         for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -89,11 +98,18 @@ def _load_dotenv() -> None:
             key, _, val = line.partition("=")
             key = key.strip()
             val = _unquote_dotenv_value(val.strip())
-            if key and key not in os.environ:
+            if not key:
+                continue
+            if not _dotenv_key_allowed(key):
+                skipped += 1
+                continue
+            if key not in os.environ:
                 os.environ[key] = val
+        if skipped:
+            write_debug_log(
+                f"vlm_secrets: ignored {skipped} .env key(s) the app does not read "
+                f"({os.path.basename(p)})")
 
-
-_load_dotenv()
 
 # secret_ref -> 環境変数名 の対応（既知の内蔵接続用）。未知の ref は
 # "PIXAI_VLM_" + ref を英大文字化した名前も試す。
@@ -110,6 +126,35 @@ _ENV_ALIASES = {
     "vlm/anthropic/api_key": ("ANTHROPIC_API_KEY",),
     # "vlm/ovhcloud/api_key": ("OVH_AI_ENDPOINTS_ACCESS_TOKEN", "OVHCLOUD_API_KEY"),
 }
+
+# 秘密値ではないが、アプリが直接 os.environ から読む設定（vlm_config.build_connection_map）。
+# .env 利用者の既存運用を壊さないよう、これらも取り込み許可リストに入れる。
+_DOTENV_NON_SECRET_KEYS: frozenset[str] = frozenset(
+    {"CLOUDFLARE_ACCOUNT_ID", "ANTHROPIC_WORKSPACE_ID"})
+
+# `_env_candidates()` が生成する慣習名の接頭辞。すべての secret_ref は `vlm/...`
+# なので generic 名は `PIXAI_VLM_*` になる（内蔵接続もカスタム `vlm/custom/<id>` も同じ）。
+_DOTENV_GENERIC_PREFIX = "PIXAI_VLM_"
+
+
+def _dotenv_allowed_keys() -> frozenset[str]:
+    """`.env` から取り込んでよいキー名（REQ-D6）。
+
+    固定リストとして二重管理せず、鍵解決が参照する定義（`_ENV_ALIASES` の値）と、
+    非秘密の参照キーから生成する。REQ-F8 で別名が増えても自動で追随する。
+    """
+    return frozenset(
+        {name for names in _ENV_ALIASES.values() for name in names}
+        | _DOTENV_NON_SECRET_KEYS)
+
+
+def _dotenv_key_allowed(key: str) -> bool:
+    """許可リスト本体。`PIXAI_VLM_*`（`_env_candidates()` の慣習名）は接頭辞で許可する。"""
+    return key in _dotenv_allowed_keys() or key.startswith(_DOTENV_GENERIC_PREFIX)
+
+
+# `_ENV_ALIASES` と許可リストの定義後に読み込む（許可リストを参照するため）。
+_load_dotenv()
 
 _lock = threading.Lock()
 _session_store: dict[str, str] = {}
@@ -254,25 +299,44 @@ def secret_status(secret_ref: str) -> str:
 _keyring_probe: bool | None = None
 
 
+def persist_choice_from_checkbox(checked: bool, enabled: bool) -> tuple[bool, bool]:
+    """「永続保存」チェックボックスの状態を `(persist, drop_existing)` に解釈する。
+
+    REQ-D8(b): keyring プローブが失敗すると、ダイアログはチェックボックスを
+    **未チェックかつ無効**にする。その False を「利用者がセッション限定へ切替えた」
+    と解釈して delete_secret を呼ぶと、後で keyring が回復した環境で既存の永続キーが
+    実際に削除される。無効化されている場合は利用者の意思ではないので、削除分岐へ入らない。
+    """
+    if not enabled:
+        return checked, False
+    return checked, not checked
+
+
 def keyring_available() -> bool:
     """OS の秘密情報ストレージが「実際に使えるか」。
 
     `import keyring` が通っても、バックエンドが無い環境では
     `keyring.backends.fail.Keyring`（priority<=0）が返り、`set_password` は例外になる。
-    モジュールの有無ではなく、使えるバックエンドがあるかを見る（結果は一度だけ判定）。
+    モジュールの有無ではなく、使えるバックエンドがあるかを見る。
+
+    REQ-D8(a): **失敗を固定しない**。成功だけをキャッシュし、失敗は次回の呼び出しで
+    再プローブする。初回の一時的な失敗（バックエンドの起動遅れ、ロック等）が
+    プロセス中ずっと「永続保存不可」として残り、回復後も保存できなくなるのを避ける
+    （非正のキャッシュは保存操作の時点の再試行を潰す）。
     """
     global _keyring_probe
-    if _keyring_probe is not None:
-        return _keyring_probe
+    if _keyring_probe:
+        return True
     if keyring is None:
-        _keyring_probe = False
         return False
     try:
         backend = keyring.get_keyring()
         module = (type(backend).__module__ or "").lower()
         priority = float(getattr(backend, "priority", 1) or 0)
-        _keyring_probe = ("fail" not in module) and priority > 0
+        available = ("fail" not in module) and priority > 0
     except Exception as e:  # pragma: no cover - 環境依存
         write_debug_log(f"vlm_secrets: keyring backend probe failed: {type(e).__name__}")
-        _keyring_probe = False
-    return _keyring_probe
+        return False
+    if available:
+        _keyring_probe = True
+    return available
