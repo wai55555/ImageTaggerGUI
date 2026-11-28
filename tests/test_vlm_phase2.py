@@ -646,7 +646,11 @@ def test_diagnostics_rate_limit_can_mark_binding_verified():
     truncated.add("Image input", D.DiagStatus.PASS, "image/jpeg, base64/data-url ready")
     truncated.add("HTTP response", D.DiagStatus.PASS, "200 OK")
     truncated.add("Caption extraction", D.DiagStatus.WARN,
-                  "response truncated at the diagnostic token cap (endpoint reachable)")
+                  # 実際の診断詳細文（_classify_extraction の生成形）に合わせる。
+                  # REQ-F5: 旧 "endpoint reachable" 表記はこのケースで生成されず、
+                  # 到達可能性の例外がデッドだった。
+                  "response truncated at diagnostic max_output_tokens=128; "
+                  "endpoint is reachable, but this VLM may need a larger generation budget")
     truncated.http_status = 200
     assert truncated.can_mark_binding_verified is True
 
@@ -763,18 +767,21 @@ def test_model_list_fetch():
     old = ML.execute_http
     try:
         ML.execute_http = lambda req, **kw: RawHttpResponse(200, {}, {"data": [{"id": "a"}, {"id": "b"}, {"id": "a"}]}, "")
-        assert ML.fetch_model_ids(oai, "k") == ["a", "b"]                      # deduped
+        catalog = ML.fetch_model_catalog(oai, "k")
+        assert [e.model_id for e in catalog] == ["a", "b"]                # deduped
 
         ML.execute_http = lambda req, **kw: RawHttpResponse(200, {}, {"models": [
             {"name": "models/gemma-3-27b-it", "supportedGenerationMethods": ["generateContent"]},
             {"name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"]}]}, "")
-        assert ML.fetch_model_ids(gem, "k") == ["gemma-3-27b-it"]              # models/ stripped, non-vision filtered
+        # models/ stripped; Gemini's non-generateContent rows are dropped by the same
+        # query extractor (_extract_catalog), REQ-F9.
+        assert [e.model_id for e in ML.fetch_model_catalog(gem, "k")] == ["gemma-3-27b-it"]
 
         ML.execute_http = lambda req, **kw: RawHttpResponse(401, {}, {}, "unauthorized")
-        assert ML.fetch_model_ids(oai, "bad").reason is VlmErrorReason.AUTH_ERROR
+        assert ML.fetch_model_catalog(oai, "bad").reason is VlmErrorReason.AUTH_ERROR
 
         ML.execute_http = lambda req, **kw: RawHttpResponse(404, {}, None, "nope")
-        assert ML.fetch_model_ids(oai, "k").reason is VlmErrorReason.BAD_RESPONSE
+        assert ML.fetch_model_catalog(oai, "k").reason is VlmErrorReason.BAD_RESPONSE
 
         # Cloudflare: different endpoint + {"result":[{"name":...,"task":{"name":...}}]}
         cf = VlmConnection("cf", "cf", ConnectionKind.BUILTIN, "openai_chat_completions",
@@ -787,7 +794,11 @@ def test_model_list_fetch():
                 {"name": "@cf/meta/llama-3.2-11b-vision", "task": {"name": "Image-to-Text"}},
                 {"name": "@cf/baai/bge-m3", "task": {"name": "Text Embeddings"}}]}, "")
         ML.execute_http = _cf
-        assert ML.fetch_model_ids(cf, "k") == ["@cf/meta/llama-3.2-11b-vision"]
+        cf_catalog = ML.fetch_model_catalog(cf, "k")
+        assert [e.model_id for e in cf_catalog] == [
+            "@cf/meta/llama-3.2-11b-vision", "@cf/baai/bge-m3"]
+        assert [e.model_id for e in ML.filter_vlm_catalog(cf_catalog)] == [
+            "@cf/meta/llama-3.2-11b-vision"]                                   # 非生成タスクはVLM一覧から外れる
         assert seen["url"].endswith("/ai/models/search")
 
         # Anthropic uses the same {data:[{id:...}]} shape but requires a version header.
@@ -800,7 +811,8 @@ def test_model_list_fetch():
             seen["anthropic_headers"] = dict(req.headers)
             return RawHttpResponse(200, {}, {"data": [{"id": "claude-haiku-4-5-20251001"}]}, "")
         ML.execute_http = _anthropic
-        assert ML.fetch_model_ids(anthropic, "ak") == ["claude-haiku-4-5-20251001"]
+        assert [e.model_id for e in ML.fetch_model_catalog(anthropic, "ak")] == [
+            "claude-haiku-4-5-20251001"]
         assert seen["anthropic_headers"]["anthropic-version"] == "2023-06-01"
         assert seen["anthropic_headers"]["x-api-key"] == "ak"
         assert seen["anthropic_headers"]["anthropic-workspace-id"] == "wrkspc_test"

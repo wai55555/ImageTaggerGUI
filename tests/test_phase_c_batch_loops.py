@@ -180,6 +180,9 @@ def _fake_vlm_runtime(text="hello world"):
     return {
         "connections": {}, "gen_profile": None, "policy": None,
         "candidates": candidates, "executor": executor,
+        # Phase F の REQ-F4 が実行開始時のプロファイル id をスナップショットとして
+        # runtime に載せる（バッチ途中の切り替えで検証先がずれないように）。
+        "model_profile_id": "p1",
         "system_prompt": "", "user_prompt": "",
         "image_cfg": ImagePreprocessConfig(max_long_edge=512, fmt="JPEG", jpeg_quality=80),
     }

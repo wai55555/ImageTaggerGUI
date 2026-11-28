@@ -124,6 +124,10 @@ _ENV_ALIASES = {
     "vlm/vercel/api_key": ("AI_GATEWAY_API_KEY", "VERCEL_AI_GATEWAY_API_KEY"),
     "vlm/openai/api_key": ("OPENAI_API_KEY",),
     "vlm/anthropic/api_key": ("ANTHROPIC_API_KEY",),
+    # xai だけ慣習名が漏れていた（R18-5）。vlm_connections の secret_ref・設定
+    # ダイアログの _PROVIDER_KEY_INFO・プロファイルエディタの4箇所でプロバイダ集合を
+    # 列挙しており、ここだけが欠けていた。keyring 経路は secret_ref 直接なので正常。
+    "vlm/xai/api_key": ("XAI_API_KEY",),
     # "vlm/ovhcloud/api_key": ("OVH_AI_ENDPOINTS_ACCESS_TOKEN", "OVHCLOUD_API_KEY"),
 }
 

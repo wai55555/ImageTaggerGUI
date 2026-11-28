@@ -310,6 +310,8 @@ def _fake_vlm_runtime(fail_second=False):
     return {
         "connections": {}, "gen_profile": None, "policy": None,
         "candidates": candidates, "executor": executor,
+        # REQ-F4: `_build_runtime` は検証記録用に開始時点のプロファイル id を返す。
+        "model_profile_id": "gemma-4-26b-a4b-it",
         "system_prompt": "", "user_prompt": "",
         "image_cfg": ImagePreprocessConfig(max_long_edge=512, fmt="JPEG", jpeg_quality=80),
     }

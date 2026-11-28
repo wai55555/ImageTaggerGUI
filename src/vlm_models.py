@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 _TOKEN_SPLIT = re.compile(r"[/:@_.\-\s]+")
+# 日付様トークン（8桁の数字のみ）。canonical ID の日付（例: claude-opus-4-5-20251101）は
+# 同じモデルの別表記に必ずしも付かないため、サイズ判定の材料にしない（REQ-F1）。
+_DATE_TOKEN = re.compile(r"^\d{8}$")
 # 「同一モデル」を判定するのに効くトークン（サイズ・世代・ファミリー）。汎用語は除外。
 _STOP_TOKENS = frozenset({"", "free", "instruct", "it", "chat", "latest", "preview",
                           "vision", "vl", "model", "google", "meta", "cf", "api"})
@@ -19,6 +22,27 @@ _STOP_TOKENS = frozenset({"", "free", "instruct", "it", "chat", "latest", "previ
 
 def _sig_tokens(text: str) -> set[str]:
     return {t for t in _TOKEN_SPLIT.split((text or "").lower()) if t and t not in _STOP_TOKENS}
+
+
+def _numeric_tokens(tokens: set[str]) -> set[str]:
+    """サイズ・世代を表す数字トークンの集合（日付様トークンは除く）。
+
+    27b / 12b / 4 のようなトークンがここに入る。8桁の数字のみのトークンは
+    canonical ID の日付や revision を表すもので、モデルの大きさではない。
+    """
+    return {t for t in tokens
+            if any(ch.isdigit() for ch in t) and not _DATE_TOKEN.match(t)}
+
+
+def _size_tokens_agree(ref: set[str], cand: set[str]) -> bool:
+    """サイズ・世代トークンの集合が一致するか（REQ-F1／F2 のサイズガード）。
+
+    以前は「積集合が空でない」だけで成立したため、世代トークン（"4"）だけを
+    共有する別サイズの兄弟まで同じモデルとして通っていた。双方とも数字トークンを
+    持たない場合は集合が共に空で一致するので、サイズ表記の無いモデル同士の
+    一致は従来どおり成立する。
+    """
+    return _numeric_tokens(ref) == _numeric_tokens(cand)
 
 
 class ModelIdentityStatus(str, Enum):
@@ -511,8 +535,15 @@ def match_model_id(profile: VlmModelProfile, provider_id: str,
     """
     if not candidates:
         return None, 0.0
+    # 候補の評価順は候補 ID で安定ソートして決める（REQ-F3）。プロバイダーの
+    # 返却順で同点の勝者が入れ替わらないようにするため。大文字小文字だけ違う
+    # 重複は、辞書順で先の表記を代表として残す（後勝ちに潰れない）。
+    ordered = sorted({str(c) for c in candidates if str(c or "").strip()},
+                     key=lambda c: (c.lower(), c))
     binding = profile.binding_for(provider_id)
-    lowered = {c.lower(): c for c in candidates}
+    lowered: dict[str, str] = {}
+    for c in ordered:
+        lowered.setdefault(c.lower(), c)
     # 1) binding の既定 ID / alias が一覧にそのままあれば即決。
     exacts = [binding.model_id] if binding is not None else []
     exacts += list(profile.aliases) + [profile.canonical_model_id]
@@ -524,15 +555,14 @@ def match_model_id(profile: VlmModelProfile, provider_id: str,
     if not ref:
         return None, 0.0
     best_id, best_score = None, 0.0
-    for c in candidates:
+    for c in ordered:
         ct = _sig_tokens(c)
         if not ct:
             continue
         inter = ref & ct
-        # 数字トークン（27b / 12b など）が食い違うなら別サイズ＝別モデル。強く減点。
-        ref_nums = {t for t in ref if any(ch.isdigit() for ch in t)}
-        cand_nums = {t for t in ct if any(ch.isdigit() for ch in t)}
-        size_ok = not (ref_nums and cand_nums) or bool(ref_nums & cand_nums)
+        # 数字トークン（27b / 12b など）の集合が食い違うなら別サイズ＝別モデル。
+        # 強く減点する（REQ-F1: 世代トークン "4" だけの部分一致では通さない）。
+        size_ok = _size_tokens_agree(ref, ct)
         score = len(inter) / len(ref | ct)
         if not size_ok:
             score *= 0.3
@@ -542,16 +572,19 @@ def match_model_id(profile: VlmModelProfile, provider_id: str,
 
 
 def looks_same_family(profile: VlmModelProfile, model_id: str) -> bool:
-    """model_id がプロファイルと「だいたい同じモデル」に見えるか（緩いチェック）。"""
+    """model_id がプロファイルと「だいたい同じモデル」に見えるか（緩いチェック）。
+
+    サイズ・世代トークンのガードは match_model_id() と同じ「集合の一致」で判定する
+    （REQ-F2）。ここは「同一モデルとみなしてよいか」の最終段なので、積集合の有無で
+    緩く通すと別サイズの兄弟が通ってしまう。
+    """
     if not model_id:
         return False
     ref = _profile_reference_tokens(profile)
     ct = _sig_tokens(model_id)
     if not ref or not ct:
         return False
-    ref_nums = {t for t in ref if any(ch.isdigit() for ch in t)}
-    cand_nums = {t for t in ct if any(ch.isdigit() for ch in t)}
-    if ref_nums and cand_nums and not (ref_nums & cand_nums):
+    if not _size_tokens_agree(ref, ct):
         return False
     return len(ref & ct) >= 1
 
@@ -929,13 +962,17 @@ def _profile_model_ids(profile: VlmModelProfile, provider_id: str) -> set[str]:
 
 
 def _known_profile_for_model(provider_id: str, model_id: str) -> VlmModelProfile | None:
-    """既知IDを、同一IDを定義している出荷プロファイルへ結び付ける。"""
+    """既知IDを、同一IDを定義している出荷プロファイルへ結び付ける。
+
+    REQ-F2: 兄弟の認識は binding の有無に依らず、プロファイルカタログ全体の
+    正規 ID・別名から行う。binding を持つプロファイルだけを見ると、この
+    プロバイダー向け binding を持たない兄弟（例: Groq binding の無い
+    QWEN3_6_27B）を見落とし、別モデルが「使用可能」として通ってしまう。
+    """
     low = (model_id or "").strip().lower()
     if not low:
         return None
     for candidate in _ALL_PROFILES:
-        if candidate.binding_for(provider_id) is None:
-            continue
         if low in _profile_model_ids(candidate, provider_id):
             return candidate
     return None

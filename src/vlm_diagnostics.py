@@ -160,8 +160,12 @@ class DiagReport:
             # 200応答が診断用トークン上限で切れた場合も、モデルまで到達したことは
             # 確認できている。本文抽出成功とは区別するため、詳細に明示されたケースだけ
             # を到達確認として扱う（content policy 等の一般WARNは含めない）。
+            # 照合する部分文字列は _classify_extraction() が実際に生成する文言
+            # （"...; endpoint is reachable, ..."）に合わせる。旧文言の
+            # "endpoint reachable" はこのケースでは決して現れず、例外がデッドだった
+            # （REQ-F5）。この判定に使う部分文字列はここの1箇所だけである。
             if (extraction.status is DiagStatus.WARN
-                    and "endpoint reachable" in (extraction.detail or "").lower()):
+                    and "endpoint is reachable" in (extraction.detail or "").lower()):
                 return True
         if self.http_status != 429 or http.status is not DiagStatus.WARN:
             return False

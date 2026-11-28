@@ -55,7 +55,6 @@ EXCLUSION_REASON_KEYS = {
     "identity_unknown": "Exclude_Identity_Unknown",
     "quantization_unknown": "Exclude_Quantization_Unknown",
     "no_auth": "Exclude_No_Auth",
-    "no_image_support": "Exclude_No_Image_Support",
     "cooldown": "Exclude_Cooldown",
 }
 
@@ -127,6 +126,35 @@ class CandidateSet:
         return bool(self.connection_ids)
 
 
+def order_connections_by_provider(
+        connections: dict[str, VlmConnection],
+        provider_order: list[str]) -> dict[str, VlmConnection]:
+    """利用者が並べた経路順（provider_id の並び）を connections の並びへ反映する。
+
+    REQ-F7: 候補順は router が connections の並びから決める。呼び出し側は
+    「どの経路をどの順で試すか」をこの関数で辞書順に載せてから渡す。
+    `provider_order` に無い接続（無効化された内蔵・カスタム接続など）は
+    元の相対順を保って後ろへ回す。
+    """
+    rank = {pid: i for i, pid in enumerate(provider_order)}
+
+    def sort_key(item: tuple[str, VlmConnection]) -> tuple[int, int, str]:
+        cid, conn = item
+        provider_id = getattr(conn, "provider_id", "")
+        if conn.kind is ConnectionKind.BUILTIN and provider_id in rank:
+            return (0, rank[provider_id], cid)
+        return (1, 0, cid)
+
+    return dict(sorted(connections.items(), key=sort_key))
+
+
+def _builtin_connections_in_order(
+        connections: dict[str, VlmConnection]) -> list[tuple[str, VlmConnection]]:
+    """内蔵接続を connections の並び順で返す。"""
+    return [(cid, conn) for cid, conn in connections.items()
+            if conn.kind is ConnectionKind.BUILTIN]
+
+
 def select_candidates(
     profile: VlmModelProfile,
     connections: dict[str, VlmConnection],
@@ -134,7 +162,6 @@ def select_candidates(
     *,
     cooldown_until: dict[str, float] | None = None,
     has_auth: dict[str, bool] | None = None,
-    supports_image: dict[str, bool] | None = None,
     now: float | None = None,
 ) -> CandidateSet:
     """処理開始時に一度だけ呼ぶ。結果はジョブスナップショットへ固定する。
@@ -146,28 +173,29 @@ def select_candidates(
     now = now if now is not None else time.monotonic()
     cooldown_until = cooldown_until or {}
     has_auth = has_auth or {}
-    supports_image = supports_image or {}
     result = CandidateSet()
 
     if policy.execution_mode is ExecutionMode.CUSTOM_SINGLE:
         return _select_custom_single(connections, policy, cooldown_until, has_auth, now)
 
     # --- builtin_fallback ---
-    # プロファイルの bindings 挿入順 = 既定の優先順位。UI で並べ替えた順は
-    # connections 側の順序で表現される想定なので、両方を尊重して交差を取る。
-    ordered_provider_ids = [pid for pid in profile.bindings if _provider_has_connection(pid, connections)]
-    for provider_id in ordered_provider_ids:
-        conn = _builtin_connection_for(provider_id, connections)
-        if conn is None:
+    # 候補順は connections の並びで決める（REQ-F7）。この辞書は利用者が並べた
+    # 経路順（connection_order）を `order_connections_by_provider()` で載せたもの
+    # を受け取る前提で、profile.bindings の挿入順には依存しない。bindings は
+    # 「この接続がこのプロファイルの経路か」の判定にだけ使う。
+    #
+    # 画像入力の可否（no_image_support）はここでは判定しない（REQ-F6）。能力判定は
+    # モデル ID 層（vlm_models.classify_model_capability）へ一本化されており、
+    # 接続定義は画像可否を持たない。ここに除外分岐を戻すと、実経路で決して
+    # 立たない死んだ防御層になる。
+    for cid, conn in _builtin_connections_in_order(connections):
+        provider_id = conn.provider_id
+        if provider_id not in profile.bindings:
             continue
-        cid = conn.connection_id
-        binding = profile.binding_for(provider_id)
+        binding = profile.bindings[provider_id]
 
         if not conn.enabled:
             result.excluded[cid] = "disabled"
-            continue
-        if binding is None:
-            result.excluded[cid] = "not_verified"
             continue
         status = binding.effective_identity_status()
         if status is ModelIdentityStatus.UNKNOWN:
@@ -183,9 +211,6 @@ def select_candidates(
             continue
         if not has_auth.get(cid, False):
             result.excluded[cid] = "no_auth"
-            continue
-        if not supports_image.get(cid, True):
-            result.excluded[cid] = "no_image_support"
             continue
         if cooldown_until.get(cid, 0.0) > now:
             result.excluded[cid] = "cooldown"
@@ -223,13 +248,3 @@ def _select_custom_single(connections, policy, cooldown_until, has_auth, now) ->
     result.connection_ids.append(cid)
     return result
 
-
-def _provider_has_connection(provider_id: str, connections: dict[str, VlmConnection]) -> bool:
-    return _builtin_connection_for(provider_id, connections) is not None
-
-
-def _builtin_connection_for(provider_id: str, connections: dict[str, VlmConnection]) -> VlmConnection | None:
-    for conn in connections.values():
-        if conn.kind is ConnectionKind.BUILTIN and conn.provider_id == provider_id:
-            return conn
-    return None

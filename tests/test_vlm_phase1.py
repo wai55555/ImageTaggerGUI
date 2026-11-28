@@ -705,10 +705,18 @@ def test_multi_provider_profiles():
     assert CFG.ordered_builtin_provider_ids(_s("openai-gpt-5.6-luna"), gpt) == [
         "openrouter"]
     auth = {cid: True for cid in gpt_cm}
+    # REQ-F7: 候補順は router が connections の並びから決める。
+    # build_connection_map の並び（内蔵テンプレート順）では OpenRouter → Vercel →
+    # OpenAI になる。実際の実行経路は vlm_worker が connection_order（＝利用者が
+    # 並べた経路順）を connections 側へ載せるので、アプリの既定は次の second call
+    # （ベンダー直販が先）どおりになる。
     paid_direct = R.select_candidates(gpt, gpt_cm, R.RouterPolicy(), has_auth=auth)
-    # Binding order is the fallback order: the model's own vendor first, then
-    # OpenRouter (the aggregator most users already hold a key for), then Vercel.
     assert paid_direct.connection_ids == [
+        "builtin-openrouter", "builtin-vercel", "builtin-openai"]
+    ui_ordered_gpt = R.order_connections_by_provider(
+        gpt_cm, ["openai", "openrouter", "vercel"])
+    assert R.select_candidates(gpt, ui_ordered_gpt, R.RouterPolicy(),
+                               has_auth=auth).connection_ids == [
         "builtin-openai", "builtin-openrouter", "builtin-vercel"]
     claude_settings = _s("claude-haiku-4-5")
     claude_settings.anthropic_workspace_id = "wrkspc_test123"
@@ -733,6 +741,12 @@ def test_multi_provider_profiles():
         claude, claude_cm, R.RouterPolicy(),
         has_auth={cid: True for cid in claude_cm})
     assert claude_paid.connection_ids == [
+        "builtin-openrouter", "builtin-vercel", "builtin-anthropic"]
+    ui_ordered_claude = R.order_connections_by_provider(
+        claude_cm, ["anthropic", "openrouter", "vercel"])
+    assert R.select_candidates(
+        claude, ui_ordered_claude, R.RouterPolicy(),
+        has_auth={cid: True for cid in claude_cm}).connection_ids == [
         "builtin-anthropic", "builtin-openrouter", "builtin-vercel"]
 
     for profile_id, provider, model_id in (
