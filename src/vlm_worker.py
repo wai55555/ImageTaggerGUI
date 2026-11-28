@@ -28,7 +28,7 @@ from vlm_image import ImagePreprocessConfig, prepare_image
 from vlm_profiles import build_system_prompt, build_user_prompt
 from vlm_router import (
     ExecutionMode, explain_candidate_failure, localized_candidate_failure,
-    select_candidates,
+    order_connections_by_provider, select_candidates,
 )
 from vlm_transport import VlmExecutor
 
@@ -167,15 +167,19 @@ class VlmCaptionWorker(QObject):
             ordered_bindings = {pid: effective.bindings[pid]
                                 for pid in order if pid in effective.bindings}
             model_profile = dataclasses.replace(model_profile, bindings=ordered_bindings)
+            # REQ-F7: 候補順は router が connections の並びから決める。利用者が並べた
+            # 経路順を connections 側にも載せ、bindings の挿入順に依存させない。
+            connections = order_connections_by_provider(connections, order)
 
         has_auth = {}
-        supports_image = {}
         for cid, conn in connections.items():
             has_auth[cid] = conn.auth.type == "none" or bool(vlm_secrets.get_secret(conn.auth.secret_ref))
-            supports_image[cid] = True
 
+        # REQ-F6: 画像入力可否はモデル ID 層（vlm_models.classify_model_capability）で
+        # 判定済みであり、接続定義は画像可否を持たない。router に supports_image の
+        # 死んだ除外を戻さないためここでは渡さない。
         candidates = select_candidates(model_profile, connections, policy,
-                                       has_auth=has_auth, supports_image=supports_image)
+                                       has_auth=has_auth)
         executor = VlmExecutor(connections, vlm_secrets.get_secret, stop_checker=self.is_stopped,
                                on_attempt_start=self._on_attempt_start)
         image_cfg = ImagePreprocessConfig(
@@ -189,6 +193,10 @@ class VlmCaptionWorker(QObject):
         return {
             "connections": connections, "gen_profile": gen_profile, "policy": policy,
             "candidates": candidates, "executor": executor,
+            # REQ-F4: 検証結果の記録先は実行開始時のスナップショットで固定する。
+            # 設定ダイアログはモードレスなので、バッチ途中でプロファイルを切り替えると
+            # emit 時点のライブ値を読むと旧プロファイルの検証が新しい id の下に入る。
+            "model_profile_id": model_profile.profile_id,
             "system_prompt": build_system_prompt(gen_profile),
             "user_prompt": build_user_prompt(gen_profile),
             "image_cfg": image_cfg,
@@ -268,7 +276,7 @@ class VlmCaptionWorker(QObject):
             self.single_test_result.emit(result.text or "",
                                          conn.display_name if conn else result.connection_id,
                                          result.model_id)
-            self._note_verified(conn)
+            self._note_verified(conn, rt["model_profile_id"])
 
             output_path = image_path.with_suffix(".txt")
             mode = parse_existing_file_mode(self._settings.behavior.existing_file_mode, self.get_string)
@@ -426,7 +434,8 @@ class VlmCaptionWorker(QObject):
                     self.log_message.emit(self.get_string("Vlm", "Image_Failed",
                                                           name=image_path.name, reason=reason), "red")
                     continue
-                self._note_verified(rt["connections"].get(result.connection_id))
+                self._note_verified(rt["connections"].get(result.connection_id),
+                                    rt["model_profile_id"])
                 if result.connection_id and result.connection_id != last_conn:
                     if last_conn:
                         conn = rt["connections"].get(result.connection_id)
@@ -495,8 +504,14 @@ class VlmCaptionWorker(QObject):
             return False, decision
         return True, decision
 
-    def _note_verified(self, conn) -> None:
-        """実出力を確認できた内蔵 binding を1度だけ MainWindow へ知らせる（永続化はあちら）。"""
+    def _note_verified(self, conn, profile_id: str) -> None:
+        """実出力を確認できた内蔵 binding を1度だけ MainWindow へ知らせる（永続化はあちら）。
+
+        REQ-F4: profile_id は `_build_runtime` が実行開始時に取ったスナップショットを
+        そのまま受け取る。ここで `self._settings.vlm.model_profile_id` を読み直すと、
+        モードレスの設定ダイアログでバッチ途中に切り替えた新しいプロファイル id の下に
+        旧プロファイルの検証が記録されてしまう。
+        """
         if conn is None or getattr(conn, "is_custom", True) or not getattr(conn, "provider_id", ""):
             return
         seen = getattr(self, "_verified_emitted", None)
@@ -505,7 +520,7 @@ class VlmCaptionWorker(QObject):
         if conn.provider_id in seen:
             return
         seen.add(conn.provider_id)
-        self.binding_verified.emit(conn.provider_id, self._settings.vlm.model_profile_id)
+        self.binding_verified.emit(conn.provider_id, profile_id)
 
     def _emit_attempt_summary(self, name: str, result) -> None:
         for a in result.attempts:

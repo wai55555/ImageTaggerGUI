@@ -120,7 +120,10 @@ def test_single_test_saves_to_txt(monkeypatch):
     assert len(changes) == 1 and changes[0].previous_content == "old caption"
     # gemini's builtin protocol is gemini_generate_content; the mock returns OpenAI-shaped
     # JSON, so gemini fails to parse and the run succeeds via openrouter.
-    assert verified == [("openrouter", "gemma-4-31b-it")], verified
+    # REQ-F4: the recorded profile id is the one `_build_runtime` snapshotted at start
+    # (the resolved profile), not the live `[Vlm] model_profile_id` string. This fixture
+    # stubs resolve_model_profile() to the 26B profile.
+    assert verified == [("openrouter", "gemma-4-26b-a4b-it")], verified
     # the other image is untouched - single test only touches the selected one
     assert not (d / "i1.txt").exists()
     print("  single test writes the selected .txt + one undo FileChange: OK")

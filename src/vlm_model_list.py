@@ -94,30 +94,6 @@ def fetch_model_catalog(conn: VlmConnection, api_key: str | None,
     return out
 
 
-def fetch_model_ids(conn: VlmConnection, api_key: str | None,
-                    *, connect_timeout: float = 8.0, read_timeout: float = 20.0
-                    ) -> list[str] | VlmAttemptError:
-    """互換 API。モデル ID だけを返す（既存の呼び出し元向け）。"""
-    raw = _fetch_model_body(conn, api_key, connect_timeout=connect_timeout,
-                            read_timeout=read_timeout)
-    if isinstance(raw, VlmAttemptError):
-        return raw
-    # 旧 API の挙動を維持するため、Cloudflare の明示的な非生成タスクと、
-    # Gemini の generateContent 非対応行は _extract_ids() で除外する。
-    ids = _extract_ids(raw)
-    if not ids:
-        return VlmAttemptError(VlmErrorReason.BAD_RESPONSE, 200,
-                               "no model ids in response",
-                               message_key="ModelList_No_Model_Ids")
-    seen: set[str] = set()
-    out: list[str] = []
-    for mid in ids:
-        if mid and mid not in seen:
-            seen.add(mid)
-            out.append(mid)
-    return out
-
-
 def _fetch_model_body(conn: VlmConnection, api_key: str | None,
                       *, connect_timeout: float, read_timeout: float):
     base = (conn.base_url or "").rstrip("/")
@@ -267,44 +243,3 @@ def catalog_entry_from_id(provider_id: str, model_id: str) -> ModelCatalogEntry:
     return ModelCatalogEntry(model_id=mid, supports_image_input=is_vlm,
                              supports_text_output=True if is_vlm else None,
                              capability_source=source)
-
-
-def _extract_ids(body) -> list[str]:
-    """旧 ``fetch_model_ids`` 用のID抽出（従来の除外挙動を維持）。"""
-    rows = body.get("data") if isinstance(body, dict) else body
-    if isinstance(rows, list) and any(isinstance(row, dict) and "id" in row for row in rows):
-        return [str(r.get("id", "")).strip() for r in rows if r.get("id")]
-    # xAI /v1/language-models: {"models": [{"id": "grok-4.6", ...}]}
-    id_rows = body.get("models") if isinstance(body, dict) else None
-    if isinstance(id_rows, list) and any(
-            isinstance(r, dict) and str(r.get("id", "")).strip() for r in id_rows):
-        return [str(r.get("id", "")).strip() for r in id_rows
-                if isinstance(r, dict) and str(r.get("id", "")).strip()]
-    # Cloudflare の非キャプションタスクを旧仕様どおり除外。
-    cf = body.get("result") if isinstance(body, dict) else None
-    if isinstance(cf, list) and cf and isinstance(cf[0], dict) and "name" in cf[0]:
-        drop = ("embedding", "classification", "speech", "translation", "detection",
-                "image-to-image", "text-to-image", "text-to-speech", "reranking")
-        out = []
-        for row in cf:
-            task = ((row.get("task") or {}).get("name") or "").lower()
-            if task and any(k in task for k in drop):
-                continue
-            name = str(row.get("name", "")).strip()
-            if name:
-                out.append(name)
-        return out
-    # Gemini は generateContent 非対応行を除外。
-    gm = body.get("models") if isinstance(body, dict) else None
-    if isinstance(gm, list):
-        out = []
-        for row in gm:
-            if not isinstance(row, dict):
-                continue
-            methods = row.get("supportedGenerationMethods") or row.get("supported_generation_methods") or []
-            if methods and "generateContent" not in methods:
-                continue
-            name = str(row.get("name", "")).strip()
-            out.append(name[len("models/"):] if name.startswith("models/") else name)
-        return [x for x in out if x]
-    return []

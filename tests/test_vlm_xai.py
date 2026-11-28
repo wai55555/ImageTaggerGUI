@@ -91,7 +91,9 @@ def test_language_models_catalog_parsing() -> None:
     assert by_id["grok-2-image-1212"].is_vlm is False  # 画像出力モデルは弾く
     vlm_ids = [e.model_id for e in vlm_model_list.filter_vlm_catalog(catalog)]
     assert vlm_ids == ["grok-4.6", "grok-4.3"]
-    assert vlm_model_list._extract_ids(body) == [
+    # REQ-F9: 旧互換 API（fetch_model_ids / _extract_ids）は削除し、現行の
+    # _extract_catalog 側で同じ並びが取れることを確かめる。
+    assert [e.model_id for e in catalog] == [
         "grok-4.6", "grok-4.3", "grok-3", "grok-2-image-1212"]
 
 
