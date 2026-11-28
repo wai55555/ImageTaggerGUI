@@ -148,6 +148,9 @@ class ImageEditCellWidget(QWidget):
         self._caption_save_timer.setInterval(constants.CAPTION_AUTOSAVE_DELAY_MS)
         self._caption_save_timer.timeout.connect(self._save_caption)
         self.caption_edit.textChanged.connect(self._caption_save_timer.start)
+        # REQ-2.3（Phase 2）: 一括/タグ付け実行中はセルの書き込み経路をハンドラ側でも
+        # 止める。ウィジェットの enable 状態だけに依存しない。
+        self._editing_enabled: bool = True
 
     # --- ADDED: Slot to handle the double click and emit the request ---
     @Slot()
@@ -240,6 +243,10 @@ class ImageEditCellWidget(QWidget):
     def _save_caption(self):
         """Captioner mode: write caption_edit back to the .txt (focus-out or autosave); emit for undo."""
         self._caption_save_timer.stop()
+        # REQ-2.3: 一括/タグ付け実行中は書かない（実行中のワーカーと同じ .txt を
+        # 取り合わない）。錠をかける前の flush は set_editing_enabled が先に行う。
+        if not self._editing_enabled:
+            return
         if not self._caption_mode or not self._image_path:
             return
         txt_path = tag_utils.get_txt_path(self._image_path)
@@ -333,6 +340,9 @@ class ImageEditCellWidget(QWidget):
         self.next_tag_page_btn.setEnabled(end_index < total_tags)
     @Slot()
     def _add_tag(self):
+        # REQ-2.3: グリッドのタグ追加も .txt を書く。錠中はハンドラでも止める。
+        if not self._editing_enabled:
+            return
         if not self._image_path:
             return
         tags_to_add_str = self.add_tag_line.text().strip()
@@ -357,6 +367,9 @@ class ImageEditCellWidget(QWidget):
                 self.tags_added.emit(txt_path, actually_new_tags)
     @Slot(str)
     def _remove_tag(self, tag_to_remove: str):
+        # REQ-2.3 / R19-6: セルのタグチップからの削除経路も錠中は通さない。
+        if not self._editing_enabled:
+            return
         if not self._image_path: return
         txt_path = tag_utils.get_txt_path(self._image_path)
         
@@ -453,6 +466,7 @@ class ImageEditCellWidget(QWidget):
         if not enabled:
             # Commit anything still inside the autosave debounce before locking.
             self._save_caption()
+        self._editing_enabled = enabled
         self._tag_area_widget.setEnabled(enabled)
         self.caption_edit.setReadOnly(not enabled)
 

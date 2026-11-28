@@ -426,9 +426,48 @@ Phase 5 のうちダイアログ側のもの。
 - 処理をしていない通常操作（単体編集、一括、Undo）が従来どおり行えることの回帰確認
 
 **完了判定**
-- [ ] 棚卸し表が PR に含まれ、表の全経路が REQ-2.3 を満たす
-- [ ] REQ-2.6 の再入再現テスト（R35-1）が入り、通過している
-- [ ] §9.1 が通過し、スモーク（処理中の各種操作の試行を含む）の記録がある
+- [x] 棚卸し表が PR に含まれ、表の全経路が REQ-2.3 を満たす
+- [x] REQ-2.6 の再入再現テスト（R35-1）が入り、通過している
+- [x] §9.1 が通過し、スモーク（処理中の各種操作の試行を含む）の記録がある
+
+**実装記録（2026-11-29）**
+
+- 棚卸し表: `docs/261129_phase2_write_path_inventory.md` を新設した。`.txt` を
+  読み-変更-書き込みする 16 経路と、錠を解く 4 経路・解いてはいけない 3 経路、
+  意図的に錠の対象外にした 4 対象を、実コードの行番号付きで列挙した。
+- REQ-2.2: `MainWindow._is_processing()`（`main_window.py:1261`）を判定の正本にした。
+  既存のフラグ群（`_is_downloading` / `_is_bulk_deleting` / `_tagger_thread` /
+  `_bulk_tag_thread`）を束ねるだけで、状態の所有者は増やしていない（NFR-9）。
+- REQ-2.3: 一括処理の開始が `_set_main_controls_enabled(False)` を通るようになり、
+  実行ボタン・単体タグ編集・グリッド切替・Undo/Redo・単体タグ追加欄・
+  表示中タグチップ・GPU トグル（R21-1／R25-1／R19-6）が同時に閉じる。
+  各ハンドラ（`add_tag_all` / `delete_tag_all` / `_add_single_tag` /
+  `_delete_image_tag` / `_perform_undo` / `_perform_redo` / `_run_vlm_single_test` /
+  `_start_tagging_thread`）と、グリッドセル（`_add_tag` / `_remove_tag` /
+  `_save_caption`）にも同じ判定のガードを置いた（片方だけに依存しない）。
+- REQ-2.4: `display_current_tag_page()` と `_display_image_tag_page()` は
+  `_controls_enabled` を引き継ぎ、`_update_bulk_tag_buttons()` は一括フラグを落とさない。
+  解除は `_on_tagger_finished` / `_on_bulk_tag_finished` / `_on_download_finished` の
+  3 経路だけが行う。
+- REQ-2.5（U-1）: `_handle_folder_drop()` の先頭で `_is_processing()` を見て受理しない。
+  3 経路（D&D／Browse／パス入力）は同関数へ集約されているので判定は 1 箇所。
+  利用者向け文言は 9 言語へ `MainWindow.Busy_Processing_Active` を追加した（NFR-5）。
+- REQ-2.6（R35-1）: 待機ループを `_wait_for_tagger_thread_stop()` に切り出し、
+  待機後に `self._tagger_thread is thread` を確認する。差し替わっていれば detach しない。
+  タイムアウト 5 秒と `terminate()` を使わない方針は不変（NFR-12）。
+- テスト: `tests/test_phase2_write_path_locks.py`（13 件）。判定の一本化、一括開始の錠、
+  表示更新・ローダ完了が解錠しないこと、チップの生成時錠、フォルダ切替の拒否、
+  単体追加／チップ削除／一括／Undo／VLM 単体テストのガード、グリッドセルの 3 経路、
+  再入（新スレッドを detach しない）と停止しないスレッドの detach を固定した。
+- §9.1: `pytest` **1025 passed / 2 skipped**、`ruff` 421（変更なし）、`pyright` 82
+  （86 から減少）。実行前後で実 config.ini・`vlm_connections.json`・
+  `vlm_profiles.json` の SHA-256 は不変（`conftest.py` の指紋検査も全件通過）。
+- スモーク: GUI を表示できない環境のため、自動テストで「処理中の操作の試行」を再現した
+  （一括実行中のフォルダ切替・単体追加・チップ削除・一括追加・Undo・VLM 単体テスト・
+  グリッド操作）。手動 GUI スモークは Phase 10 の通し検証で行う。
+- 既存テストの追随: Phase H のテストダブル 3 箇所（`tests/test_phase_h_tag_identity.py`）に
+  `_is_processing` / `_controls_enabled` / `_editing_enabled` を与えた。実装の変更に
+  対するテストダブルの追随であり、観測対象の挙動は変えていない。
 
 ---
 

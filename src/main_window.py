@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QLabel, QLineEdit, QPushButton,
     QSlider, QTextEdit, QFileDialog, QMessageBox, QDialog,
     QStackedWidget, QApplication, QSplitter, QListWidgetItem, QComboBox, QButtonGroup,
-    QProgressDialog
+    QCheckBox, QProgressDialog
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QKeyEvent, QResizeEvent, QDragEnterEvent,
@@ -218,6 +218,8 @@ class MainWindow(QMainWindow):
     tagger_config_block: QWidget
     shared_run_block: QWidget
     category_settings_button: QPushButton
+    # Phase 2（R21-1）で錠の対象に加えた GPU トグル（生成は ui_main_window）。
+    use_gpu_check: QCheckBox
 
     # --- Signals ---
     request_overwrite_check = Signal(str, str)
@@ -1028,8 +1030,8 @@ class MainWindow(QMainWindow):
     def _run_vlm_single_test(self):
         """選択画像1枚で実際に VLM 生成し、結果を編集欄へ出しつつ .txt へも保存する
         （既存ファイルの扱い・挿入位置は一括処理と同じ設定に従う。2026-09 ユーザー決定）。"""
-        if self._tagger_thread and self._tagger_thread.isRunning():
-            self.update_log(self.locale_manager.get_string("MainWindow", "Warning_Tagging_Already_Running"), "orange")
+        if self._is_processing():
+            self.update_log(self.locale_manager.get_string("MainWindow", "Busy_Processing_Active"), "orange")
             return
         current_item = self.image_list.currentItem()
         if not current_item:
@@ -1109,7 +1111,8 @@ class MainWindow(QMainWindow):
         """Updates the bulk tag deletion buttons with new tag data."""
         if self.loading_timer:
             self.loading_timer.stop()
-        self._is_bulk_deleting = False
+        # REQ-2.4: ローダ完了は「読む側」の完了であって、書く側の錠を解く理由ではない。
+        # ここで _is_bulk_deleting を落とすと、一括処理中でもガードが外れる（R12-6）。
         self._all_tags = all_tags
 
         saved_page = getattr(self, '_saved_bulk_page', None)
@@ -1195,7 +1198,9 @@ class MainWindow(QMainWindow):
 
         self.prev_page_btn.setEnabled(self._current_page > 0)
         self.next_page_btn.setEnabled(end_index < total_tags)
-        self._set_bulk_controls_enabled(True)
+        # REQ-2.4: 表示更新で錠を開けない。解除は処理の終了経路（_set_main_controls_enabled）
+        # だけが行う（R7-4。以前はここで無条件に True にしていた）。
+        self._set_bulk_controls_enabled(self._controls_enabled)
         QTimer.singleShot(0, self.update_all_button_alignments)
         
     def _display_image_tag_page(self):
@@ -1229,6 +1234,8 @@ class MainWindow(QMainWindow):
 
             button = QPushButton(display_text)
             button.setMinimumSize(self._tag_button_min_width, self._tag_button_min_height)
+            # 生成時点の錠状態を引き継ぐ（実行中に再描画されてもチップが書けない）。
+            button.setEnabled(self._controls_enabled)
             button.setToolTip(tag_name) # Tooltip always shows English tag
             button.setProperty("original_tag", tag_name)
             button.clicked.connect(functools.partial(self._delete_image_tag, tag_name))
@@ -1247,6 +1254,20 @@ class MainWindow(QMainWindow):
         self.display_current_tag_page()
         self._display_image_tag_page()
         self.grid_view_widget.set_tag_display_language(self._tag_display_language, self.tag_translation_map)
+
+    # .txt を書きうる実行が 1 つでも進行中か（REQ-2.2 の正本）。各ハンドラは
+    # 自前の部分的なガードではなくこの判定を見る。ダウンロードは .txt を書かないが、
+    # ロック中に編集経路だけが通る非対称を作らないため含める。メモリ内の状態だけを
+    # 参照し、経路ごとにファイル I/O を足さない（REQ-2.7）。状態の所有者は既存の
+    # フラグ群のままで、判定だけをここへ一本化する（NFR-9）。
+    def _is_processing(self) -> bool:
+        """True while a run that can write .txt files is active."""
+        return bool(
+            self._is_downloading
+            or self._is_bulk_deleting
+            or (self._tagger_thread is not None and self._tagger_thread.isRunning())
+            or (self._bulk_tag_thread is not None and self._bulk_tag_thread.isRunning())
+        )
 
     def _update_ui_for_processing(self, is_running: bool, process_type: str):
         """Updates UI elements based on whether a process is starting or stopping."""
@@ -1296,9 +1317,21 @@ class MainWindow(QMainWindow):
             # 走行中は1枚テストも押せないようにする（設定ボタンと同じ理由）。
             self.vlm_single_test_button.setEnabled(enabled)
         # The worker rewrites the same .txt files, so every path that can also write them
-        # has to be locked: the main caption box, the grid-view cells, and Undo/Redo.
+        # has to be locked: the main caption box, the grid-view cells, Undo/Redo,
+        # the single-tag add row, the displayed tag chips and the GPU toggle.
         self.caption_text_edit.setEnabled(enabled)
         self.grid_view_widget.set_editing_enabled(enabled)
+        # R25-1: 単体タグ追加の入力欄とボタン
+        self.add_single_tag_line.setEnabled(enabled)
+        self.add_single_tag_button.setEnabled(enabled)
+        # R19-6: 表示中画像のタグチップ（新規生成分は _display_image_tag_page が
+        # 現在の錠状態で作る。ここでは既に存在する分を追従させる）。
+        for button in self.tag_buttons_for_image:
+            button.setEnabled(enabled)
+        # R21-1: GPU トグルは実行中のワーカーの provider を変えないが、設定を
+        # 書き換えるので同じ錠に入れる。
+        if hasattr(self, "use_gpu_check"):
+            self.use_gpu_check.setEnabled(enabled)
         self.undo_button.setEnabled(enabled and self.undo_manager.can_undo())
         self.redo_button.setEnabled(enabled and self.undo_manager.can_redo())
         if enabled:
@@ -1463,6 +1496,13 @@ class MainWindow(QMainWindow):
     def _handle_folder_drop(self, folder_path: str, file_to_select: str | None = None):
         write_debug_log(f"DEBUG: _handle_folder_drop - folder_path: {folder_path}, file_to_select: {file_to_select}")
         """Handles the logic for when a folder is dropped or selected."""
+        # U-1（REQ-2.5）: フォルダ切替は書き込み先を差し替える開始経路なので、処理中は
+        # 受理しない。3 経路（D&D／Browse／パス入力）はここへ集約されているので、
+        # 判定はこの 1 箇所で足りる（保留パスは持たない = 状態の所有者を増やさない）。
+        if self._is_processing():
+            write_debug_log(f"_handle_folder_drop rejected while processing: {folder_path}")
+            self.update_log(self.locale_manager.get_string("MainWindow", "Busy_Processing_Active"), "orange")
+            return
         # フォルダが変わったら「失敗のみ」用のセッション失敗集合は無効。破棄する
         # （前フォルダの失敗パスを別フォルダの実行対象にしないため。todo 5）。
         self._batch_failed_paths = []
@@ -1587,6 +1627,11 @@ class MainWindow(QMainWindow):
     @Slot()
     def _add_single_tag(self):
         """Adds a new tag to the currently selected image's tag file."""
+        # REQ-2.3 / R25-1: 入力欄とボタンは錠で閉じるが、ハンドラ側でも同じ判定で
+        # 止める（片方だけに依存しない）。
+        if self._is_processing():
+            write_debug_log("_add_single_tag ignored while processing")
+            return
         current_item = self.image_list.currentItem()
         if not current_item:
             return
@@ -1638,6 +1683,10 @@ class MainWindow(QMainWindow):
 
     def _delete_image_tag(self, tag_to_delete: str):
         """Deletes a tag from the currently selected image's tag file."""
+        # REQ-2.3 / R19-6: 表示中のタグチップからの削除経路も処理中は通さない。
+        if self._is_processing():
+            write_debug_log(f"_delete_image_tag ignored while processing: {tag_to_delete}")
+            return
         write_debug_log(f"[_delete_image_tag] Attempting to delete tag: {tag_to_delete}")
         current_item = self.image_list.currentItem()
         if not current_item:
@@ -1690,7 +1739,10 @@ class MainWindow(QMainWindow):
         write_debug_log(f"Tag copied to clipboard: {tag_name}")
 
     def add_tag_all(self, prepend: bool):
-        if self._is_bulk_deleting:
+        # REQ-2.3: 一括追加も .txt を書く経路。処理中は開始できない（自前の
+        # _is_bulk_deleting ではなく一本化した判定を見る）。
+        if self._is_processing():
+            write_debug_log("add_tag_all ignored while processing")
             return
         tags_to_add = (self.add_tag_line if prepend else self.add_tag_line_append).text().strip()
         if not tags_to_add:
@@ -1701,7 +1753,8 @@ class MainWindow(QMainWindow):
     
     def delete_tag_all(self, tag_to_delete: str):
         """Starts a bulk process to delete a tag from all .txt files."""
-        if self._is_bulk_deleting:
+        if self._is_processing():
+            write_debug_log("delete_tag_all ignored while processing")
             return
         if QMessageBox.question(self, self.locale_manager.get_string("MainWindow", "Bulk_Delete_Confirmation"), self.locale_manager.get_string("MainWindow", "Confirm_Bulk_Delete_Tag", tag_to_delete=tag_to_delete)) == QMessageBox.StandardButton.Yes:
             self._start_bulk_tag_worker('delete', input_dir=Path(self.settings.paths.input_dir), tag=tag_to_delete)
@@ -1727,6 +1780,10 @@ class MainWindow(QMainWindow):
 
     def _start_tagging_thread(self):
         """Initializes and starts the TaggerThreadWorker."""
+        if self._is_processing():
+            # REQ-2.3: 一括処理中などに開始経路が生きていても、ここで止まる。
+            write_debug_log("_start_tagging_thread ignored while processing")
+            return
         if self._tagger_thread and self._tagger_thread.isRunning():
             self.update_log(self.locale_manager.get_string("MainWindow", "Warning_Tagging_Already_Running"), "orange")
             return
@@ -1846,47 +1903,72 @@ class MainWindow(QMainWindow):
         self._update_undo_redo_buttons()
         write_debug_log(f"batch_completed: {len(actions)} 件のファイル変更を1つのUndoエントリにまとめました")
 
+    def _wait_for_tagger_thread_stop(self, thread: QThread, timeout: float = 5.0) -> bool:
+        """tagging スレッドの停止待ちだけを切り出したもの（REQ-2.6）。
+
+        `processEvents()` を挟む以上、待機中に新しい実行が始まりうる。呼び出し側は
+        待機対象をローカルに固定し、`self._tagger_thread` が差し替わっていないかを
+        戻り値と併せて確認する。素朴な wait(5000) はメインスレッドのイベントループを
+        丸ごと止めてしまい、同じ finished シグナルから2本目に繋がっている thread.quit
+        や、ワーカースレッド側の後始末が必要とするメインスレッドとのやり取りが処理される
+        機会を奪う。ここで小刻みに processEvents() を挟みながら待つことで、その機会を
+        与えつつ、合計の待ち時間の上限（既定 5 秒）は変えない。
+        """
+        deadline = time.monotonic() + timeout
+        while thread.isRunning() and time.monotonic() < deadline:
+            QApplication.processEvents()
+            thread.wait(50)
+        return not thread.isRunning()
+
     def _cleanup_tagger_thread(self):
         """Safely cleans up the existing tagger thread and worker."""
-        if self._tagger_thread:
-            if self._tagger_thread.isRunning():
-                # worker.finished は _on_tagger_finished（これがこの cleanup を呼ぶ）と
-                # thread.quit の両方に connect されており（この順）、この cleanup 自体が
-                # その1本目の帰結として、2本目の thread.quit がまだ処理される前に走る
-                # ことがある——「異常経路だけ」という想定は正確ではなく、正常完了でも
-                # 普通に起こりうる経路。
-                write_debug_log("tagger thread still running during cleanup; waiting")
-                self._tagger_thread.quit()
-                # 素朴な wait(5000) はメインスレッドのイベントループを丸ごと止めてしまい、
-                # 同じ finished シグナルから2本目に繋がっている thread.quit（まだキューに
-                # 残っている可能性がある）や、ワーカースレッド側の後始末が必要とする
-                # メインスレッドとのやり取りが処理される機会を奪う。ここで小刻みに
-                # processEvents() を挟みながら待つことで、その機会を与えつつ、合計の
-                # 待ち時間の上限（5秒）は変えない。
-                deadline = time.monotonic() + 5.0
-                while self._tagger_thread.isRunning() and time.monotonic() < deadline:
-                    QApplication.processEvents()
-                    self._tagger_thread.wait(50)
-                if self._tagger_thread.isRunning():
-                    write_debug_log("tagger thread did not finish within cleanup timeout; "
-                                     "detaching without terminate()")
-                    self.update_log(self.locale_manager.get_string(
-                        "MainWindow", "Thread_Shutdown_Slow"), "orange")
-                    # QThread.terminate()（Windows では TerminateThread 相当）は危険:
-                    # HTTPS ソケット処理などネイティブコードの最中に強制終了すると、
-                    # ヒープ/ローダーロックを保持したまま死に、以後プロセス全体が
-                    # ハングしうることを実機（オフスクリーン一括テスト）で確認した
-                    # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
-                    # スレッド自身は自分のイベントループが処理される限り、いずれ
-                    # 自然に終了する。
-                    self._detach_running_thread(self._tagger_thread, self._tagger_worker)
-                    self._tagger_thread = None
-                    self._tagger_worker = None
-                    return
-            self._tagger_thread.deleteLater()
+        # 待機中に self._tagger_thread が差し替わりうるので、対象はローカルに固定する
+        # （REQ-2.6 / R35-1）。
+        thread = self._tagger_thread
+        worker = self._tagger_worker
+        if thread is None:
+            if worker is not None:
+                worker.deleteLater()
+                self._tagger_worker = None
+            return
+
+        if thread.isRunning():
+            # worker.finished は _on_tagger_finished（これがこの cleanup を呼ぶ）と
+            # thread.quit の両方に connect されており（この順）、この cleanup 自体が
+            # その1本目の帰結として、2本目の thread.quit がまだ処理される前に走る
+            # ことがある——「異常経路だけ」という想定は正確ではなく、正常完了でも
+            # 普通に起こりうる経路。
+            write_debug_log("tagger thread still running during cleanup; waiting")
+            thread.quit()
+            stopped = self._wait_for_tagger_thread_stop(thread)
+            if self._tagger_thread is not thread:
+                # 待機中に新しい処理が始まり、窓口が新しいスレッドへ差し替わった。
+                # 外側の後始末が新しいスレッド・状態に触れてはいけない（R35-1）。
+                write_debug_log("cleanup: a new run started during the wait; "
+                                "leaving the new thread and worker attached")
+                return
+            if not stopped:
+                write_debug_log("tagger thread did not finish within cleanup timeout; "
+                                 "detaching without terminate()")
+                self.update_log(self.locale_manager.get_string(
+                    "MainWindow", "Thread_Shutdown_Slow"), "orange")
+                # QThread.terminate()（Windows では TerminateThread 相当）は危険:
+                # HTTPS ソケット処理などネイティブコードの最中に強制終了すると、
+                # ヒープ/ローダーロックを保持したまま死に、以後プロセス全体が
+                # ハングしうることを実機（オフスクリーン一括テスト）で確認した
+                # （2026-09 VLM デバッグ）。無理に殺さず、この参照だけを手放す。
+                # スレッド自身は自分のイベントループが処理される限り、いずれ
+                # 自然に終了する。
+                self._detach_running_thread(thread, worker)
+                self._tagger_thread = None
+                self._tagger_worker = None
+                return
+        thread.deleteLater()
+        if self._tagger_thread is thread:
             self._tagger_thread = None
-        if self._tagger_worker:
-            self._tagger_worker.deleteLater()
+        if worker is not None:
+            worker.deleteLater()
+        if self._tagger_worker is worker:
             self._tagger_worker = None
 
     def _detach_running_thread(self, thread: QThread, worker) -> None:
@@ -1960,8 +2042,15 @@ class MainWindow(QMainWindow):
     
     def _start_bulk_tag_worker(self, mode: str, **kwargs: Any):
         """Initializes and starts the BulkTagWorker for add/delete operations."""
+        # 錠を先にかける（_set_main_controls_enabled が未保存のキャプションを flush する
+        # ので、_is_bulk_deleting を立てるのはその後）。
+        # REQ-2.3 / R2-7: 一括処理中も本体の錠をかける。以前は一括用コントロールだけを
+        # 無効化していたため、実行ボタン・単体タグ編集・グリッド切替・Undo が生きていた。
+        self._set_main_controls_enabled(False)
+        # 実行ボタンはタグ付け/DL 中は「停止」として生きているが、一括処理に停止手段は
+        # 無い。ここだけは明示的に閉じる（処理中にタグ付けを開始できないようにする）。
+        self.run_button.setEnabled(False)
         self._is_bulk_deleting = True
-        self._set_bulk_controls_enabled(False)
         self.update_log(self.locale_manager.get_string("MainWindow", "Starting_Bulk_Tag_Operation", mode=mode), "blue")
 
         self._bulk_tag_thread = QThread()
@@ -2070,7 +2159,9 @@ class MainWindow(QMainWindow):
         if self._is_shutting_down:
             return
 
-        self.reload_tags_only(preserve_page=True) # This will re-enable controls on finish
+        # REQ-2.4: 解除は処理の終了経路だけが行う。先にスレッドを畳んで一括フラグを
+        # 落とし、その上で錠を開ける（逆順にすると isRunning() が真のまま再描画が走り、
+        # 錠が戻らない）。
         if self._bulk_tag_thread:
             self._bulk_tag_thread.quit()
             self._bulk_tag_thread.wait()
@@ -2078,6 +2169,12 @@ class MainWindow(QMainWindow):
                 self._bulk_tag_worker.deleteLater()
             self._bulk_tag_thread.deleteLater()
             self._bulk_tag_thread = self._bulk_tag_worker = None
+        self._is_bulk_deleting = False
+        self._set_main_controls_enabled(True)
+        # 実行ボタンは錠の対象外（タグ付け/DL 中は「停止」として使う）なので、
+        # 一括終了時にモデル状態から戻す。
+        self._check_model_status_and_update_ui()
+        self.reload_tags_only(preserve_page=True)
     
     @Slot(list, list, str)
     def _on_bulk_add_completed(self, file_paths: list[Path], added_tags: list[str], position: str):
@@ -2434,6 +2531,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def _perform_undo(self):
         """Performs an undo operation."""
+        if self._is_processing():
+            write_debug_log("_perform_undo ignored while processing")
+            return
         if self.undo_manager.undo():
             self.update_log(self.locale_manager.get_string("MainWindow", "Undo_Success"), "green")
             self._refresh_ui_after_undo_redo()
@@ -2444,6 +2544,9 @@ class MainWindow(QMainWindow):
     @Slot()
     def _perform_redo(self):
         """Performs a redo operation."""
+        if self._is_processing():
+            write_debug_log("_perform_redo ignored while processing")
+            return
         if self.undo_manager.redo():
             self.update_log(self.locale_manager.get_string("MainWindow", "Redo_Success"), "green")
             self._refresh_ui_after_undo_redo()

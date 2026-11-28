@@ -126,6 +126,8 @@ def _fake_main_window(folder: Path, relative_name: str, text: str):
         add_single_tag_line=_FakeLineEdit(text),
         settings=SimpleNamespace(paths=SimpleNamespace(input_dir=str(folder))),
         undo_manager=SimpleNamespace(push=lambda action: None),
+        # Phase 2 の一本化した判定（処理中は書き込み経路を開始しない）。
+        _is_processing=lambda: False,
         update_log=lambda message, color: logs.append(message),
         _update_undo_redo_buttons=lambda: None,
         _load_image_tags=lambda image_path, preserve_page=True: None,
@@ -161,6 +163,7 @@ def test_grid_add_rejects_case_variant_and_normalizes_whitespace(tmp_path: Path,
     ns = SimpleNamespace(
         add_tag_line=_FakeLineEdit("Solo"),
         _image_path=image,
+        _editing_enabled=True,  # Phase 2: 錠中はハンドラ側でも書かない
         locale_manager=SimpleNamespace(get_string=lambda section, key, **kw: key),
         _update_tag_display=lambda: None,
         tags_added=SimpleNamespace(emit=lambda path, tags: added.append((path, tags))),
@@ -309,6 +312,7 @@ def test_main_window_image_view_uses_normalized_translation_key():
     ns.image_tag_prev_page_btn = button
     ns.image_tag_next_page_btn = button
     ns.update_all_button_alignments = lambda: None
+    ns._controls_enabled = True  # Phase 2: チップは錠状態を引き継いで生成される
 
     main_window.MainWindow._display_image_tag_page(ns)
     assert [b.text() for b in ns.tag_buttons_for_image] == ["長い髪"]
