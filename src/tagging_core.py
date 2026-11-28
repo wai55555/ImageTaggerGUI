@@ -1458,7 +1458,9 @@ def main(decision_resolver: Callable[[Path], OverwriteDecision] | None = None, l
 
     try:
         assert CONFIG_PATH.is_file(), _get_string_internal("TaggerCore", "Config_File_NotFound", CONFIG_PATH=str(CONFIG_PATH))
-        config = configparser.ConfigParser()
+        # REQ-D1(b): `load_settings` へ渡すパーサは補間なしに揃える（`%` を含む
+        # パスが InterpolationSyntaxError にならないように）。
+        config = configparser.ConfigParser(interpolation=None)
         config.read(CONFIG_PATH, encoding='utf-8')
     except Exception as e:
         log_dbg(_get_string_internal("TaggerCore", "Fatal_Error_Config_Load_Failed", type_e_name=type(e).__name__, e=str(e)))

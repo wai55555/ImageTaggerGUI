@@ -53,7 +53,11 @@ class ModelModeController:
         mw.grid_view_widget.set_tag_display_language(mw._tag_display_language, mw.tag_translation_map)
 
     # Fallback per-category defaults when a model_config.json doesn't spell them out.
-    _FALLBACK_THRESHOLDS = {"general": 0.40, "character": 0.65, "rating": 0.50,
+    # character の既定は app_settings.DEFAULT_CHARACTER_THRESHOLD が単一の正本
+    # （REQ-D4 / R18-4）。
+    _FALLBACK_THRESHOLDS = {"general": 0.40,
+                            "character": app_settings.DEFAULT_CHARACTER_THRESHOLD,
+                            "rating": 0.50,
                             "copyright": 0.50, "style": 0.50, "artist": 0.50, "meta": 0.50,
                             "model": 0.50, "quality": 0.50, "year": 0.50}
     _FALLBACK_LIMITS = {"general": 55, "character": 1, "rating": 0, "copyright": 0, "style": 0,

@@ -345,11 +345,16 @@ class CustomConnectionDialog(QDialog):
         if atype != "none":
             key = self.api_key_edit.text().strip()
             if key:
-                persist_key = self.persist_key_check.isChecked()
+                # REQ-D8(b): 無効化されたチェックボックスの False は利用者の切替ではない。
+                # プローブ由来で無効化されているときに delete_secret を呼ぶと、後で
+                # keyring が回復した環境で既存の永続キーが実際に削除される。
+                persist_key, drop_persisted = vlm_secrets.persist_choice_from_checkbox(
+                    self.persist_key_check.isChecked(),
+                    self.persist_key_check.isEnabled())
                 # セッション限定に切り替えるときは、以前 keyring へ保存した値を先に
                 # 消す。残すと set_secret(persist=False) はセッション上書きを足すだけで、
                 # 再起動後に get_secret が古い keyring 値を返してしまう。
-                if not persist_key and not vlm_secrets.delete_secret(secret_ref):
+                if drop_persisted and not vlm_secrets.delete_secret(secret_ref):
                     # keyring から消せなかった。セッション上書きは効くが、再起動後は
                     # 古い keyring 値が復活しうる旨を明示する（保存自体は続行）。
                     QMessageBox.warning(

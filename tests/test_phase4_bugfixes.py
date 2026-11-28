@@ -255,27 +255,31 @@ def test_unquote_dotenv_value(secrets_mod, raw, expected):
 
 
 def test_dotenv_loading_keeps_unintentional_quotes(secrets_mod, monkeypatch, tmp_path):
-    """クォートしていない値の末尾の `"` を壊さない（旧実装は剥がしていた）。"""
+    """クォートしていない値の末尾の `"` を壊さない（旧実装は剥がしていた）。
+
+    REQ-D6 で `.env` の取り込みは許可リスト制になったため、キー名は許可される
+    慣習形（`PIXAI_*`）を使う。クォート処理自体は REQ-D6 の前後で不変。
+    """
     import os
 
     (tmp_path / ".env").write_text(
-        "PHASE4_BUG3_PLAIN=abc\"\n"
-        "PHASE4_BUG3_QUOTED=\"def\"\n"
-        "PHASE4_BUG3_MISMATCH=\"ghi'\n"
-        "export PHASE4_BUG3_EXPORT='jkl'\n",
+        "PIXAI_VLM_PHASE4_BUG3_PLAIN=abc\"\n"
+        "PIXAI_VLM_PHASE4_BUG3_QUOTED=\"def\"\n"
+        "PIXAI_VLM_PHASE4_BUG3_MISMATCH=\"ghi'\n"
+        "export PIXAI_VLM_PHASE4_BUG3_EXPORT='jkl'\n",
         encoding="utf-8",
     )
-    for name in ("PHASE4_BUG3_PLAIN", "PHASE4_BUG3_QUOTED", "PHASE4_BUG3_MISMATCH",
-                 "PHASE4_BUG3_EXPORT"):
+    for name in ("PIXAI_VLM_PHASE4_BUG3_PLAIN", "PIXAI_VLM_PHASE4_BUG3_QUOTED",
+                 "PIXAI_VLM_PHASE4_BUG3_MISMATCH", "PIXAI_VLM_PHASE4_BUG3_EXPORT"):
         monkeypatch.delenv(name, raising=False)
     cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
         secrets_mod._load_dotenv()
-        assert os.environ["PHASE4_BUG3_PLAIN"] == 'abc"'
-        assert os.environ["PHASE4_BUG3_QUOTED"] == "def"
-        assert os.environ["PHASE4_BUG3_MISMATCH"] == "\"ghi'"
-        assert os.environ["PHASE4_BUG3_EXPORT"] == "jkl"
+        assert os.environ["PIXAI_VLM_PHASE4_BUG3_PLAIN"] == 'abc"'
+        assert os.environ["PIXAI_VLM_PHASE4_BUG3_QUOTED"] == "def"
+        assert os.environ["PIXAI_VLM_PHASE4_BUG3_MISMATCH"] == "\"ghi'"
+        assert os.environ["PIXAI_VLM_PHASE4_BUG3_EXPORT"] == "jkl"
     finally:
         os.chdir(cwd)
 
