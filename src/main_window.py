@@ -343,6 +343,10 @@ class MainWindow(QMainWindow):
         self._last_navigation_event_time: datetime | None = None # 追加
         
         self.tag_translation_map: dict[str, list[str]] = {}
+        # REQ-4.7 / R31-1: 翻訳 CSV の「正本」が現れたかを判定するためのスタンプ。
+        self._tag_map_stamp: tuple[bool, float] | None = None
+        # キャプション編集欄が最後にロード／保存した内容（REQ-4.3 の dirty 判定）。
+        self._caption_loaded_text: str = ""
         self._tag_display_language: str = "English"
         self._current_caption_image_path: Path | None = None
 
@@ -353,8 +357,19 @@ class MainWindow(QMainWindow):
         self._tag_button_min_width = 100
         self._tag_button_min_height = 25
 
+    def _report_vlm_config_problems(self) -> None:
+        """REQ-4.2: 壊れた VLM JSON を「黙って空」にしない（起動時の GUI ログ）。"""
+        problems = vlm_config.load_problems()
+        if not problems:
+            return
+        names = ", ".join(sorted(problems))
+        write_debug_log(f"vlm config problems: {problems}")
+        self.update_log(self.locale_manager.get_string(
+            "Vlm", "Config_Broken_Log", names=names), "red")
+
     def initial_load(self):
         """Performs the initial loading of images and tags after the main window is shown."""
+        self._report_vlm_config_problems()
         self.tag_translation_map = self._load_shared_tag_translation_map()
         self.reload_image_list()
         self.reload_tags_only()
@@ -379,6 +394,36 @@ class MainWindow(QMainWindow):
         return load_tag_translation_map(constants.MODEL_PATH.parent,
                                         constants.MODELS_DIR / constants.MODEL_DIR_NAME,
                                         constants.MODELS_RESOURCE_DIR / constants.MODEL_DIR_NAME)
+
+    def _shared_tag_csv_stamp(self) -> tuple[bool, float]:
+        """正本（最優先ディレクトリ）の selected_tags.csv の有無と mtime。"""
+        path = constants.MODEL_PATH.parent / "selected_tags.csv"
+        try:
+            return (True, path.stat().st_mtime) if path.is_file() else (False, 0.0)
+        except OSError:
+            return (False, 0.0)
+
+    def _refresh_shared_tag_translation_map(self, *, force: bool = False) -> bool:
+        """REQ-4.7 / R31-1: 翻訳の正本が現れた／更新されたときだけ読み直す。
+
+        以前は「マップが空のときだけ」再読込していたため、フォールバック先の
+        非空マップが入っていると、ワーカーが最優先ディレクトリへ取得した
+        selected_tags.csv がそのセッション中ずっと反映されなかった。
+        読み直しの判断は正本ファイルのスタンプ（有無＋mtime）で行う（NFR-4）。
+        """
+        stamp = self._shared_tag_csv_stamp()
+        if not force and self._tag_map_stamp == stamp:
+            return False
+        self._tag_map_stamp = stamp
+        new_map = self._load_shared_tag_translation_map()
+        if not new_map:
+            return False
+        self.tag_translation_map = new_map
+        self.display_current_tag_page()
+        self._display_image_tag_page()
+        self.grid_view_widget.set_tag_display_language(
+            self._tag_display_language, self.tag_translation_map)
+        return True
 
     def _maybe_prompt_gpu_setup(self):
         """NVIDIA GPU が使えるビルドで GPU コンポーネント未整備なら、ダウンロードを尋ねる。
@@ -685,6 +730,28 @@ class MainWindow(QMainWindow):
         self.caption_text_edit.installEventFilter(self)
         self.caption_text_edit.textChanged.connect(self._caption_save_timer.start)
 
+    def _reset_folder_state(self) -> None:
+        """前フォルダの編集状態・対象・キャッシュを破棄する（REQ-4.5 / R7-8）。
+
+        早期 return の経路（フォルダ作成失敗・画像 0 件）でも呼ぶ。先に未保存の
+        キャプションを確定してから捨てる（REQ-4.3。書く先は「前の」画像なので、
+        切替後の対象には影響しない）。
+        """
+        self._save_current_caption()
+        self._caption_save_timer.stop()
+        self._current_caption_image_path = None
+        self._caption_loaded_text = ""
+        self.caption_text_edit.blockSignals(True)
+        self.caption_text_edit.clear()
+        self.caption_text_edit.blockSignals(False)
+        self._all_tags = []
+        self._current_image_tags = []
+        self._current_image_tag_page = 0
+        self._tag_cache = {}
+        self.grid_view_widget.update_tag_cache(self._tag_cache)
+        self._display_image_tag_page()
+        self.display_current_tag_page()
+
     def reload_image_list(self, auto_select_path: str | None = None):
         """Reloads the list of images from the input directory."""
         self.image_label.setPixmap(QPixmap()) # Explicitly clear pixmap
@@ -693,6 +760,8 @@ class MainWindow(QMainWindow):
         self.image_label.setText(self.locale_manager.get_string("MainWindow", "Loading_Image_List"))
 
         if not self._ensure_input_dir_exists(input_dir_path):
+            # REQ-4.5 / R7-8: 切替に失敗しても前フォルダの状態を残さない。
+            self._reset_folder_state()
             return
 
         write_debug_log(self.locale_manager.get_string("MainWindow", "Reloading_Image_List", input_dir_path=input_dir_path))
@@ -701,6 +770,8 @@ class MainWindow(QMainWindow):
         if not image_paths:
             self.image_label.setText(self.locale_manager.get_string("MainWindow", "Image_Files_Not_Found"))
             self.update_log(self.locale_manager.get_string("MainWindow", "Warning_No_Image_Files_Found", input_dir_path_name=input_dir_path.name), "orange")
+            # REQ-4.5 / R7-8:「画像なし」と編集可能状態を共存させない。
+            self._reset_folder_state()
             return
             
         selected_item = self._populate_image_list(image_paths, auto_select_path)
@@ -880,11 +951,11 @@ class MainWindow(QMainWindow):
 
     def _load_caption_for_image(self, image_path: Path) -> None:
         """Captioner mode: load the .txt file as free text, no comma-splitting (design.md 8.5節)."""
+        same_path = self._current_caption_image_path == image_path
         # Commit any edit still pending in the debounce window for the PREVIOUS image
         # before its path/content is replaced, otherwise the edit is silently lost.
-        if self._current_caption_image_path is not None and self._current_caption_image_path != image_path:
+        if self._current_caption_image_path is not None and not same_path:
             self._save_current_caption()
-        self._current_caption_image_path = image_path
         txt_path = image_path.with_suffix('.txt')
         content = ""
         if txt_path.is_file():
@@ -892,10 +963,16 @@ class MainWindow(QMainWindow):
                 content = txt_path.read_text(encoding='utf-8')
             except Exception as e:
                 self.update_log(self.locale_manager.get_string("MainWindow", "Error_Tag_File_Load_Failed", e=e, txt_path_name=txt_path.name), "red")
+        # REQ-4.3 / R12-5: 同じパスの再ロード（リサイズ等）で未保存の編集を
+        # ファイル内容で上書きしない。dirty でなければ外部変更を拾う。
+        if same_path and self.caption_text_edit.toPlainText() != self._caption_loaded_text:
+            return
+        self._current_caption_image_path = image_path
         self._caption_save_timer.stop()
         self.caption_text_edit.blockSignals(True)
         self.caption_text_edit.setPlainText(content)
         self.caption_text_edit.blockSignals(False)
+        self._caption_loaded_text = content
 
     def _save_current_caption(self) -> None:
         """Saves caption_text_edit's content back to the currently loaded image's .txt file.
@@ -914,9 +991,18 @@ class MainWindow(QMainWindow):
         if existed_before:
             try:
                 old_text = txt_path.read_text(encoding='utf-8')
-            except Exception:
-                old_text = ""
+            except Exception as e:
+                # REQ-4.1 / NFR-11: 読めない既存内容を「空だった」として上書きしない。
+                # Undo 記録も作らない（old_text="" で積むと Undo が元を破壊する）。
+                write_debug_log(
+                    f"caption save skipped: existing .txt is unreadable "
+                    f"({txt_path.name}: {type(e).__name__}: {e})")
+                self.update_log(self.locale_manager.get_string(
+                    "MainWindow", "Error_Tag_File_Load_Failed", e=e,
+                    txt_path_name=txt_path.name), "red")
+                return
         if new_text == old_text:
+            self._caption_loaded_text = new_text
             return
         try:
             # REQ-2.3: 一時ファイル + os.replace で原子的に（REQ-2.7 の (iii) 段）。
@@ -925,6 +1011,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.update_log(self.locale_manager.get_string("MainWindow", "Error_Caption_Save_Failed", txt_path_name=txt_path.name, e=e), "red")
             return
+        self._caption_loaded_text = new_text
         self.undo_manager.push(EditCaptionAction(
             file_path=txt_path, old_text=old_text, new_text=new_text, file_existed_before=existed_before))
         self._update_undo_redo_buttons()
@@ -1069,7 +1156,12 @@ class MainWindow(QMainWindow):
         self.update_log(self.locale_manager.get_string(
             "Vlm", "Test_Result_Header", conn=connection_display, model=model_id), "green")
         if hasattr(self, "caption_text_edit"):
+            # REQ-4.4 / R7-9: プログラム的な表示で自動保存タイマーを武装させない。
+            # 保存はワーカーが同じ内容で既に行っている。
+            self.caption_text_edit.blockSignals(True)
             self.caption_text_edit.setPlainText(caption)
+            self.caption_text_edit.blockSignals(False)
+            self._caption_loaded_text = caption
 
     @Slot(str, str)
     def _on_vlm_binding_verified(self, provider_id: str, profile_id: str):
@@ -1102,6 +1194,7 @@ class MainWindow(QMainWindow):
         self._save_current_caption()
         self._caption_save_timer.stop()
         self._current_caption_image_path = None
+        self._caption_loaded_text = ""
         self.caption_text_edit.blockSignals(True)
         self.caption_text_edit.clear()
         self.caption_text_edit.blockSignals(False)
@@ -1374,6 +1467,9 @@ class MainWindow(QMainWindow):
         """Handles the window closing event to save settings and stop threads gracefully."""
         self._is_shutting_down = True
         write_debug_log("DEBUG: closeEvent triggered. _is_shutting_down = True")
+        # REQ-4.3 / R4-4: 終了時も自動保存のデバウンス中身を取りこぼさない。
+        self._save_current_caption()
+        self.grid_view_widget.flush_pending_edits()
         self.save_current_config()
 
         threads_to_stop: list[tuple[QThread | None, StoppableWorker | None]] = [ # type: ignore
@@ -1844,7 +1940,7 @@ class MainWindow(QMainWindow):
         self._tagger_worker.batch_completed.connect(self._on_batch_completed)
         self._tagger_worker.batch_failed.connect(self._on_batch_failed)
         self._tagger_worker.progress_update.connect(self._on_tagging_progress)
-        self._tagger_worker.model_status_changed.connect(self._check_model_status_and_update_ui)
+        self._tagger_worker.model_status_changed.connect(self._on_model_status_changed)
         self._tagger_worker.finished.connect(self._on_tagger_finished)
         # 正常終了時は worker の finished シグナルから QThread も終了させる。
         self._tagger_worker.finished.connect(self._tagger_thread.quit)
@@ -2089,10 +2185,9 @@ class MainWindow(QMainWindow):
             # Store the relative path of the current file to re-select it later
             path_to_reselect = current_item.data(Qt.ItemDataRole.UserRole + 1)
 
-        if not self.tag_translation_map:
-            # The worker may have just fetched PixAI's selected_tags.csv on our behalf.
-            self.tag_translation_map = self._load_shared_tag_translation_map()
-            self.grid_view_widget.set_tag_display_language(self._tag_display_language, self.tag_translation_map)
+        # The worker may have just fetched PixAI's selected_tags.csv on our behalf.
+        # REQ-4.7: 既に非空でも、正本が現れた／更新されたなら読み直す。
+        self._refresh_shared_tag_translation_map()
 
         self.reload_image_list(auto_select_path=path_to_reselect)
         self.reload_tags_only()
@@ -2611,6 +2706,22 @@ class MainWindow(QMainWindow):
         # Refresh grid view
         self.grid_view_widget.refresh_current_page()
 
+    @Slot()
+    def _on_model_status_changed(self):
+        """REQ-4.6（U-3）: ワーカーがディスク側で変えた verified をメモリへ反映する。
+
+        再読込はこのシグナル経由に限定する（通常の UI 更新では disk を読まない。
+        NFR-4）。読み直さないと、次の無関係な設定保存が古いメモリ値でディスクを
+        巻き戻す（R30-3）。
+        """
+        if self._is_shutting_down:
+            return
+        try:
+            self.settings.model.verified_models = load_settings(load_config()).model.verified_models
+        except Exception as e:  # noqa: BLE001 - 状態更新の失敗で UI を止めない
+            write_debug_log(f"model_status_changed: could not reload verified_models: {e}")
+        self._check_model_status_and_update_ui()
+
     def _check_model_status_and_update_ui(self, auto_start_download: bool = False, force_download: bool = False):
         """Checks for model files and updates the run button's state and appearance."""
         if not force_download and (self.settings.vlm.enabled or self._is_model_available()):
@@ -2710,6 +2821,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, self.locale_manager.get_string("MainWindow", "No_Images_Found_Title"), self.locale_manager.get_string("MainWindow", "No_Images_Found_Message"))
             return
 
+        # REQ-4.3 / R18-2: グリッドへ切り替える前に未保存のキャプションを確定する。
+        self._save_current_caption()
         self.central_widget.setCurrentWidget(self.grid_view_widget)
         self.setWindowTitle(f"{constants.MSG_WINDOW_TITLE} - "
                             + self.locale_manager.get_string("GridView", "Window_Title"))
@@ -2721,6 +2834,8 @@ class MainWindow(QMainWindow):
     @Slot()
     def _show_main_view(self):
         """Switches the central widget back to the main view."""
+        # REQ-4.3: グリッド側の未保存編集も確定してから戻る。
+        self.grid_view_widget.flush_pending_edits()
         self.central_widget.setCurrentWidget(self.main_view_widget)
         self.setWindowTitle(constants.MSG_WINDOW_TITLE)
         self.showNormal() # Or restore previous geometry

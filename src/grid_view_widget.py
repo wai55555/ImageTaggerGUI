@@ -220,6 +220,10 @@ class ImageEditCellWidget(QWidget):
                 self.image_label.setPixmap(scaled_pixmap)
 
     def _load_caption_text(self):
+        # REQ-4.3: 未保存の編集がある間は、ファイル内容で編集中のテキストを
+        # 上書きしない（リサイズ・言語切替・モード再入・セル再利用の共通入口）。
+        if self.caption_edit.toPlainText() != self._caption_loaded_text:
+            return
         """Captioner mode: load the image's .txt as free text into caption_edit."""
         self._caption_save_timer.stop()
         if not self._image_path:
@@ -253,11 +257,18 @@ class ImageEditCellWidget(QWidget):
         new_text = self.caption_edit.toPlainText()
         existed_before = txt_path.is_file()
         old_text = ""
-        try:
-            if existed_before:
+        if existed_before:
+            try:
                 old_text = txt_path.read_text(encoding="utf-8")
-        except Exception:
-            old_text = ""
+            except Exception as e:
+                # REQ-4.1 / NFR-11: 読めない既存内容を「空だった」として上書きしない。
+                # Undo（caption_edited）も出さない。
+                write_debug_log(
+                    f"grid caption save skipped: existing .txt is unreadable "
+                    f"({txt_path.name}: {type(e).__name__}: {e})")
+                self.caption_save_failed.emit(
+                    f"{txt_path.name}: {type(e).__name__}: {e}")
+                return
         if new_text == old_text:
             return
         try:
@@ -351,7 +362,15 @@ class ImageEditCellWidget(QWidget):
         tags_to_add = tag_utils.parse_tag_input(tags_to_add_str)
         if not tags_to_add: return
         txt_path = tag_utils.get_txt_path(self._image_path)
-        existing_tags = tag_utils.read_tags(txt_path)
+        ok, existing_tags = tag_utils.read_tags_strict(txt_path)
+        if not ok:
+            # REQ-4.1 / R4-5: 読めない既存タグを「無かった」として上書きしない。
+            write_debug_log(f"grid add aborted: existing .txt is unreadable ({txt_path})")
+            QToolTip.showText(
+                self.add_tag_line.mapToGlobal(self.add_tag_line.rect().bottomLeft()),
+                self.locale_manager.get_string("GridView", "Error_Unreadable_Txt"),
+                self.add_tag_line)
+            return
         # REQ-H1: compare case-insensitively, matching tagging_core.merge_tags.
         actually_new_tags = tag_utils.filter_new_tags(existing_tags, tags_to_add)
         any_duplicates = len(actually_new_tags) < len(tags_to_add)
@@ -372,9 +391,12 @@ class ImageEditCellWidget(QWidget):
             return
         if not self._image_path: return
         txt_path = tag_utils.get_txt_path(self._image_path)
-        
-        # Get original index before removal
-        existing_tags = tag_utils.read_tags(txt_path)
+
+        # Get original index before removal（REQ-4.1: 読めないなら書かない）
+        ok, existing_tags = tag_utils.read_tags_strict(txt_path)
+        if not ok:
+            write_debug_log(f"grid remove aborted: existing .txt is unreadable ({txt_path})")
+            return
         original_index = existing_tags.index(tag_to_remove) if tag_to_remove in existing_tags else -1
         
         if tag_utils.remove_tag_from_file(txt_path, tag_to_remove):
@@ -441,6 +463,9 @@ class ImageEditCellWidget(QWidget):
         QTimer.singleShot(2000, QToolTip.hideText)
     
     def clear_data(self):
+        # REQ-4.3 / R2-8: セル再利用の前に自動保存のデバウンス中身を確定する。
+        if self._caption_mode and self._image_path is not None:
+            self._save_caption()
         self._image_path = None
         self._global_index = -1
         self._current_tag_page = 0
@@ -753,6 +778,12 @@ class GridViewWidget(QWidget):
         for cell in self.cells:
             cell.set_tag_display_language(language, translation_map)
     
+    def flush_pending_edits(self) -> None:
+        """未保存のセル編集を確定する（ビュー切替・終了時の共通入口。REQ-4.3）。"""
+        for cell in self.cells:
+            if cell._caption_mode and cell._image_path is not None:
+                cell._save_caption()
+
     def set_editing_enabled(self, enabled: bool):
         """Called while a tagging/captioning run is active. Deliberately leaves the
         "back to main view" button and the page navigation alive so the user is not

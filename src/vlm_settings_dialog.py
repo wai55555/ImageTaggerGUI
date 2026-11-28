@@ -193,6 +193,7 @@ class VlmSettingsDialog(QDialog):
         self.setMinimumWidth(_DIALOG_MIN_WIDTH)
         self._build()
         self._load()
+        self._warn_about_broken_config_files()
         # スクロール領域は使わない(過去に導入したが、ウィンドウの手動拡縮に内容が
         # 追従しない・幅も高さも self.sizeHint() が中身の自然なサイズを反映しなく
         # なる等の表示バグの元だった)。自然なサイズのまま開き、画面より大きい
@@ -212,6 +213,19 @@ class VlmSettingsDialog(QDialog):
     def _opts(self, prefix: str, keys: list[str]) -> list[tuple[str, str]]:
         """保存値 key と locale から引いた表示ラベルの組にする（[Vlm] <prefix>_<key>）。"""
         return [(k, self._t("Vlm", f"{prefix}_{k}")) for k in keys]
+
+    def _warn_about_broken_config_files(self) -> None:
+        """REQ-4.2: 壊れた VLM JSON を「空として開いた」ように見せない。
+
+        読み込めなかったファイル名を明示し、保存時にはバックアップすることを伝える。
+        """
+        problems = vlm_config.load_problems()
+        if not problems:
+            return
+        names = ", ".join(sorted(problems))
+        QMessageBox.warning(
+            self, self._t("Vlm", "Settings_Title"),
+            self._t("Vlm", "Config_Broken_Message", names=names))
 
     def _build(self) -> None:
         root = QVBoxLayout(self)

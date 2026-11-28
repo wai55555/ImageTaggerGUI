@@ -101,6 +101,27 @@ def read_tags(txt_path: Path) -> list[str]:
         write_debug_log(f"tag_utils.read_tags failed for {txt_path}: {type(e).__name__}: {e}")
         return []
 
+def read_tags_strict(txt_path: Path) -> tuple[bool, list[str]]:
+    """タグを読む。**読めなかった場合と「空」を区別する**（NFR-11 / REQ-4.1）。
+
+    戻り値は `(ok, tags)`。ファイルが無い場合は `(True, [])`（空と同義）。
+    存在するのに読めない（権限・ロック・復号失敗）場合は `(False, [])` を返し、
+    呼び出し側は書き込まずに中止する。読めない既存タグを「空だった」として
+    上書きしないための入口。
+    """
+    if not txt_path.is_file():
+        return True, []
+    try:
+        content = read_text(txt_path, encoding='utf-8-sig').strip()
+    except (OSError, UnicodeError, ValueError) as e:
+        write_debug_log(
+            f"tag_utils.read_tags_strict failed for {txt_path}: {type(e).__name__}: {e}")
+        return False, []
+    if not content:
+        return True, []
+    return True, [tag.strip() for tag in content.split(',') if tag.strip()]
+
+
 def write_tags(txt_path: Path, tags: list[str]) -> bool:
     """Write a list of tags to a txt file (overwriting existing content).
 

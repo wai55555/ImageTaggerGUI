@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -29,6 +30,52 @@ VLM_PROFILES_VERSION = 1
 
 
 # --- vlm_connections.json（カスタム接続定義） ---------------------------------------
+
+# REQ-4.2 / NFR-11: 壊れた設定 JSON を「空だった」として開かないための記録。
+# ファイル名 → 理由。読み込みが成功したら消える。
+_LOAD_PROBLEMS: dict[str, str] = {}
+
+
+def load_problems() -> dict[str, str]:
+    """直近の読み込みで壊れていた設定 JSON（ファイル名 → 理由）。"""
+    return dict(_LOAD_PROBLEMS)
+
+
+def _set_problem(name: str, reason: str) -> None:
+    _LOAD_PROBLEMS[name] = reason
+    write_debug_log(f"vlm_config: {name} is unreadable ({reason}); the file is left untouched")
+
+
+def _clear_problem(name: str) -> None:
+    _LOAD_PROBLEMS.pop(name, None)
+
+
+def _backup_unreadable(path: Path) -> Path | None:
+    """壊れた既存ファイルを、上書きする前に退避する（REQ-4.2 / NFR-11）。
+
+    パースできないファイルだけを対象にする（正常なファイルはコピーしない）。
+    退避先は同じディレクトリの ``<name>.broken-YYYYmmdd-HHMMSS.bak``。
+    """
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        json.loads(raw.decode("utf-8-sig"))
+        return None
+    except (ValueError, UnicodeDecodeError):
+        pass
+    dest = path.with_name(f"{path.name}.broken-{time.strftime('%Y%m%d-%H%M%S')}.bak")
+    try:
+        dest.write_bytes(raw)
+        write_debug_log(f"vlm_config: backed up unreadable {path.name} to {dest.name}")
+        return dest
+    except OSError as e:
+        write_debug_log(f"vlm_config: could not back up {path.name}: {e}")
+        return None
+
 
 def _json_version_ok(data: dict, expected: int, *, name: str) -> bool:
     """設定 JSON の `version` を検証する（REQ-D9）。
@@ -60,27 +107,35 @@ def _json_version_ok(data: dict, expected: int, *, name: str) -> bool:
 
 def load_custom_connections() -> list[dict]:
     """vlm_connections.json のカスタム接続定義（生 dict）を返す。壊れていれば []。"""
+    name = VLM_CONNECTIONS_PATH.name
     if not VLM_CONNECTIONS_PATH.is_file():
+        _clear_problem(name)
         return []
     try:
         with VLM_CONNECTIONS_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
-        write_debug_log(f"vlm_config: cannot read {VLM_CONNECTIONS_PATH.name}: {e}")
+        _set_problem(name, f"{type(e).__name__}: {e}")
         return []
     if not isinstance(data, dict):
+        _set_problem(name, "top-level JSON is not an object")
         return []
-    if not _json_version_ok(data, VLM_CONNECTIONS_VERSION, name=VLM_CONNECTIONS_PATH.name):
+    if not _json_version_ok(data, VLM_CONNECTIONS_VERSION, name=name):
+        _set_problem(name, "unsupported version")
         return []
     conns = data.get("connections")
     if not isinstance(conns, list):
+        _set_problem(name, "connections is not a list")
         return []
+    _clear_problem(name)
     return [c for c in conns if isinstance(c, dict) and c.get("connection_id")]
 
 
 def save_custom_connections(connections: list[dict]) -> bool:
     """カスタム接続定義を原子的に書き出す。秘密値は含めない前提（呼び出し側の責務）。"""
     payload = {"version": VLM_CONNECTIONS_VERSION, "connections": connections}
+    # REQ-4.2: 壊れている原本は上書き前に退避する（黙って失わない）。
+    _backup_unreadable(VLM_CONNECTIONS_PATH)
     tmp = VLM_CONNECTIONS_PATH.with_name(f"{VLM_CONNECTIONS_PATH.stem}.{uuid.uuid4().hex}.tmp")
     try:
         with tmp.open("w", encoding="utf-8") as f:
@@ -88,6 +143,7 @@ def save_custom_connections(connections: list[dict]) -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, VLM_CONNECTIONS_PATH)
+        _clear_problem(VLM_CONNECTIONS_PATH.name)
         return True
     except (OSError, TypeError, ValueError) as e:
         write_debug_log(f"vlm_config: cannot write {VLM_CONNECTIONS_PATH.name}: {e}")
@@ -165,26 +221,34 @@ def new_connection_id(prefix: str = "custom") -> str:
 # `vlm_capable` を保存し、再起動後にもプロセス内カタログへ依存しない。
 
 def load_user_profiles() -> list[dict]:
+    name = VLM_PROFILES_PATH.name
     if not VLM_PROFILES_PATH.is_file():
+        _clear_problem(name)
         return []
     try:
         with VLM_PROFILES_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
-        write_debug_log(f"vlm_config: cannot read {VLM_PROFILES_PATH.name}: {e}")
+        _set_problem(name, f"{type(e).__name__}: {e}")
         return []
     if not isinstance(data, dict):
+        _set_problem(name, "top-level JSON is not an object")
         return []
-    if not _json_version_ok(data, VLM_PROFILES_VERSION, name=VLM_PROFILES_PATH.name):
+    if not _json_version_ok(data, VLM_PROFILES_VERSION, name=name):
+        _set_problem(name, "unsupported version")
         return []
     profs = data.get("profiles")
     if not isinstance(profs, list):
+        _set_problem(name, "profiles is not a list")
         return []
+    _clear_problem(name)
     return [p for p in profs if isinstance(p, dict) and p.get("profile_id")]
 
 
 def save_user_profiles(profiles: list[dict]) -> bool:
     payload = {"version": VLM_PROFILES_VERSION, "profiles": profiles}
+    # REQ-4.2: 壊れている原本は上書き前に退避する。
+    _backup_unreadable(VLM_PROFILES_PATH)
     tmp = VLM_PROFILES_PATH.with_name(f"{VLM_PROFILES_PATH.stem}.{uuid.uuid4().hex}.tmp")
     try:
         with tmp.open("w", encoding="utf-8") as f:
@@ -192,6 +256,7 @@ def save_user_profiles(profiles: list[dict]) -> bool:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, VLM_PROFILES_PATH)
+        _clear_problem(VLM_PROFILES_PATH.name)
         return True
     except (OSError, TypeError, ValueError) as e:
         write_debug_log(f"vlm_config: cannot write {VLM_PROFILES_PATH.name}: {e}")

@@ -579,9 +579,54 @@ Phase 5 のうちダイアログ側のもの。
 - flush 棚卸し表の全遷移について、未保存編集が保持されることのテストまたはスモーク記録
 
 **完了判定**
-- [ ] REQ-4.1、4.2 の再現テストが入り、§9.1 が通過する
-- [ ] flush 棚卸し表が PR に含まれ、全遷移が REQ-4.3 を満たす
-- [ ] REQ-4.4（単体テスト結果の表示が自動保存タイマーを武装させないこと）、REQ-4.5（フォルダ切替時の前フォルダ状態の破棄）、REQ-4.6（verified のメモリ反映。U-3 の決定どおり）、REQ-4.7（タグマップ反映順序）の確認記録がある
+- [x] REQ-4.1、4.2 の再現テストが入り、§9.1 が通過する
+- [x] flush 棚卸し表が PR に含まれ、全遷移が REQ-4.3 を満たす
+- [x] REQ-4.4（単体テスト結果の表示が自動保存タイマーを武装させないこと）、REQ-4.5（フォルダ切替時の前フォルダ状態の破棄）、REQ-4.6（verified のメモリ反映。U-3 の決定どおり）、REQ-4.7（タグマップ反映順序）の確認記録がある
+
+**実装記録（2026-11-29）**
+
+- REQ-4.1（R1-3／R2-4／R4-5）: 読めない既存 `.txt` を「空だった」として上書きしない。
+  - `main_window._save_current_caption`: 既存内容の読み取りに失敗したら、赤ログを出して
+    書き込みも Undo 記録も行わない（`old_text=""` で積まない）。
+  - グリッドセル `_save_caption`: 同じ扱い。`caption_save_failed` を発火し
+    `caption_edited`（Undo 用）は出さない。
+  - `tag_utils.read_tags_strict()` を新設（`(ok, tags)` を返し、読めない場合と空を区別）。
+    グリッドの `_add_tag` / `_remove_tag` はこれを使い、読めない場合は書き込まずに中止する。
+- REQ-4.2（R4-2）: `vlm_config` に「壊れている」記録を追加した。
+  `load_problems()` がファイル名→理由を返し、読み込み成功で消える。
+  保存時は壊れた原本を `<name>.broken-YYYYmmdd-HHMMSS.bak` へ退避してから書く。
+  利用者へは起動時の GUI ログ（`Vlm.Config_Broken_Log`）と、設定ダイアログを開いた
+  時点の警告（`Vlm.Config_Broken_Message`）で明示する（debug ログ既定オフに依存しない）。
+- REQ-4.3: flush の棚卸しは §4.3 の表のとおり。
+  - 終了（R4-4）: `closeEvent` で `_save_current_caption()` とグリッドの
+    `flush_pending_edits()` を実行。
+  - 画像切替: 既存どおり（パス変更時に flush）。
+  - フォルダ切替: `_reset_folder_state()` が先に flush する。
+  - グリッド切替（R18-2）/メイン復帰: それぞれ `_save_current_caption()` /
+    `flush_pending_edits()` を追加。
+  - リサイズ・言語切替・モード再入（R12-5／R14-1／R23-2）: 読み込み側
+    （`_load_caption_for_image`・セルの `_load_caption_text`）に dirty ガードを入れ、
+    dirty な間はファイル内容で上書きしない。
+  - セル再利用（R2-8）: `clear_data()` が flush してから捨てる。
+- REQ-4.4（R7-9）: `_on_vlm_single_test_result` は `blockSignals` で表示し、
+  `_caption_loaded_text` を更新する（自動保存タイマーを武装させない）。
+- REQ-4.5（R7-8）: `reload_image_list` の早期 return 2 経路で
+  `_reset_folder_state()` を呼び、キャプション編集状態・対象パス・タグ・キャッシュを
+  破棄する（「画像なし」と編集可能状態を共存させない）。
+- REQ-4.6（R30-3／U-3）: `model_status_changed` の接続先を `_on_model_status_changed`
+  に変え、`load_config()`→`load_settings()` で `verified_models` を読み直してから
+  UI を更新する。再読込はシグナル経由に限定（通常の UI 更新では disk を読まない）。
+- REQ-4.7（R31-1）: `_refresh_shared_tag_translation_map()` を追加。正本
+  （`models/pixai-tagger-v0.9/selected_tags.csv`）の有無＋mtime のスタンプで
+  読み直しを判断するため、フォールバック由来の非空マップが正本の反映を阻まない。
+  バッチ終了時に呼ぶ（毎回の重い読み込みはしない。NFR-4）。
+- テスト: `tests/test_phase4_data_integrity.py`（14 件）。読めない `.txt` の保存中止
+  （メイン／グリッド／タグ追加）、壊れた VLM JSON の通知とバックアップ、同一パス再読込の
+  dirty 保持、終了時 flush、グリッド切替 flush、セル再利用 flush、セル再読込の dirty 保持、
+  自動保存タイマー非武装、空フォルダ切替の状態破棄、verified の再読込、翻訳マップの
+  正本優先を固定した。
+- §9.1: `pytest` **1054 passed / 2 skipped**、`ruff` 421（増加なし）、`pyright` 83。
+  実 config・VLM JSON の SHA-256 は不変。
 
 ---
 
