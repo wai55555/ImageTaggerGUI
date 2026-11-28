@@ -133,7 +133,7 @@ def test_req_e1_pointer_failure_aborts_before_downloading(monkeypatch, tmp_path,
     monkeypatch.setattr(workers.model_registry, "get_model_entry",
                         lambda model_id: _entry(tmp_path, {
                             "network": {
-                                "files": {"model.onnx": "https://example/model.onnx"},
+                                "files": {"model.onnx": "https://huggingface.co/test/model/resolve/main/model.onnx"},
                                 "hash_verified_file": "model.onnx",
                             },
                         }))
@@ -157,7 +157,7 @@ def _manifest_two_files(tmp_path: Path) -> tuple[dict, dict[str, bytes]]:
     bodies = {"a.onnx": b"AAAA", "b.onnx": b"BBBB"}
     config = {
         "network": {
-            "files": {name: f"https://example/{name}" for name in bodies},
+            "files": {name: f"https://huggingface.co/test/model/resolve/main/{name}" for name in bodies},
             "hash_verified_file": ["a.onnx", "b.onnx"],
         },
     }
@@ -175,8 +175,8 @@ def test_req_e2_partial_failure_does_not_mark_verified(monkeypatch, tmp_path, no
     ok = _FakeResponse(bodies["a.onnx"], headers={"content-length": str(len(bodies["a.onnx"]))})
     fail = _FakeResponse(b"", status=404)
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/a.onnx": ok,
-        "https://example/b.onnx": fail,
+        "https://huggingface.co/test/model/resolve/main/a.onnx": ok,
+        "https://huggingface.co/test/model/resolve/main/b.onnx": fail,
     }))
     verified = _record_verification(monkeypatch)
 
@@ -195,8 +195,8 @@ def test_req_e2_full_success_marks_verified_once(monkeypatch, tmp_path, no_side_
         lambda url, gs=None: (_sha(bodies[url.rsplit("/", 1)[-1]]), len(bodies[url.rsplit("/", 1)[-1]])),
     )
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/a.onnx": _FakeResponse(bodies["a.onnx"], headers={"content-length": "4"}),
-        "https://example/b.onnx": _FakeResponse(bodies["b.onnx"], headers={"content-length": "4"}),
+        "https://huggingface.co/test/model/resolve/main/a.onnx": _FakeResponse(bodies["a.onnx"], headers={"content-length": "4"}),
+        "https://huggingface.co/test/model/resolve/main/b.onnx": _FakeResponse(bodies["b.onnx"], headers={"content-length": "4"}),
     }))
     verified = _record_verification(monkeypatch)
 
@@ -274,10 +274,10 @@ def test_req_e4_416_with_a_complete_local_file_succeeds(monkeypatch, tmp_path, n
     # （gpu_runtime の 416 処理と同じ考え方）。
     work.worker._hash_verified_files = {target}
     response = _FakeResponse(status=416)
-    fake_get = _FakeGet({"https://example/model.onnx": response})
+    fake_get = _FakeGet({"https://huggingface.co/test/model/resolve/main/model.onnx": response})
     monkeypatch.setattr(workers.requests, "get", fake_get)
 
-    result = work.worker._download_single_file(target, "https://example/model.onnx", _sha(body))
+    result = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx", _sha(body))
 
     assert bool(result) is True
     assert len(fake_get.calls) == 1
@@ -292,10 +292,10 @@ def test_req_e4_416_with_a_partial_file_restarts_once(monkeypatch, tmp_path, no_
     target.write_bytes(body[:4])
     first = _FakeResponse(status=416)
     second = _FakeResponse(body, headers={"content-length": str(len(body))})
-    fake_get = _FakeGet({"https://example/model.onnx": [first, second]})
+    fake_get = _FakeGet({"https://huggingface.co/test/model/resolve/main/model.onnx": [first, second]})
     monkeypatch.setattr(workers.requests, "get", fake_get)
 
-    result = work.worker._download_single_file(target, "https://example/model.onnx")
+    result = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx")
 
     assert bool(result) is True
     assert len(fake_get.calls) == 2
@@ -307,10 +307,10 @@ def test_req_e4_a_second_416_gives_up_instead_of_looping(monkeypatch, tmp_path, 
     work = _Worker()
     target = tmp_path / "model.onnx"
     target.write_bytes(b"partial")
-    fake_get = _FakeGet({"https://example/model.onnx": [_FakeResponse(status=416), _FakeResponse(status=416)]})
+    fake_get = _FakeGet({"https://huggingface.co/test/model/resolve/main/model.onnx": [_FakeResponse(status=416), _FakeResponse(status=416)]})
     monkeypatch.setattr(workers.requests, "get", fake_get)
 
-    result = work.worker._download_single_file(target, "https://example/model.onnx")
+    result = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx")
 
     assert bool(result) is False
     assert len(fake_get.calls) == 2
@@ -345,10 +345,10 @@ def test_req_e6_no_size_and_no_content_length_is_suspected(monkeypatch, tmp_path
     body = b"sidecar-body"
     target = tmp_path / "selected_tags.csv"
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/tags.csv": _FakeResponse(body),   # content-length なし
+        "https://huggingface.co/test/model/resolve/main/tags.csv": _FakeResponse(body),   # content-length なし
     }))
 
-    result = work.worker._download_single_file(target, "https://example/tags.csv")
+    result = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/tags.csv")
 
     assert bool(result) is True
     assert result.suspected_incomplete is True
@@ -362,8 +362,8 @@ def test_req_e6_manifest_does_not_mark_verified_when_a_sidecar_is_suspected(monk
     config = {
         "network": {
             "files": {
-                "model.onnx": "https://example/model.onnx",
-                "meta.json": "https://example/meta.json",
+                "model.onnx": "https://huggingface.co/test/model/resolve/main/model.onnx",
+                "meta.json": "https://huggingface.co/test/model/resolve/main/meta.json",
             },
             "hash_verified_file": "model.onnx",
         },
@@ -373,8 +373,8 @@ def test_req_e6_manifest_does_not_mark_verified_when_a_sidecar_is_suspected(monk
     monkeypatch.setattr(workers, "get_model_info_from_pointer",
                         lambda url, gs=None: (_sha(model_body), len(model_body)))
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/model.onnx": _FakeResponse(model_body, headers={"content-length": "5"}),
-        "https://example/meta.json": _FakeResponse(sidecar),  # content-length なし
+        "https://huggingface.co/test/model/resolve/main/model.onnx": _FakeResponse(model_body, headers={"content-length": "5"}),
+        "https://huggingface.co/test/model/resolve/main/meta.json": _FakeResponse(sidecar),  # content-length なし
     }))
     verified = _record_verification(monkeypatch)
 
@@ -390,15 +390,15 @@ def test_req_e6_legacy_clears_verified_when_the_tags_csv_is_suspected(monkeypatc
     model_body = b"MODEL"
     csv_body = b"id,tag_id,name,category,count,ips\n0,1,alpha,general,1,\n"
     monkeypatch.setattr(workers, "DOWNLOAD_URLS", {
-        workers.MODEL_PATH: "https://example/model.onnx",
-        workers.TAGS_CSV_PATH: "https://example/tags.csv",
-        workers.MODEL_POINTER_PATH: "https://example/pointer.txt",
+        workers.MODEL_PATH: "https://huggingface.co/test/model/resolve/main/model.onnx",
+        workers.TAGS_CSV_PATH: "https://huggingface.co/test/model/resolve/main/tags.csv",
+        workers.MODEL_POINTER_PATH: "https://huggingface.co/test/model/resolve/main/pointer.txt",
     })
     monkeypatch.setattr(workers, "get_model_info_from_pointer",
                         lambda url, gs=None: (_sha(model_body), len(model_body)))
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/model.onnx": _FakeResponse(model_body, headers={"content-length": "5"}),
-        "https://example/tags.csv": _FakeResponse(csv_body),   # content-length なし
+        "https://huggingface.co/test/model/resolve/main/model.onnx": _FakeResponse(model_body, headers={"content-length": "5"}),
+        "https://huggingface.co/test/model/resolve/main/tags.csv": _FakeResponse(csv_body),   # content-length なし
     }))
     verified = _record_verification(monkeypatch)
 
@@ -417,16 +417,16 @@ def test_req_e7_oversized_local_file_is_removed_and_recovers(monkeypatch, tmp_pa
     target.write_bytes(body + b"EXTRA")
     work.worker._file_sizes[target] = len(body)
     fake_get = _FakeGet({
-        "https://example/model.onnx": _FakeResponse(body, headers={"content-length": str(len(body))}),
+        "https://huggingface.co/test/model/resolve/main/model.onnx": _FakeResponse(body, headers={"content-length": str(len(body))}),
     })
     monkeypatch.setattr(workers.requests, "get", fake_get)
 
-    first = work.worker._download_single_file(target, "https://example/model.onnx")
+    first = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx")
     assert bool(first) is False
     assert not target.exists()              # 文言どおり削除する
     assert fake_get.calls == []
 
-    second = work.worker._download_single_file(target, "https://example/model.onnx")
+    second = work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx")
     assert bool(second) is True
     assert target.read_bytes() == body
 
@@ -436,9 +436,9 @@ def test_req_e7_oversized_local_file_is_removed_and_recovers(monkeypatch, tmp_pa
 def test_req_e8_response_is_closed_on_success(monkeypatch, tmp_path, no_side_fetches):
     work = _Worker()
     response = _FakeResponse(b"body", headers={"content-length": "4"})
-    monkeypatch.setattr(workers.requests, "get", _FakeGet({"https://example/f": response}))
+    monkeypatch.setattr(workers.requests, "get", _FakeGet({"https://huggingface.co/test/model/resolve/main/f": response}))
 
-    result = work.worker._download_single_file(tmp_path / "f.bin", "https://example/f")
+    result = work.worker._download_single_file(tmp_path / "f.bin", "https://huggingface.co/test/model/resolve/main/f")
 
     assert bool(result) is True
     assert response.closed is True
@@ -447,9 +447,9 @@ def test_req_e8_response_is_closed_on_success(monkeypatch, tmp_path, no_side_fet
 def test_req_e8_response_is_closed_on_failure(monkeypatch, tmp_path, no_side_fetches):
     work = _Worker()
     response = _FakeResponse(error=workers.requests.exceptions.ConnectionError("boom"))
-    monkeypatch.setattr(workers.requests, "get", _FakeGet({"https://example/f": response}))
+    monkeypatch.setattr(workers.requests, "get", _FakeGet({"https://huggingface.co/test/model/resolve/main/f": response}))
 
-    result = work.worker._download_single_file(tmp_path / "f.bin", "https://example/f")
+    result = work.worker._download_single_file(tmp_path / "f.bin", "https://huggingface.co/test/model/resolve/main/f")
 
     assert bool(result) is False
     assert response.closed is True
@@ -461,10 +461,10 @@ def test_req_e9_unknown_expected_size_does_not_log_zero_mb(monkeypatch, tmp_path
     work = _Worker()
     body = b"abc"
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/f": _FakeResponse(body, headers={"content-length": "3"}),
+        "https://huggingface.co/test/model/resolve/main/f": _FakeResponse(body, headers={"content-length": "3"}),
     }))
 
-    work.worker._download_single_file(tmp_path / "f.bin", "https://example/f")
+    work.worker._download_single_file(tmp_path / "f.bin", "https://huggingface.co/test/model/resolve/main/f")
 
     assert not any("0.00" in message for message in work.logs)
     assert "DownloaderWorker_Downloading_Model_UnknownSize" in work.logs
@@ -477,10 +477,10 @@ def test_req_e9_known_expected_size_still_logs_the_size(monkeypatch, tmp_path, n
     target = tmp_path / "model.onnx"
     work.worker._file_sizes[target] = len(body)
     monkeypatch.setattr(workers.requests, "get", _FakeGet({
-        "https://example/model.onnx": _FakeResponse(body, headers={"content-length": "3"}),
+        "https://huggingface.co/test/model/resolve/main/model.onnx": _FakeResponse(body, headers={"content-length": "3"}),
     }))
 
-    work.worker._download_single_file(target, "https://example/model.onnx")
+    work.worker._download_single_file(target, "https://huggingface.co/test/model/resolve/main/model.onnx")
 
     assert "DownloaderWorker_Downloading_Model" in work.logs
     assert "DownloaderWorker_Downloading_Model_UnknownSize" not in work.logs

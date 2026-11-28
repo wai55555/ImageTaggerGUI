@@ -1,31 +1,42 @@
-from pathlib import Path
 import csv
 import json
 import os
-import requests
+import re
 import threading
-from dataclasses import dataclass
-from typing import Callable, Sequence
 from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Sequence
+from urllib.parse import urlparse
 
+import requests
 from PySide6.QtCore import QObject, Signal, Slot
 
-from utils import write_debug_log, calculate_sha256, GetString, default_get_string_fallback
+import caption_core
+import model_registry
 import tag_utils
-from text_io import atomic_write_text, read_text
-from constants import (
-    DOWNLOAD_URLS, MODEL_PATH, TAGS_CSV_PATH, MODEL_POINTER_PATH
-)
+import tagging_core
 from app_settings import AppSettings, update_model_verification_status
+from constants import DOWNLOAD_URLS, MODEL_PATH, MODEL_POINTER_PATH, TAGS_CSV_PATH
 from get_pointer_huggingface import get_model_info_from_pointer
 from tagging_core import (
-    setup_tagger_from_settings, process_image_loop, get_image_paths_recursive,
-    FileChange, OverwriteDecision, parse_target_mode, filter_target_images,
     TAGS_CSV_COLUMN_COUNTS,
+    FileChange,
+    OverwriteDecision,
+    filter_target_images,
+    get_image_paths_recursive,
+    parse_target_mode,
+    process_image_loop,
+    setup_tagger_from_settings,
 )
-import tagging_core
-import model_registry
-import caption_core
+from text_io import atomic_write_text, read_text
+from utils import (
+    GetString,
+    calculate_sha256,
+    default_get_string_fallback,
+    write_debug_log,
+)
+
 
 def _looks_like_tags_csv(data: bytes) -> bool:
     """Cheap sanity check for the downloaded selected_tags.csv: a header naming the tag
@@ -112,6 +123,75 @@ class FileDownloadResult:
 
     def __bool__(self) -> bool:
         return self.ok
+
+
+# --- REQ-7.1 / 7.2 / 7.3: マニフェスト由来の入力検証 ------------------------------
+#
+# `model_config.json` は「利用者がフォルダを置く」拡張点なので、network.files の
+# キー（書き込み先の相対パス）と URL を GPU 経路と同水準に検証する。
+# GPU 側の `_is_safe_filename` は単一コンポーネント前提で、Florence の
+# `onnx/vision_encoder_quantized.onnx` を通せないため、ここでは「安全な相対パス」
+# を許可する別の述語を使う（§1.2 の訂正版）。
+
+_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def _is_safe_relative_path(name: object) -> bool:
+    """network.files のキーが「安全な相対パス」か（REQ-7.1）。
+
+    許可: `onnx/vision_encoder_quantized.onnx` のような通常の相対パス。
+    拒否: 絶対パス、ドライブレター、`..` コンポーネント、空コンポーネント、
+    末尾の区切り、空文字。
+    """
+    if not isinstance(name, str):
+        return False
+    raw = name.strip()
+    if not raw or raw != name:
+        return False
+    if _DRIVE_PREFIX.match(raw):
+        return False
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/"):
+        return False
+    if normalized.endswith("/"):
+        return False
+    parts = normalized.split("/")
+    return not any(part in ("", ".", "..") for part in parts)
+
+
+# 同梱モデルの URL は Hugging Face（huggingface.co / CDN / *.hf.co）だけ。
+_ALLOWED_MODEL_HOST_SUFFIXES = (".huggingface.co", ".hf.co")
+
+
+def _is_allowed_model_url(url: object) -> bool:
+    """models の URL が https かつ想定ホスト（Hugging Face）か（REQ-7.3）。"""
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host == "huggingface.co":
+        return True
+    return any(host.endswith(suffix) for suffix in _ALLOWED_MODEL_HOST_SUFFIXES)
+
+
+def _is_inside_directory(path: Path, directory: Path) -> bool:
+    """resolve した書き込み先が `directory`（も resolve 済み）の配下か（REQ-7.2）。
+
+    U-9 の決定どおり、リンク自体は拒否せず resolve 先の配下判定だけで弾く。
+    """
+    try:
+        resolved = path.resolve()
+        base = directory.resolve()
+    except OSError:
+        return False
+    return resolved == base or base in resolved.parents
 
 
 class DownloaderWorker(QObject):
@@ -495,6 +575,30 @@ class DownloaderWorker(QObject):
             hash_verified_names: list[str] = [hash_verified_raw]
         else:
             hash_verified_names = list(hash_verified_raw) if hash_verified_raw else []
+
+        # REQ-7.1 / 7.2 / 7.3: 書き込み先と URL を検証してから 1 バイトも書かない。
+        # 弾いた対象はログに残す（黙ってスキップしない。NFR-3）。
+        rejected_names = [name for name in files if not _is_safe_relative_path(name)]
+        rejected_urls = [
+            f"{name}: {url}" for name, url in files.items()
+            if _is_safe_relative_path(name) and not _is_allowed_model_url(url)
+        ]
+        rejected_verified = [name for name in hash_verified_names
+                             if not _is_safe_relative_path(name)]
+        unsafe_targets = [
+            name for name in files
+            if _is_safe_relative_path(name)
+            and not _is_inside_directory(model_dir / name, model_dir)
+        ]
+        if rejected_names or rejected_urls or rejected_verified or unsafe_targets:
+            write_debug_log(
+                "DownloaderWorker: manifest rejected before downloading: "
+                f"unsafe names={rejected_names}, unsafe urls={rejected_urls}, "
+                f"unsafe verified={rejected_verified}, escaping targets={unsafe_targets}")
+            self.log_message.emit(
+                self.get_string("Workers", "DownloaderWorker_Error_UnsafeManifest"), "red")
+            return False
+
         self._hash_verified_files = {model_dir / name for name in hash_verified_names}
 
         expected_sha_by_path: dict[Path, str] = {}
@@ -504,7 +608,15 @@ class DownloaderWorker(QObject):
             if not url:
                 pointer_failures.append(name)
                 continue
+            # REQ-7.4: /resolve/main/ -> /raw/main/ の置換が効いた場合だけポインターを
+            # 取りに行く。効かない URL で実ファイルを丸ごと読む経路を作らない。
             pointer_url = url.replace("/resolve/main/", "/raw/main/")
+            if pointer_url == url:
+                write_debug_log(
+                    f"DownloaderWorker: {name}: URL has no /resolve/main/ segment; "
+                    "skipping pointer lookup")
+                pointer_failures.append(name)
+                continue
             expected_sha256, expected_size = get_model_info_from_pointer(pointer_url, self.get_string)
             if expected_sha256 and expected_size:
                 file_path = model_dir / name

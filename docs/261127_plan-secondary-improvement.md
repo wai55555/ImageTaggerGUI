@@ -837,10 +837,37 @@ DL 経路の入力検証を GPU 経路と同水準に揃える。方針は §1.2
 | REQ-7.7 | 先行配布分の残件の判断を記録する: N（get_pointer_huggingface の単体実行経路を直すか消すか）と O（calculate_sha256 等の chunk_size。DL の iter_content 分は一時改修側 PERF-1 との重複を確認したうえで扱う）について、本 Phase で実施するか否かを決め、台帳（付録 B）に残す |
 
 **完了判定**
-- [ ] 悪性キー（`..`、絶対パス、ドライブレター、空コンポーネント）と想定外 URL の拒否テストが入り、§9.1 が通過する
-- [ ] 同梱モデル全件の正常系テストが通る
-- [ ] REQ-7.4 の検証がある: 置換が効かない URL ではポインター取得を行わず、hash_verified_file は DL 中断、それ以外は通常 DL になること
-- [ ] REQ-7.7 の判断（N／O の実施可否）が付録 B に記録されている
+- [x] 悪性キー（`..`、絶対パス、ドライブレター、空コンポーネント）と想定外 URL の拒否テストが入り、§9.1 が通過する
+- [x] 同梱モデル全件の正常系テストが通る
+- [x] REQ-7.4 の検証がある: 置換が効かない URL ではポインター取得を行わず、hash_verified_file は DL 中断、それ以外は通常 DL になること
+- [x] REQ-7.7 の判断（N／O の実施可否）が付録 B に記録されている
+
+**実装記録（2026-11-29）**
+
+- REQ-7.1: `workers._is_safe_relative_path()` を追加。通常の相対パス（Florence の
+  `onnx/...` を含む）を許可し、絶対パス・ドライブレター・`..`／空コンポーネント・
+  末尾区切り・空文字を拒否する。同梱 9 件の model_config.json の全キーが通ることを
+  テストで固定した（REQ-7.6）。
+- REQ-7.2: `workers._is_inside_directory()` で、`resolve()` した書き込み先が
+  `model_dir`（これも resolve）配下に収まることを検証する。U-9 の決定どおり
+  リンク自体は拒否せず、脱出リンクは resolve 先の判定で弾く（symlink のテストは
+  作成できない環境では skip）。
+- REQ-7.3: `workers._is_allowed_model_url()` を追加。https かつ
+  `huggingface.co` / `*.huggingface.co` / `*.hf.co` のホストだけを許可し、
+  弾いたモデル名と URL を debug log に残して DL を開始しない（NFR-3）。
+  利用者向けには既存の DL エラーと同じ粒度で
+  `Workers.DownloaderWorker_Error_UnsafeManifest`（9 言語追加）を出す（REQ-7.5）。
+- REQ-7.4: ポインター取得は `/resolve/main/` → `/raw/main/` の置換が効いた場合だけ行う。
+  効かない URL では取得せず、hash_verified_file は既存方針（Phase E）どおり DL を中断、
+  それ以外のファイルは通常どおり DL する。
+- REQ-7.6: 同梱モデルの正常系は不変（`tests/test_phase7_download_validation.py` の
+  全件検証）。既存 Phase E テストの URL は `https://example/...` から
+  `https://huggingface.co/.../resolve/main/...` へ更新した（新契約に合わせた
+  テストデータの追随であり、検証内容は変えていない）。
+- REQ-7.7: N は「実施しない」、O は「実施しない（Phase 8A の計測で判断）」を付録 B に記録。
+- テスト: `tests/test_phase7_download_validation.py`（32 件、symlink 1 件は環境により skip）。
+- §9.1: `pytest` **1105 passed / 3 skipped**、`ruff` 421（増加なし）、`pyright` 80。
+  実 config・VLM JSON の SHA-256 は不変。
 
 ---
 
@@ -1238,8 +1265,8 @@ Phase 0 の実測（`any()` の全箇所、書き込み 7 系統、terminate 2 �
 | K（_opt_float の検証） | 同上（プロファイル解釈側）。ダイアログ側の丸めは R13-4 として Phase 5 で扱う | 両者は別機構 |
 | L（拒否理由の表漏れ） | 同上（ルータ側） | |
 | M（診断の TCP 確認） | Phase 8C（REQ-8C.6） | 表示面・診断項目の範囲で本書が扱う |
-| N（get_pointer_huggingface 単体実行） | Phase 7（REQ-7.7 で実施可否を判断し記録する） | |
-| O（chunk_size 8192） | Phase 7（REQ-7.7 で一時改修側 PERF-1 との重複を確認したうえで判断し記録する） | |
+| N（get_pointer_huggingface 単体実行） | Phase 7（REQ-7.7 で実施可否を判断し記録する） | **判断: 実施しない**（2026-11-29）。アプリの実行経路からは呼ばれない開発用の単体実行経路であり、危険なプリミティブでも本番の挙動に影響する箇所でもない。削除すると手動検証の手段が減るため残す。将来この経路を実行時にも使う変更を入れる場合は、REQ-7.1〜7.3 の検証を必ず通すこと |
+| O（chunk_size 8192） | Phase 7（REQ-7.7 で一時改修側 PERF-1 との重複を確認したうえで判断し記録する） | **判断: 実施しない**（2026-11-29）。DL 本体の `iter_content` は一時改修 PERF-1 で既に間引き済みで重複する。`calculate_sha256` の chunk_size は検証時の読み取りであり、計測なしに変えない（NFR-7）。Phase 8A の計測対象に含めるかは 8A の計測結果で判断する |
 | P（プロンプトプレビューの overridden 表示） | Phase 8C（REQ-8C.7）。実施可否は Phase 0 で判断する | R ID を持たないため付録 A には含めない |
 | Q（対応拡張子の追加） | §6 の CUT-候補 6 | 実測が前提の機能候補 |
 
